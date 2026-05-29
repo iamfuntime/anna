@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+MANIFEST
+.installed.cfg
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Test and lint caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Secrets (never commit)
+.env
+.env.local
+*.pem
+*.key
+
+# Runtime artifacts (the deployment writes these into ~/anna; if the operator
+# happens to clone the repo into that same location, do not let any of it ride
+# along with a git push)
+audit/
+transcripts/
+core/
+vault/
+
+# Local config the operator may keep alongside the repo
+anna.yaml

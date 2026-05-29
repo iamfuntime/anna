@@ -1,0 +1,91 @@
+[build-system]
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
+
+[project]
+name = "anna"
+version = "0.1.0"
+description = "ANNA (Adaptive Neural Network Assistant), a multi-channel personal agent built on the Claude Agent SDK."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+    { name = "iamfuntime" }
+]
+keywords = ["claude", "agent", "slack", "telegram", "assistant"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Communications :: Chat",
+]
+
+dependencies = [
+    "claude-agent-sdk>=0.1.0",
+    "slack-bolt>=1.20",
+    "slack-sdk>=3.27",
+    "python-telegram-bot>=22.0",
+    "structlog>=24.1",
+    "pydantic>=2.6",
+    "python-dotenv>=1.0",
+    "click>=8.1",
+    "pyyaml>=6.0",
+    "watchfiles>=0.21",
+    "aiofiles>=23.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.4",
+    "mypy>=1.10",
+]
+
+[project.scripts]
+anna = "anna.__main__:main"
+anna-logs = "anna.cli.logs:main"
+anna-admin = "anna.cli.admin:main"
+anna-setup = "anna.setup.wizard:main"
+
+[project.urls]
+Homepage = "https://github.com/iamfuntime/anna"
+Repository = "https://github.com/iamfuntime/anna"
+Issues = "https://github.com/iamfuntime/anna/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/anna"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/anna",
+    "README.md",
+    "anna.yaml.example",
+    ".env.example",
+    "systemd",
+    "install.sh",
+    "tests",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "ASYNC"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true
+disallow_untyped_defs = true

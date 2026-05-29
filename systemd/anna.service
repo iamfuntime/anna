@@ -1,0 +1,47 @@
+[Unit]
+# Systemd user unit for ANNA.
+#
+# Installed by the setup wizard to ~/.config/systemd/user/anna.service.
+# Enable and start with:
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now anna
+#   loginctl enable-linger $USER   # keep running when not logged in
+Description=ANNA: Adaptive Neural Network Assistant
+Documentation=https://github.com/iamfuntime/anna
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Type=simple: the process stays in the foreground, systemd treats the
+# main PID as the service. ANNA does its own asyncio loop and never forks.
+Type=simple
+
+# %h expands to the operator's home directory at unit-load time.
+WorkingDirectory=%h/anna
+
+# The venv created by install.sh holds the anna entrypoint script.
+ExecStart=%h/anna/.venv/bin/anna
+
+# Restart on any non-clean exit. SIGTERM during shutdown is treated as
+# clean; the supervisor handles graceful drain of the worker pool.
+Restart=on-failure
+RestartSec=10
+
+# Forward stdout and stderr to the user journal. ANNA emits structured
+# JSON to stdout; journald stores it. The anna-logs wrapper reads it back
+# with journalctl --user -u anna.
+StandardOutput=journal
+StandardError=journal
+
+# Plain memory limit to keep a runaway worker pool from eating the host.
+# Adjust if the operator runs many sub-agents in parallel.
+MemoryMax=2G
+
+# Drop a few capabilities ANNA never needs. The user unit cannot tighten
+# much beyond this without breaking the SDK's subprocess launches.
+NoNewPrivileges=true
+
+[Install]
+# default.target is the user equivalent of multi-user.target; enabling
+# adds this unit to the operator's login session.
+WantedBy=default.target

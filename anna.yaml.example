@@ -1,0 +1,99 @@
+# ============================================================
+# ANNA configuration
+#
+# Non-secret runtime config lives here. Secrets live in .env.
+# The runtime loads this file at startup and watches it for
+# changes via watchfiles. A reload emits audit.config.reloaded.
+# ============================================================
+
+# ============================================================
+# Auth path
+# ============================================================
+auth:
+  # "max" or "api_key". When "max", ANNA reuses the Claude Code saved
+  # session and inherits the operator's MAX plan rate limits. When
+  # "api_key", ANNA reads ANTHROPIC_API_KEY from .env.
+  mode: max
+
+# ============================================================
+# Transports
+#
+# Each transport gets one section. The runtime starts a listener
+# for every transport with enabled: true. The setup wizard discovers
+# adapter plugins under src/anna/transports/ and populates this block.
+# ============================================================
+transports:
+  slack:
+    enabled: false
+    # The default channel ANNA addresses for admin alerts when a different
+    # transport goes down. Use a channel ID, not a name.
+    admin_channel: ""
+  telegram:
+    enabled: false
+    # The default chat ID ANNA addresses for admin alerts. Usually the
+    # operator's own user ID (a DM with themselves).
+    admin_chat_id: ""
+
+# ============================================================
+# Vault
+# ============================================================
+vault:
+  # Root directory for ANNA's markdown vault. Conversations, Identity
+  # archives, sub-agent personas, and skills all live under this root.
+  path: ~/Obsidian/ANNA
+
+# ============================================================
+# Watchdog
+# ============================================================
+watchdog:
+  # How often the watchdog loops. Default 300 seconds (5 minutes).
+  interval_seconds: 300
+  # Seconds without forward progress before a worker is flagged as stalled.
+  worker_stall_seconds: 90
+  # Whether to restart stalled workers (true) or only log them (false).
+  restart_stalled_workers: false
+
+# ============================================================
+# Logging
+# ============================================================
+logging:
+  # DEBUG, INFO, WARNING, ERROR, CRITICAL. Env var ANNA_LOG_LEVEL overrides.
+  level: INFO
+  # "json" (default, for journald) or "text" (for local hacking).
+  format: json
+  audit:
+    enabled: true
+    # Days retained. 0 means forever.
+    retention_days: 365
+    # Whether to fsync after every audit write. The cost is small because
+    # audit events are not high-frequency, and the benefit is that an OS
+    # crash does not lose audit data.
+    fsync_on_write: true
+  transcripts:
+    enabled: true
+    # Days before transcripts are gzipped. Runtime deletes at 3 times this.
+    # 0 means forever, no gzip, no delete.
+    retention_days: 30
+  ship:
+    # Phase 2 stub. Setting this true in Phase 1 raises a config error.
+    enabled: false
+    destination: ""
+    format: json
+
+# ============================================================
+# Housekeeping
+# ============================================================
+housekeeping:
+  # Local time the daily sweep runs (audit retention, transcript gzip
+  # and delete, vault index refresh). HH:MM 24h.
+  daily_sweep_time: "03:17"
+
+# ============================================================
+# Session boundaries
+# ============================================================
+sessions:
+  # Hours of inactivity before a DM-style conversation is considered closed.
+  # Worker writes a vault checkpoint and terminates.
+  dm_gap_hours: 8
+  # Hours of inactivity before a thread or group-style conversation is closed.
+  thread_gap_hours: 1
