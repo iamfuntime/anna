@@ -151,6 +151,13 @@ class ConversationWorker:
         options = ClaudeAgentOptions(
             system_prompt=system_prompt,
             setting_sources=[],
+            # ANNA runs as a headless systemd service with no operator at a
+            # terminal to approve tool calls. The default permission_mode is
+            # interactive prompting, which means every tool call hangs forever
+            # waiting for an OK that never comes — that's how the operator
+            # sees "ANNA doesn't have permission to do shit". The config
+            # default is bypassPermissions; tighten in anna.yaml if needed.
+            permission_mode=self._config.runtime.permission_mode,
         )
         # ClaudeSDKClient is an async context manager. We hold it open for the
         # life of the worker and close it in stop().

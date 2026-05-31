@@ -16,6 +16,19 @@ auth:
   mode: max
 
 # ============================================================
+# Runtime
+# ============================================================
+runtime:
+  # Claude Agent SDK tool-permission gate. ANNA is a headless service —
+  # no operator at a terminal to approve tool calls — so the default is
+  # "bypassPermissions". Valid values:
+  #   bypassPermissions  no prompts, ANNA runs tools freely (default)
+  #   acceptEdits        auto-approve file edits, prompt on the rest
+  #   plan               read-only planning mode, no writes
+  #   default            interactive prompts (do not use in a service)
+  permission_mode: bypassPermissions
+
+# ============================================================
 # Transports
 #
 # Each transport gets one section. The runtime starts a listener

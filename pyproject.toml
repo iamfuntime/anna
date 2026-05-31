@@ -28,6 +28,10 @@ dependencies = [
     "claude-agent-sdk>=0.1.0",
     "slack-bolt>=1.20",
     "slack-sdk>=3.27",
+    # slack-bolt/slack-sdk's Socket Mode client uses aiohttp directly. Without
+    # an explicit pin, neither pulls it as a transitive dep, so a fresh
+    # install starts with channel.import_failed for the Slack transport.
+    "aiohttp>=3.9",
     "python-telegram-bot>=22.0",
     "structlog>=24.1",
     "pydantic>=2.6",

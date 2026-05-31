@@ -530,6 +530,14 @@ def _write_anna_yaml(state: WizardState, path: Path) -> None:
 auth:
   mode: {state.auth_mode}
 
+runtime:
+  # Claude Agent SDK permission gate. ANNA runs headless with no operator at
+  # a terminal to approve tool calls. "bypassPermissions" is the right
+  # default for a service. Switch to "plan" for read-only testing,
+  # "acceptEdits" if you want manual approval on non-edit tools, or
+  # "default" if you actually want interactive prompts (you don't).
+  permission_mode: bypassPermissions
+
 transports:
   slack:
     enabled: {slack_enabled}

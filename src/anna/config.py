@@ -31,6 +31,22 @@ class AuthConfig(BaseModel):
     mode: Literal["max", "api_key"] = "max"
 
 
+class RuntimeConfig(BaseModel):
+    """SDK runtime options applied to every conversation worker.
+
+    permission_mode is the Claude Agent SDK's tool-permission gate. ANNA runs
+    as a headless service with no human at a terminal to approve tool calls,
+    so the default is "bypassPermissions". The other valid values from the
+    SDK are "default" (interactive prompts — never use in service), "plan"
+    (read-only planning), and "acceptEdits" (auto-approve file edits, prompt
+    for the rest). Override in anna.yaml if you want stricter behavior.
+    """
+
+    permission_mode: Literal[
+        "default", "acceptEdits", "bypassPermissions", "plan"
+    ] = "bypassPermissions"
+
+
 class SlackTransportConfig(BaseModel):
     enabled: bool = False
     admin_channel: str = ""
@@ -130,6 +146,7 @@ class SessionsConfig(BaseModel):
 
 class AnnaConfig(BaseModel):
     auth: AuthConfig = Field(default_factory=AuthConfig)
+    runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
     transports: TransportsConfig = Field(default_factory=TransportsConfig)
     vault: VaultConfig = Field(default_factory=VaultConfig)
     watchdog: WatchdogConfig = Field(default_factory=WatchdogConfig)
