@@ -42,11 +42,13 @@ htmlcov/
 
 # Runtime artifacts (the deployment writes these into ~/anna; if the operator
 # happens to clone the repo into that same location, do not let any of it ride
-# along with a git push)
-audit/
-transcripts/
-core/
-vault/
+# along with a git push). Anchored with a leading slash so these match ONLY the
+# deployment-root runtime dirs -- without it, the unanchored patterns also match
+# the source packages src/anna/core/ and src/anna/vault/ and silently drop them.
+/audit/
+/transcripts/
+/core/
+/vault/
 
 # Local config the operator may keep alongside the repo
 anna.yaml
