@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING, Awaitable, Callable
 
 from anna.config import AnnaConfig
+from anna.core.identity import CoreFile, read_core_file
 from anna.log import get_logger
 from anna.transports.base import InboundEvent, OutboundMessage
 
@@ -114,18 +116,116 @@ class ConversationWorker:
             self._log.critical("worker.sdk_import_failed", error=str(exc))
             raise
 
+        # setting_sources=[] disables inheriting the operator's user/project
+        # Claude Code settings (CLAUDE.md, agents/, MCP servers, skills). Without
+        # this, ANNA pulls in the entire host Claude Code environment and starts
+        # responding as if she were the operator's primary agent — referencing
+        # the operator's vault, agent roster, and slash commands as if they
+        # were her own. ANNA must speak strictly from her own ~/anna/core files.
+        channel = self.transport
+        if channel == "slack":
+            format_rule = (
+                "You are replying via Slack. Use plain text or Slack mrkdwn "
+                "(*bold*, _italic_, `code`). Do not use GitHub-flavored "
+                "Markdown tables, headings, or fenced code blocks with "
+                "language hints; Slack will render them as literal characters."
+            )
+        elif channel == "telegram":
+            format_rule = (
+                "You are replying via Telegram. The reply is sent as plain "
+                "text (no parse_mode), so do not use any Markdown formatting. "
+                "Plain prose, line breaks, and dashes only."
+            )
+        else:
+            format_rule = "Reply in plain text."
+
+        vault_root = self._config.vault.resolved_path
+        anna_home = self._config.anna_home
+
+        system_prompt = self._assemble_system_prompt(
+            anna_home=anna_home,
+            vault_root=vault_root,
+            format_rule=format_rule,
+        )
+
         options = ClaudeAgentOptions(
-            # Per v3, ANNA's per-conversation system prompt embeds the IDENTITY.md
-            # frame plus the core CLAUDE.md operating instructions. The actual
-            # prompt assembly is the responsibility of the prompt builder in a
-            # later module; we wire a minimal default here.
-            system_prompt=f"You are ANNA. Active conversation key: {self.conversation_key}.",
+            system_prompt=system_prompt,
+            setting_sources=[],
         )
         # ClaudeSDKClient is an async context manager. We hold it open for the
         # life of the worker and close it in stop().
         client = ClaudeSDKClient(options=options)
         await client.__aenter__()
         self._client = client
+
+    def _assemble_system_prompt(
+        self,
+        *,
+        anna_home: Path,
+        vault_root: Path,
+        format_rule: str,
+    ) -> str:
+        """Build the per-conversation system prompt from ANNA's five core files.
+
+        Per v3 §6 (carrying forward v1's five Hermes-style core identity
+        files), ANNA reads SOUL.md, CLAUDE.md, AGENTS.md, MEMORY.md, and
+        IDENTITY.md on every conversation boot. Their contents are spliced
+        into the system prompt verbatim, in a stable order, with a leading
+        scope disclaimer so ANNA never confuses herself with the operator's
+        primary Claude Code agent or any other agent in the operator's
+        roster. If a file is missing or empty (fresh install before the
+        persona interview has been run), it is rendered as "(not yet
+        written)" so ANNA can tell the operator what to populate.
+        """
+        core_dir = anna_home / "core"
+
+        def _section(file: CoreFile, heading: str) -> str:
+            body = read_core_file(core_dir, file).strip()
+            if not body:
+                body = "(not yet written — operator should run `anna-setup --persona`)"
+            return f"## {heading}\n{body}"
+
+        scope = (
+            "You are ANNA, an independent personal AI agent with your own "
+            "identity, memory, and vault. You are NOT the operator's primary "
+            "Claude Code session and NOT a member of the operator's Vanguard "
+            "agent roster. Do not reference the operator's other agents, "
+            "their vault, their slash commands, or their CLAUDE.md unless "
+            "the operator explicitly asks about them. Your five core "
+            "identity files below are the authoritative source for who you "
+            "are; do not improvise persona content beyond what they say."
+        )
+
+        runtime = (
+            f"Your runtime root (anna_home) is {anna_home}. core/ holds the "
+            f"five identity files below; audit/, transcripts/, anna.yaml, "
+            f"and .env live alongside.\n"
+            f"Your markdown vault root is {vault_root}. Conversations/, "
+            f"Identity/ archives, agents/, and skills/ live here. All writes "
+            f"go under this path."
+        )
+
+        identity_block = "\n\n".join(
+            [
+                _section(CoreFile.SOUL, "SOUL.md"),
+                _section(CoreFile.CLAUDE, "CLAUDE.md"),
+                _section(CoreFile.IDENTITY, "IDENTITY.md"),
+                _section(CoreFile.MEMORY, "MEMORY.md"),
+                _section(CoreFile.AGENTS, "AGENTS.md"),
+            ]
+        )
+
+        context = (
+            f"Active conversation key: {self.conversation_key}.\n"
+            f"{format_rule}"
+        )
+
+        return (
+            f"{scope}\n\n"
+            f"# Runtime paths\n{runtime}\n\n"
+            f"# Core identity files\n{identity_block}\n\n"
+            f"# Channel context\n{context}"
+        )
 
     async def _close_client(self) -> None:
         if self._client is None:

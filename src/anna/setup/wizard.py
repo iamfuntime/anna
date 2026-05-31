@@ -54,6 +54,12 @@ class WizardState:
     anthropic_api_key: str = ""
     operator_short_name: str = ""
     addressed_as_examples: list[str] = field(default_factory=list)
+    operator_context: str = ""
+    operator_values: str = ""
+    anna_role: str = ""
+    anna_duties: str = ""
+    anna_out_of_scope: str = ""
+    anna_tone: str = ""
     reconfigure: bool = False
     answers: dict[str, str] = field(default_factory=dict)
 
@@ -176,8 +182,14 @@ def step_slack_path(state: WizardState) -> None:
         "     app_mentions:read, im:history, im:read, im:write.\n"
         "3. Under 'Socket Mode', enable Socket Mode. Create an app-level token\n"
         "   with the connections:write scope.\n"
-        "4. Under 'Event Subscriptions', toggle 'Enable Events' ON. Under\n"
-        "   'Subscribe to bot events', add:  message.im, app_mention.\n"
+        "4. Under 'Event Subscriptions':\n"
+        "     a. Toggle 'Enable Events' ON.\n"
+        "     b. Under 'Subscribe to bot events', click 'Add Bot User Event'\n"
+        "        and add BOTH of the following (you need both — message.im\n"
+        "        covers DMs, app_mention covers @anna in channels):\n"
+        "          - message.im     (required for DMs)\n"
+        "          - app_mention    (required for @anna in channels)\n"
+        "     c. Save changes at the bottom of the page.\n"
         "5. Under 'App Home':\n"
         "     - Set a Display Name and Default Username for the bot user.\n"
         "     - Under 'Show Tabs', enable the Messages Tab AND tick the\n"
@@ -293,20 +305,24 @@ def _check_claude_login() -> None:
     )
 
 
-def step_persona_bootstrap(state: WizardState) -> None:
-    click.secho("\n[6/7] Persona bootstrap", bold=True, fg="cyan")
+def step_persona_bootstrap(state: WizardState, *, standalone: bool = False) -> None:
+    header = "Persona interview" if standalone else "[6/7] Persona bootstrap"
+    click.secho(f"\n{header}", bold=True, fg="cyan")
     click.echo(
-        "ANNA needs a short interview to seed SOUL.md (your values) and\n"
-        "IDENTITY.md (how she addresses you). Both files have hard token caps\n"
-        "and will be evicted at session boundaries as they grow."
+        "Short interview to populate ANNA's three persona files:\n"
+        "  IDENTITY.md  who she's addressing\n"
+        "  SOUL.md      operator context, values, what ANNA should weigh\n"
+        "  CLAUDE.md    ANNA's role, duties, tone, out-of-scope rules\n"
+        "Each file has a hard token cap and will be evicted at session\n"
+        "boundaries as it grows. Press Enter to skip any question.\n"
     )
+
     short_name = click.prompt("What name should ANNA address you as?", type=str)
     state.operator_short_name = short_name
     _emit_step(state, step="persona.short_name", answer=short_name)
 
     raw_examples = click.prompt(
-        "Comma-separated examples of how you want ANNA to greet you "
-        "(or press Enter to skip)",
+        "Examples of how you want ANNA to greet you (comma-separated, or skip)",
         type=str,
         default="",
         show_default=False,
@@ -314,9 +330,65 @@ def step_persona_bootstrap(state: WizardState) -> None:
     state.addressed_as_examples = [s.strip() for s in raw_examples.split(",") if s.strip()]
     _emit_step(state, step="persona.greetings", answer=raw_examples)
 
+    state.operator_context = click.prompt(
+        "Briefly, what do you do? (one or two sentences ANNA uses for context)",
+        type=str,
+        default="",
+        show_default=False,
+    )
+    _emit_step(state, step="persona.operator_context", answer=state.operator_context)
+
+    state.operator_values = click.prompt(
+        "What should ANNA weigh when she has to make a judgment call on your\n"
+        "behalf? (e.g., 'reliability over cleverness, candor over comfort,\n"
+        "ask before irreversible actions')",
+        type=str,
+        default="",
+        show_default=False,
+    )
+    _emit_step(state, step="persona.operator_values", answer=state.operator_values)
+
+    state.anna_role = click.prompt(
+        "How should ANNA describe her role when asked? (one sentence,\n"
+        "e.g., 'personal AI assistant focused on calendar, research, and drafts')",
+        type=str,
+        default="",
+        show_default=False,
+    )
+    _emit_step(state, step="persona.anna_role", answer=state.anna_role)
+
+    state.anna_duties = click.prompt(
+        "What are ANNA's primary duties? (comma-separated,\n"
+        "e.g., 'morning briefs, research summaries, draft replies, reminders')",
+        type=str,
+        default="",
+        show_default=False,
+    )
+    _emit_step(state, step="persona.anna_duties", answer=state.anna_duties)
+
+    state.anna_out_of_scope = click.prompt(
+        "What is OUT of scope for ANNA? (comma-separated,\n"
+        "e.g., 'production infra changes, financial trades, irreversible\n"
+        "actions without explicit confirmation')",
+        type=str,
+        default="",
+        show_default=False,
+    )
+    _emit_step(state, step="persona.anna_out_of_scope", answer=state.anna_out_of_scope)
+
+    state.anna_tone = click.prompt(
+        "Preferred response style? (e.g., 'terse, no fluff, no apologies'\n"
+        "or 'thorough with context')",
+        type=str,
+        default="",
+        show_default=False,
+    )
+    _emit_step(state, step="persona.anna_tone", answer=state.anna_tone)
+
     ensure_core_files(state.anna_home / "core")
     _seed_identity_file(state)
     _seed_soul_file(state)
+    _seed_claude_file(state)
 
 
 def _seed_identity_file(state: WizardState) -> None:
@@ -339,10 +411,69 @@ def _seed_identity_file(state: WizardState) -> None:
 
 def _seed_soul_file(state: WizardState) -> None:
     path = state.anna_home / "core" / "SOUL.md"
-    # Leave the existing template in place if the operator already populated
-    # it. The bootstrap interview is intentionally short on values.
-    if "Addressed as" in path.read_text(encoding="utf-8"):
-        return
+    frontmatter = (
+        "---\n"
+        "name: SOUL.md\n"
+        "purpose: The operator's core values and ANNA's relationship to them.\n"
+        "token_cap: 1500\n"
+        "last_evicted: null\n"
+        "---\n\n"
+    )
+    body_lines = ["# SOUL", ""]
+    if state.operator_context:
+        body_lines += ["## Operator context", state.operator_context, ""]
+    if state.operator_values:
+        body_lines += [
+            "## What to weigh on the operator's behalf",
+            state.operator_values,
+            "",
+        ]
+    body_lines += [
+        "## ANNA's relationship to those values",
+        "Treat the items above as standing instructions. When a request",
+        "conflicts with them, surface the conflict to the operator before",
+        "proceeding.",
+        "",
+    ]
+    path.write_text(frontmatter + "\n".join(body_lines), encoding="utf-8")
+
+
+def _seed_claude_file(state: WizardState) -> None:
+    path = state.anna_home / "core" / "CLAUDE.md"
+    frontmatter = (
+        "---\n"
+        "name: CLAUDE.md\n"
+        "purpose: High-level operating instructions ANNA reads on every session.\n"
+        "token_cap: 2500\n"
+        "last_evicted: null\n"
+        "---\n\n"
+    )
+    body_lines = ["# CLAUDE", ""]
+    if state.anna_role:
+        body_lines += ["## Role", state.anna_role, ""]
+    if state.anna_duties:
+        duties = [d.strip() for d in state.anna_duties.split(",") if d.strip()]
+        if duties:
+            body_lines += ["## Duties"]
+            body_lines += [f"- {d}" for d in duties]
+            body_lines += [""]
+    if state.anna_out_of_scope:
+        out = [s.strip() for s in state.anna_out_of_scope.split(",") if s.strip()]
+        if out:
+            body_lines += ["## Out of scope"]
+            body_lines += [f"- {s}" for s in out]
+            body_lines += [""]
+    if state.anna_tone:
+        body_lines += ["## Response style", state.anna_tone, ""]
+    body_lines += [
+        "## Standing operating rules",
+        "- Never reference the operator's other Claude Code agents, vault,",
+        "  or slash commands unless the operator asks.",
+        "- Surface uncertainty rather than guess.",
+        "- Confirm before irreversible actions.",
+        "",
+    ]
+    path.write_text(frontmatter + "\n".join(body_lines), encoding="utf-8")
 
 
 def step_final_wiring(state: WizardState) -> None:
@@ -533,6 +664,11 @@ def _print_live_commands(state: WizardState) -> None:
 @click.command()
 @click.option("--reconfigure", is_flag=True, help="Rerun the wizard and update existing config.")
 @click.option(
+    "--persona",
+    is_flag=True,
+    help="Run only the persona interview (re-write IDENTITY.md, SOUL.md, CLAUDE.md).",
+)
+@click.option(
     "--anna-home",
     type=click.Path(file_okay=False),
     default=lambda: os.path.expanduser(os.environ.get("ANNA_HOME", "~/anna")),
@@ -546,7 +682,7 @@ def _print_live_commands(state: WizardState) -> None:
     show_default=True,
     help="Markdown vault root.",
 )
-def main(reconfigure: bool, anna_home: str, vault_root: str) -> int:
+def main(reconfigure: bool, persona: bool, anna_home: str, vault_root: str) -> int:
     """Run the ANNA setup wizard."""
     configure_logging(level="INFO", format="json")
     log = get_logger("anna.setup")
@@ -557,6 +693,21 @@ def main(reconfigure: bool, anna_home: str, vault_root: str) -> int:
         reconfigure=reconfigure,
     )
     state.anna_home.mkdir(parents=True, exist_ok=True)
+
+    if persona:
+        log.info("setup.persona_only.start", anna_home=str(state.anna_home))
+        try:
+            step_persona_bootstrap(state, standalone=True)
+        except click.Abort:
+            click.secho("Persona interview cancelled.", fg="yellow")
+            return 1
+        click.secho(
+            "\nPersona files rewritten. Restart ANNA so the new identity loads:\n"
+            "  systemctl --user restart anna",
+            fg="green",
+        )
+        log.info("setup.persona_only.complete")
+        return 0
 
     log.info("setup.start", anna_home=str(state.anna_home), reconfigure=reconfigure)
 
@@ -578,6 +729,15 @@ def main(reconfigure: bool, anna_home: str, vault_root: str) -> int:
     _print_live_commands(state)
     log.info("setup.complete")
     return 0
+
+
+def persona_entrypoint() -> int:
+    """Console-script entry for ``anna-persona``.
+
+    Forwards to ``main(--persona)`` so the operator can re-run just the
+    persona interview without reconfiguring transports or auth.
+    """
+    return main.main(args=["--persona"], standalone_mode=False)
 
 
 if __name__ == "__main__":

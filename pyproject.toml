@@ -51,6 +51,7 @@ anna = "anna.__main__:main"
 anna-logs = "anna.cli.logs:main"
 anna-admin = "anna.cli.admin:main"
 anna-setup = "anna.setup.wizard:main"
+anna-persona = "anna.setup.wizard:persona_entrypoint"
 
 [project.urls]
 Homepage = "https://github.com/iamfuntime/anna"
