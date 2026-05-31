@@ -40,7 +40,9 @@ transports:
 vault:
   # Root directory for ANNA's markdown vault. Conversations, Identity
   # archives, sub-agent personas, and skills all live under this root.
-  path: ~/Obsidian/ANNA
+  # Obsidian users typically point this inside their existing vault;
+  # everyone else uses a standalone directory.
+  path: ~/anna/vault
 
 # ============================================================
 # Watchdog

@@ -47,7 +47,7 @@ class TransportsConfig(BaseModel):
 
 
 class VaultConfig(BaseModel):
-    path: str = "~/Obsidian/ANNA"
+    path: str = "~/anna/vault"
 
     @property
     def resolved_path(self) -> Path:
