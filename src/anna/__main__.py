@@ -1,14 +1,31 @@
 """ANNA process entrypoint.
 
-Invoked as ``python -m anna`` or via the ``anna`` console script. Loads
-config, wires logging, starts every enabled transport adapter, hands events
-to the conversation router, and runs the watchdog and housekeeping coroutines
-in parallel until the process is signalled.
+Invoked as ``python -m anna`` or via the ``anna`` console script. With no
+subcommand the daemon boots (loads config, wires logging, starts every
+enabled transport adapter, hands events to the conversation router, and
+runs the watchdog and housekeeping coroutines in parallel until the
+process is signalled). With a subcommand, dispatches to the matching CLI
+client.
+
+Subcommands (Phase 2 §5 subtask 11 — operator decision #6 unified the
+entry points under a single ``anna`` console-script):
+
+* ``daemon`` (or no subcommand): run the daemon. Preserves the
+  systemd-unit invocation ``ExecStart=%h/anna/.venv/bin/anna``.
+* ``chat``: interactive CLI client (``anna.cli.chat:main``).
+* ``ask``:  one-shot CLI client (``anna.cli.ask:main``).
+* ``admin``: operator administration commands (``anna.cli.admin:main``).
+
+Subcommand modules are imported lazily so a broken ``admin`` module (or
+one that does not yet exist) cannot crash ``anna chat`` or ``anna ask``
+and cannot regress the daemon-startup path the systemd unit relies on.
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
+import importlib
 import os
 import signal
 import sys
@@ -41,6 +58,15 @@ from anna.transports import build_enabled_adapters
 # socket / polling client to attach before ``health_check()`` returns
 # True. 3s is comfortably above the ~0.5s observed in production logs.
 _STARTUP_ALERT_DELAY_SECONDS = 3.0
+
+# Subcommands the dispatcher routes outside of the daemon path. The
+# value is the dotted module path that exposes a ``main()`` callable.
+# Lazy-imported only when the operator actually invokes that subcommand.
+_CLI_SUBCOMMANDS: dict[str, str] = {
+    "chat": "anna.cli.chat",
+    "ask": "anna.cli.ask",
+    "admin": "anna.cli.admin",
+}
 
 
 async def _run(config: AnnaConfig) -> None:
@@ -322,8 +348,14 @@ async def _send_startup_alert(
         )
 
 
-def main() -> int:
-    """Console entrypoint."""
+def run_daemon() -> int:
+    """Boot the ANNA daemon: load config, wire logging, run the loop.
+
+    Extracted verbatim from the pre-dispatcher ``main()`` body so the
+    systemd unit (``ExecStart=%h/anna/.venv/bin/anna`` — no subcommand)
+    keeps working unchanged. The dispatcher routes both the
+    no-subcommand and explicit ``daemon`` subcommand cases here.
+    """
     try:
         config = load_config()
     except Exception as exc:
@@ -339,6 +371,154 @@ def main() -> int:
     except KeyboardInterrupt:
         return 0
     return 0
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    """Construct the outer argparse parser for ``anna --help`` output.
+
+    Only used to render help text and to validate the first positional
+    argument against the known-subcommand list. We do NOT use this
+    parser to slice the per-subcommand argument tail — argparse has a
+    long-standing quirk where a leading ``--flag`` after a subcommand
+    gets consumed by the outer parser even when the subcommand
+    declares ``nargs=argparse.REMAINDER`` (see
+    https://bugs.python.org/issue9334). Instead, ``main()`` reads
+    ``sys.argv`` directly once it knows the subcommand is valid; the
+    parser here is purely for the help banner and for the unknown-
+    subcommand error path.
+    """
+    parser = argparse.ArgumentParser(
+        prog="anna",
+        description=(
+            "ANNA: Adaptive Neural Network Assistant. With no subcommand "
+            "the daemon boots (the systemd-unit invocation path). With a "
+            "subcommand, dispatches to the matching client."
+        ),
+    )
+    subparsers = parser.add_subparsers(dest="subcommand", required=False)
+    subparsers.add_parser(
+        "daemon",
+        help="run the ANNA daemon (default when no subcommand is given)",
+        add_help=False,
+    )
+    for name, module_path in _CLI_SUBCOMMANDS.items():
+        subparsers.add_parser(
+            name,
+            help=f"dispatch to {module_path}:main",
+            add_help=False,  # let the subcommand show its own --help
+        )
+    return parser
+
+
+def _dispatch_subcommand(name: str, rest: list[str]) -> int:
+    """Lazy-import the subcommand module and invoke its ``main()``.
+
+    Rewrites ``sys.argv`` to ``["anna <name>", *rest]`` before calling
+    so the subcommand's argv-parsing (whether argparse, click, or
+    hand-rolled) sees the right shape. Restores ``sys.argv`` on the way
+    out so test runners that re-enter the dispatcher in the same
+    process don't see leaked state.
+
+    For ``admin``: if the module fails to import we surface the stub
+    message and exit 2 (per subtask 11 spec — keeps the dispatcher
+    robust if a later refactor breaks ``anna.cli.admin``).
+    """
+    log = get_logger("anna.main")
+    log.debug("anna.dispatch", chosen=name)
+
+    module_path = _CLI_SUBCOMMANDS[name]
+    try:
+        module = importlib.import_module(module_path)
+    except Exception as exc:
+        if name == "admin":
+            sys.stderr.write(
+                "anna admin subcommands not yet available — pending subtask 12\n"
+            )
+            return 2
+        sys.stderr.write(f"anna {name}: failed to import {module_path}: {exc}\n")
+        return 2
+
+    if module is None or not hasattr(module, "main"):
+        if name == "admin":
+            sys.stderr.write(
+                "anna admin subcommands not yet available — pending subtask 12\n"
+            )
+            return 2
+        sys.stderr.write(
+            f"anna {name}: module {module_path} has no main() entry point\n"
+        )
+        return 2
+
+    saved_argv = sys.argv
+    sys.argv = [f"anna {name}", *rest]
+    try:
+        result = module.main()
+    except SystemExit as exc:
+        # click's standalone_mode=True (the default) raises SystemExit
+        # from inside main(). Surface its code so the outer process
+        # exit reflects the subcommand's intent.
+        code = exc.code if isinstance(exc.code, int) else (0 if exc.code is None else 1)
+        return code
+    finally:
+        sys.argv = saved_argv
+
+    if result is None:
+        return 0
+    if isinstance(result, int):
+        return result
+    return 0
+
+
+def main() -> int:
+    """``anna`` console entrypoint and ``python -m anna`` dispatcher.
+
+    No subcommand → daemon (the systemd-unit case). Explicit ``daemon``
+    → also the daemon. ``chat`` / ``ask`` / ``admin`` → lazy-import and
+    forward. Anything else → usage to stderr, exit 2.
+
+    The no-subcommand → daemon shortcut is taken via direct ``sys.argv``
+    inspection *before* argparse runs (per operator decision #6 — the
+    pre-existing systemd unit invokes ``anna`` with no args and must
+    keep working without argparse printing a help banner and exiting).
+
+    For the subcommand arms we slice ``sys.argv`` by hand rather than
+    rely on ``argparse.REMAINDER``: REMAINDER drops leading ``--flag``
+    tokens at the outer level (Python bug #9334), which would break
+    ``anna ask --foo``. The shape we want — "first positional decides
+    the subcommand, everything after that is passed through verbatim"
+    — is trivial without argparse once we've already detected the
+    no-arg fast-path.
+    """
+    # Fast-path: bare ``anna`` (no args) → daemon. Done before argparse
+    # so the help-on-no-subcommand default is never triggered. See the
+    # subtask 11 spec ("Decisions section") for the choice rationale.
+    if len(sys.argv) == 1:
+        return run_daemon()
+
+    # Handle top-level help / version before subcommand routing so
+    # ``anna --help`` works the way an operator expects (and doesn't
+    # get parsed as a subcommand).
+    first = sys.argv[1]
+    if first in ("-h", "--help"):
+        _build_parser().print_help()
+        return 0
+
+    if first == "daemon":
+        # ``anna daemon`` with trailing args is treated the same as
+        # bare ``anna daemon`` — the daemon does not accept argv flags
+        # today; if a future slice grows them, swap to argparse here.
+        return run_daemon()
+
+    if first in _CLI_SUBCOMMANDS:
+        rest = list(sys.argv[2:])
+        return _dispatch_subcommand(first, rest)
+
+    # Anything else: print usage to stderr and exit 2. We synthesize a
+    # short error line first so the operator sees the bad-token name,
+    # then dump the help banner from the parser.
+    sys.stderr.write(f"anna: unknown subcommand: {first}\n")
+    _build_parser().print_usage(sys.stderr)
+    return 2
 
 
 if __name__ == "__main__":
