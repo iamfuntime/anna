@@ -27,9 +27,15 @@ curl -fsSL https://anna.funtime.dev/install.sh | bash
 ```
 
 The script clones this repository, creates a venv, runs `pip install -e .`, and hands
-off to the setup wizard. The wizard interrogates the operator for credentials, writes
-`.env` at `chmod 600`, installs the systemd user unit, and runs a health check against
-every enabled transport.
+off to the setup wizard. The wizard is a calm, guided interview: it collects credentials,
+writes `.env` at `chmod 600` and `anna.yaml`, seeds ANNA's core identity files, installs
+and starts the systemd user unit, then waits and reports honest per-transport readiness
+(Slack/Telegram connected, or where to look if not). Press Enter to accept defaults; pass
+`--verbose` to see the full channel walkthroughs inline.
+
+The channel walkthroughs are summarized in the wizard; the full step-by-step guides
+(with the gotchas) live in [`docs/slack-setup.md`](docs/slack-setup.md) and
+[`docs/telegram-setup.md`](docs/telegram-setup.md).
 
 ### Manual install
 

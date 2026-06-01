@@ -7,31 +7,43 @@ Per v3 section 4. Seven steps:
 3. Telegram path with BotFather walkthrough.
 4. Slack path with Slack-app and Socket Mode walkthrough.
 5. Auth path: MAX subscription or API key.
-6. Persona bootstrap: writes SOUL.md and IDENTITY.md.
-7. Final wiring: write .env at chmod 600, install systemd unit, health check.
+6. Persona bootstrap: seeds IDENTITY.md, SOUL.md, and CLAUDE.md.
+7. Final wiring: pre-flight confirm, write .env at chmod 600 + anna.yaml,
+   install + start the systemd unit, then probe real per-transport readiness.
 
-Every completed interview step emits ``audit.setup.step_completed``. Reruns
-under ``--reconfigure`` that change an answer emit ``audit.setup.step_changed``.
-Credentials are never logged literally; tokens are recorded as their last
-four characters only.
+The wizard owns stdout as a human conversation: it does NOT call
+``configure_logging`` (that is the long-running service's job), so no JSON log
+lines leak between prompts. Every completed interview step still emits
+``audit.setup.step_completed`` to the audit JSONL file (``audit.setup.step_changed``
+on a changed answer under ``--reconfigure``). Credentials are never logged
+literally; tokens are recorded as their last four characters only.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import os
+import select
 import shutil
 import stat
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import click
+import structlog
 
 from anna.core.identity import ensure_core_files
-from anna.log import audit_event, configure_logging, get_logger
+from anna.log import audit_event
+
+# Repo/docs URLs surfaced in the walkthroughs so the operator always has a
+# canonical, screenshot-friendly reference one click away.
+_DOCS_BASE = "https://github.com/iamfuntime/anna/blob/main/docs"
 
 
 # ---------------------------------------------------------------------------
@@ -61,7 +73,46 @@ class WizardState:
     anna_out_of_scope: str = ""
     anna_tone: str = ""
     reconfigure: bool = False
+    verbose: bool = False
     answers: dict[str, str] = field(default_factory=dict)
+
+
+def _silence_console_logging() -> None:
+    """Keep the interactive wizard's console clean.
+
+    The wizard owns stdout as a human conversation, so it deliberately does NOT
+    call ``configure_logging`` (that wires a JSON StreamHandler to stdout for
+    the long-running service). But structlog's *default* configuration prints
+    every INFO event to stdout via its own ``PrintLogger`` — so the audit
+    mirrors emitted by ``audit_event`` would still scroll past between prompts.
+
+    We reconfigure structlog locally for the wizard process: a filtering bound
+    logger that drops everything below WARNING (the INFO ``audit.setup.*``
+    mirrors vanish) and a ``PrintLogger`` aimed at *stderr*. The audit *file*
+    write inside ``audit_event`` is independent of this and stays fully intact.
+
+    A broken audit write still logs CRITICAL, which clears the WARNING filter
+    and prints to stderr — a broken audit trail should be loud. The running
+    service is unaffected: it never imports/runs the wizard ``main``, and
+    ``configure_logging`` overrides this on its own startup.
+    """
+    structlog.configure(
+        wrapper_class=structlog.make_filtering_bound_logger(logging.WARNING),
+        logger_factory=structlog.PrintLoggerFactory(file=sys.stderr),
+        cache_logger_on_first_use=False,
+    )
+
+
+def _emit_lifecycle(state: WizardState, *, event: str, **fields: Any) -> None:
+    """Record a wizard lifecycle event (start/complete) to the audit trail.
+
+    Replaces the old ``log.info`` lifecycle calls so nothing prints to the
+    console during the interactive wizard, while the JSONL audit file still
+    captures the run for later inspection via ``anna-logs --audit``.
+    """
+    audit_dir = state.anna_home / "audit"
+    audit_dir.mkdir(parents=True, exist_ok=True)
+    audit_event(event, audit_dir=audit_dir, actor="operator", **fields)
 
 
 def _last4(secret: str) -> str:
@@ -105,6 +156,92 @@ def _emit_step(
 
 
 # ---------------------------------------------------------------------------
+# Walkthroughs
+# ---------------------------------------------------------------------------
+
+# Brief = the few lines almost everyone needs. Detailed = every gotcha, shown
+# on request (the operator answers "yes" to the expander, or passes --verbose).
+# The full long-form also lives in docs/ for those who prefer screenshots.
+
+TELEGRAM_STEPS_BRIEF = (
+    "Create a bot with Telegram's @BotFather:\n"
+    "  1. DM @BotFather and send /newbot.\n"
+    "  2. Pick a name and a username ending in 'bot'.\n"
+    "  3. Copy the HTTP API token it gives you, and paste it below.\n"
+    f"  Full guide (with screenshots): {_DOCS_BASE}/telegram-setup.md"
+)
+
+TELEGRAM_STEPS_DETAILED = (
+    "Detailed Telegram setup:\n"
+    "  1. Open Telegram and start a chat with @BotFather.\n"
+    "  2. Send /newbot. Pick a display name, then a username ending in 'bot'.\n"
+    "  3. BotFather replies with an HTTP API token (digits:letters). Copy it.\n"
+    "  4. Paste it below. The token is stored in .env at chmod 600 and is\n"
+    "     never logged; only its last 4 characters appear in audit events.\n"
+    "  5. After this, DM your new bot once from your own account so ANNA can\n"
+    "     learn your numeric user ID (asked next). ANNA pins its allowed-users\n"
+    "     list to that ID so strangers can't talk to her."
+)
+
+SLACK_STEPS_BRIEF = (
+    "Create a Slack app at https://api.slack.com/apps ('From scratch'):\n"
+    "  1. OAuth & Permissions -> add bot scopes (chat:write, im:history,\n"
+    "     im:read, im:write, app_mentions:read, channels:read, groups:read,\n"
+    "     chat:write.public).\n"
+    "  2. Socket Mode -> enable; create an app-level token (connections:write).\n"
+    "  3. Event Subscriptions -> enable; subscribe to message.im + app_mention.\n"
+    "  4. App Home -> enable the Messages tab AND 'Allow users to send ...\n"
+    "     messages from the messages tab'.\n"
+    "  5. Install to your workspace, then copy the bot (xoxb-) and app (xapp-)\n"
+    "     tokens below.\n"
+    f"  Full guide (with screenshots + gotchas): {_DOCS_BASE}/slack-setup.md"
+)
+
+SLACK_STEPS_DETAILED = (
+    "Detailed Slack setup:\n"
+    "  1. Visit https://api.slack.com/apps -> 'Create New App' -> 'From scratch'.\n"
+    "  2. Under 'OAuth & Permissions', add bot scopes:\n"
+    "       chat:write, chat:write.public, channels:read, groups:read,\n"
+    "       app_mentions:read, im:history, im:read, im:write.\n"
+    "  3. Under 'Socket Mode', enable Socket Mode. Create an app-level token\n"
+    "     with the connections:write scope.\n"
+    "  4. Under 'Event Subscriptions':\n"
+    "       a. Toggle 'Enable Events' ON.\n"
+    "       b. Under 'Subscribe to bot events', click 'Add Bot User Event'\n"
+    "          and add BOTH (you need both — message.im covers DMs,\n"
+    "          app_mention covers @anna in channels):\n"
+    "            - message.im     (required for DMs)\n"
+    "            - app_mention    (required for @anna in channels)\n"
+    "       c. Save changes at the bottom of the page.\n"
+    "  5. Under 'App Home':\n"
+    "       - Set a Display Name and Default Username for the bot user.\n"
+    "       - Under 'Show Tabs', enable the Messages Tab AND tick the checkbox\n"
+    "         'Allow users to send Slash commands and messages from the\n"
+    "         messages tab'. Without it Slack shows 'Sending messages to this\n"
+    "         app has been turned off' when you try to DM the bot.\n"
+    "  6. Install the app to your workspace.\n"
+    "  7. Copy the bot token (xoxb-...) and the app token (xapp-...).\n"
+    "\n"
+    "  If you change scopes or events later, you must Reinstall the app from\n"
+    "  'OAuth & Permissions' for the changes to take effect."
+)
+
+
+def _walkthrough(brief: str, detailed: str, *, verbose: bool, what: str) -> None:
+    """Print the brief walkthrough, then the detailed one only if asked.
+
+    ``verbose`` (the --verbose flag) forces the detailed view; otherwise the
+    operator is offered an opt-in expander so the happy path stays calm.
+    """
+    click.echo(brief)
+    if verbose:
+        click.echo("\n" + detailed)
+        return
+    if click.confirm(f"\nShow the detailed {what} setup steps?", default=False):
+        click.echo("\n" + detailed)
+
+
+# ---------------------------------------------------------------------------
 # Steps
 # ---------------------------------------------------------------------------
 
@@ -145,14 +282,9 @@ def step_channel_selection(state: WizardState) -> None:
 def step_telegram_path(state: WizardState) -> None:
     if not state.use_telegram:
         return
-    click.secho("\n[3/7] Telegram path: BotFather walkthrough", bold=True, fg="cyan")
-    click.echo(
-        "1. Open Telegram and start a chat with @BotFather.\n"
-        "2. Send /newbot. Pick a display name and a username ending in `bot`.\n"
-        "3. BotFather will reply with an HTTP API token. Copy it.\n"
-        "4. Paste it below. The token is stored in .env at chmod 600 and is\n"
-        "   never logged. Only the last 4 characters appear in audit events."
-    )
+    click.secho("\n[3/7] Telegram setup", bold=True, fg="cyan")
+    _walkthrough(TELEGRAM_STEPS_BRIEF, TELEGRAM_STEPS_DETAILED, verbose=state.verbose, what="Telegram")
+    click.echo("")
     token = click.prompt(
         "Telegram bot token",
         hide_input=True,
@@ -174,35 +306,9 @@ def step_telegram_path(state: WizardState) -> None:
 def step_slack_path(state: WizardState) -> None:
     if not state.use_slack:
         return
-    click.secho("\n[4/7] Slack path: Slack-app and Socket Mode walkthrough", bold=True, fg="cyan")
-    click.echo(
-        "1. Visit https://api.slack.com/apps and click 'Create New App' -> 'From scratch'.\n"
-        "2. Under 'OAuth & Permissions', add bot scopes:\n"
-        "     chat:write, chat:write.public, channels:read, groups:read,\n"
-        "     app_mentions:read, im:history, im:read, im:write.\n"
-        "3. Under 'Socket Mode', enable Socket Mode. Create an app-level token\n"
-        "   with the connections:write scope.\n"
-        "4. Under 'Event Subscriptions':\n"
-        "     a. Toggle 'Enable Events' ON.\n"
-        "     b. Under 'Subscribe to bot events', click 'Add Bot User Event'\n"
-        "        and add BOTH of the following (you need both — message.im\n"
-        "        covers DMs, app_mention covers @anna in channels):\n"
-        "          - message.im     (required for DMs)\n"
-        "          - app_mention    (required for @anna in channels)\n"
-        "     c. Save changes at the bottom of the page.\n"
-        "5. Under 'App Home':\n"
-        "     - Set a Display Name and Default Username for the bot user.\n"
-        "     - Under 'Show Tabs', enable the Messages Tab AND tick the\n"
-        "       checkbox 'Allow users to send Slash commands and messages\n"
-        "       from the messages tab'. Without this checkbox Slack shows\n"
-        "       'Sending messages to this app has been turned off' when\n"
-        "       you try to DM the bot.\n"
-        "6. Install the app to your workspace.\n"
-        "7. Copy the bot token (xoxb-...) and the app token (xapp-...).\n"
-        "\n"
-        "If you change scopes or events later, you must Reinstall the app\n"
-        "from 'OAuth & Permissions' for the changes to take effect."
-    )
+    click.secho("\n[4/7] Slack setup", bold=True, fg="cyan")
+    _walkthrough(SLACK_STEPS_BRIEF, SLACK_STEPS_DETAILED, verbose=state.verbose, what="Slack")
+    click.echo("")
     bot_token = click.prompt("Slack bot token (xoxb-...)", hide_input=True, confirmation_prompt=True)
     state.slack_bot_token = bot_token
     _emit_step(state, step="slack.bot_token", answer=bot_token, is_secret=True)
@@ -476,15 +582,46 @@ def _seed_claude_file(state: WizardState) -> None:
     path.write_text(frontmatter + "\n".join(body_lines), encoding="utf-8")
 
 
-def step_final_wiring(state: WizardState) -> None:
+def step_final_wiring(state: WizardState) -> dict[str, Any] | None:
+    """Write config, install + start the service, and probe real readiness.
+
+    Returns the probe result (see ``_start_and_probe``) so the caller can print
+    an honest recap, or ``None`` when the service could not be started here
+    (no systemd / missing unit) and the operator must start it themselves.
+    """
     click.secho("\n[7/7] Final wiring", bold=True, fg="cyan")
+    if not _confirm_plan(state):
+        raise click.Abort()
+
     env_path = state.anna_home / ".env"
     yaml_path = state.anna_home / "anna.yaml"
     _write_env_file(state, env_path)
     _write_anna_yaml(state, yaml_path)
-    _install_systemd_unit(state)
     _emit_step(state, step="wiring.env_file_written", answer=str(env_path))
     _emit_step(state, step="wiring.anna_yaml_written", answer=str(yaml_path))
+    return _install_systemd_unit(state)
+
+
+def _confirm_plan(state: WizardState) -> bool:
+    """Show what the wizard is about to write, then ask once for the go-ahead.
+
+    A calm, no-surprises checkpoint before any file is created or the service
+    started. Returns True to proceed, False to abort cleanly.
+    """
+    transports = []
+    if state.use_slack:
+        transports.append("Slack")
+    if state.use_telegram:
+        transports.append("Telegram")
+
+    click.echo("Here's what I'll set up:")
+    click.echo(f"  Channels    : {', '.join(transports) or 'none'}")
+    click.echo(f"  Claude auth : {state.auth_mode}")
+    click.echo(f"  Vault root  : {state.vault_root}")
+    click.echo(f"  Config      : {state.anna_home / 'anna.yaml'}")
+    click.echo(f"  Secrets     : {state.anna_home / '.env'} (chmod 600)")
+    click.echo(f"  Service     : systemd user unit 'anna', enabled + started now")
+    return click.confirm("\nWrite config and start ANNA?", default=True)
 
 
 def _write_env_file(state: WizardState, path: Path) -> None:
@@ -580,10 +717,10 @@ sessions:
     path.write_text(body, encoding="utf-8")
 
 
-def _install_systemd_unit(state: WizardState) -> None:
-    """Copy the packaged systemd unit into ~/.config/systemd/user/ and
-    enable + start the service so ANNA is running by the time the
-    wizard exits.
+def _install_systemd_unit(state: WizardState) -> dict[str, Any] | None:
+    """Copy the packaged systemd unit into ~/.config/systemd/user/, then start
+    and probe the service. Returns the probe result, or ``None`` if the unit
+    file is missing (operator must wire it up manually).
     """
     target_dir = Path(os.path.expanduser("~/.config/systemd/user"))
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -596,72 +733,243 @@ def _install_systemd_unit(state: WizardState) -> None:
             f"`systemctl --user enable --now anna`.",
             fg="yellow",
         )
-        return
+        return None
 
     shutil.copy2(src, target)
-    click.secho(f"Installed systemd unit at {target}", fg="green")
-    _start_systemd_service()
+    return _start_and_probe(state)
 
 
-def _start_systemd_service() -> None:
-    """Reload systemd, enable the unit for boot, and start it now.
+def _now_journal_since() -> str:
+    """A `journalctl --since` timestamp for 'now', in local time.
 
-    Each step is best-effort: a missing or unusable systemd is downgraded
-    to a yellow warning with the exact recovery command, since the wizard
-    runs on systems where `systemctl --user` may not be available
-    (headless boxes without linger, WSL without systemd, macOS).
+    journalctl interprets a bare ``YYYY-MM-DD HH:MM:SS`` string in the system
+    timezone, so we capture local now (not UTC) right before starting the unit
+    and only read lines from this boot forward.
+    """
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _journal_events(since: str, deadline: float):
+    """Yield parsed ANNA event dicts from the user journal until ``deadline``.
+
+    Spawns ``journalctl --user -u anna -o json --since <since> -f`` and reads
+    line-by-line, bounded by a monotonic deadline via ``select`` so a quiet
+    service never blocks the wizard. journald's ``-o json`` wraps the real
+    event JSON inside the ``MESSAGE`` field, so we decode twice and skip any
+    line that isn't an ANNA structured event. Best-effort: yields nothing if
+    journald is unavailable.
+    """
+    cmd = ["journalctl", "--user", "-u", "anna", "-o", "json", "--since", since, "-f"]
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    except OSError:
+        return
+    try:
+        assert proc.stdout is not None
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            ready, _, _ = select.select([proc.stdout], [], [], remaining)
+            if not ready:
+                break
+            line = proc.stdout.readline()
+            if not line:
+                break
+            try:
+                outer = json.loads(line)
+                inner = json.loads(outer.get("MESSAGE", ""))
+            except (json.JSONDecodeError, TypeError, AttributeError):
+                continue
+            if isinstance(inner, dict) and "event" in inner:
+                yield inner
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            proc.kill()
+
+
+def _await_readiness(state: WizardState, *, since: str, timeout_s: int = 20) -> dict[str, Any] | None:
+    """Tail the journal after start, classifying per-transport connectivity.
+
+    Returns a dict ``{"transports": {name: "ok"|"failed"|"timeout"},
+    "bot_username": str, "errors": {name: str}}`` or ``None`` when journald
+    can't be probed (no journalctl / non-systemd session) so the caller can
+    fall back to a calm "watch the logs" message instead of a false claim.
+    """
+    if not shutil.which("journalctl"):
+        return None
+
+    expected: set[str] = set()
+    if state.use_slack:
+        expected.add("slack")
+    if state.use_telegram:
+        expected.add("telegram")
+
+    results: dict[str, Any] = {"transports": {}, "bot_username": "", "errors": {}}
+    seen: set[str] = set()
+    deadline = time.monotonic() + timeout_s
+
+    for inner in _journal_events(since, deadline):
+        event = inner.get("event")
+        channel = inner.get("channel")
+        if event == "channel.connected" and channel:
+            results["transports"][channel] = "ok"
+            seen.add(channel)
+            if channel == "telegram" and inner.get("bot_username"):
+                results["bot_username"] = inner["bot_username"]
+        elif event in ("channel.health_check_failed", "channel.import_failed") and channel:
+            results["transports"][channel] = "failed"
+            results["errors"][channel] = inner.get("error", "")
+            seen.add(channel)
+        if expected and expected.issubset(seen):
+            break
+
+    # Any expected transport we never heard from timed out (slow network, or
+    # the service is still coming up). Not fatal — the recap points at the logs.
+    for channel in expected:
+        results["transports"].setdefault(channel, "timeout")
+    return results
+
+
+def _start_and_probe(state: WizardState) -> dict[str, Any] | None:
+    """daemon-reload, enable + start the unit, then probe readiness.
+
+    Returns ``{"service": "active"|"failed"|"unknown", "restarts": int,
+    "readiness": <_await_readiness result or None>}`` or ``None`` when
+    systemctl is unavailable (WSL without systemd, macOS) so the wizard degrades
+    to a manual-start hint rather than pretending the service is up.
     """
     if not shutil.which("systemctl"):
         click.secho(
-            "Warning: systemctl not found. Start ANNA manually with the "
-            "method appropriate for your init system.",
+            "Note: systemctl --user not available here. Config is written; "
+            "start ANNA with the method appropriate for your init system.",
             fg="yellow",
         )
-        return
+        return None
 
     def _run(args: list[str], purpose: str) -> bool:
         try:
             subprocess.run(args, check=True, capture_output=True, text=True)
             return True
         except subprocess.CalledProcessError as exc:
-            stderr = (exc.stderr or "").strip()
-            click.secho(
-                f"Warning: {purpose} failed ({' '.join(args)}): {stderr}",
-                fg="yellow",
-            )
+            click.secho(f"Warning: {purpose} failed: {(exc.stderr or '').strip()}", fg="yellow")
             return False
 
-    if not _run(["systemctl", "--user", "daemon-reload"], "systemd daemon-reload"):
-        return
-    if not _run(["systemctl", "--user", "enable", "--now", "anna.service"], "enable + start anna"):
-        return
+    _run(["systemctl", "--user", "daemon-reload"], "systemd daemon-reload")
+    since = _now_journal_since()
+    started = _run(["systemctl", "--user", "enable", "--now", "anna.service"], "enable + start anna")
 
-    # Verify the service actually came up; surface the journalctl pointer
-    # immediately if it did not so the operator does not chase a silent failure.
-    status = subprocess.run(
-        ["systemctl", "--user", "is-active", "anna.service"],
-        capture_output=True,
-        text=True,
+    click.echo("Starting ANNA and waiting for her to connect…")
+    readiness = _await_readiness(state, since=since) if started else None
+
+    is_active = subprocess.run(
+        ["systemctl", "--user", "is-active", "anna.service"], capture_output=True, text=True
     )
-    state_text = status.stdout.strip() or status.stderr.strip()
-    if status.returncode == 0:
-        click.secho(f"anna.service is {state_text}.", fg="green")
-    else:
-        click.secho(
-            f"Warning: anna.service is {state_text or 'not active'}. "
-            f"Run `journalctl --user -u anna -xe` to see why.",
-            fg="yellow",
+    service_state = (is_active.stdout.strip() or is_active.stderr.strip() or "unknown")
+    restarts = _systemd_restart_count()
+    return {"service": service_state, "restarts": restarts, "readiness": readiness}
+
+
+def _systemd_restart_count() -> int:
+    """Best-effort read of the unit's NRestarts (a restart loop = boot failure)."""
+    try:
+        out = subprocess.run(
+            ["systemctl", "--user", "show", "-p", "NRestarts", "--value", "anna.service"],
+            capture_output=True,
+            text=True,
         )
+        return int((out.stdout or "0").strip() or "0")
+    except (ValueError, OSError):
+        return 0
 
 
-def _print_live_commands(state: WizardState) -> None:
-    click.secho("\nANNA is online.", bold=True, fg="green")
+def _linger_hint() -> str | None:
+    """Return a one-line linger warning if the user's services stop on logout."""
+    if not shutil.which("loginctl"):
+        return None
+    try:
+        out = subprocess.run(
+            ["loginctl", "show-user", os.environ.get("USER", ""), "-p", "Linger", "--value"],
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
+    if out.stdout.strip().lower() in ("no", ""):
+        user = os.environ.get("USER", "$USER")
+        return f"Heads up: enable linger so ANNA keeps running after you log out:\n  loginctl enable-linger {user}"
+    return None
+
+
+def _print_readiness_recap(state: WizardState, probe: dict[str, Any] | None) -> None:
+    """Honest, warm closing recap: what she is, how to reach her, what's next."""
+    click.echo("")
+    # --- Headline reflects reality, not just "we ran systemctl". ---
+    if probe is None:
+        click.secho("ANNA is configured.", bold=True, fg="yellow")
+        click.echo("Start her, then watch her come online:  anna-logs --follow")
+    else:
+        readiness = probe.get("readiness")
+        boot_ok = probe.get("service") == "active" and probe.get("restarts", 0) == 0
+        if boot_ok:
+            click.secho("ANNA is online.", bold=True, fg="green")
+        elif probe.get("restarts", 0) > 0 or probe.get("service") in ("activating", "failed"):
+            click.secho("ANNA started but isn't healthy yet.", bold=True, fg="red")
+            if state.auth_mode == "max":
+                click.echo("Most likely Claude auth — run `claude login`, then: systemctl --user restart anna")
+            click.echo("See why:  anna-logs --follow")
+        else:
+            click.secho("ANNA is starting.", bold=True, fg="yellow")
+
+        # --- Per-transport status, if we could probe the journal. ---
+        if readiness is not None:
+            _print_transport_lines(readiness)
+
+    # --- How to talk to her now. ---
+    bot_username = ""
+    if probe and probe.get("readiness"):
+        bot_username = probe["readiness"].get("bot_username", "")
+    _print_talk_to_her(state, bot_username)
+
+    # --- Next steps. ---
+    click.secho("\nNext steps", bold=True)
     click.echo(
-        "- Service:     systemctl --user status anna\n"
-        "- Live logs:   anna-logs --follow\n"
-        "- Audit:       anna-logs --audit\n"
-        "- Reconfigure: anna-setup --reconfigure"
+        "  Status      : systemctl --user status anna\n"
+        "  Live logs   : anna-logs --follow\n"
+        "  Audit trail : anna-logs --audit\n"
+        "  Reconfigure : anna-setup --reconfigure\n"
+        "  Edit persona: anna-persona"
     )
+    hint = _linger_hint()
+    if hint:
+        click.secho("\n" + hint, fg="yellow")
+
+
+def _print_transport_lines(readiness: dict[str, Any]) -> None:
+    labels = {"slack": "Slack", "telegram": "Telegram"}
+    for channel, status in sorted(readiness.get("transports", {}).items()):
+        label = labels.get(channel, channel).ljust(9)
+        if status == "ok":
+            click.secho(f"  {label} connected", fg="green")
+        elif status == "failed":
+            err = readiness.get("errors", {}).get(channel, "")
+            click.secho(f"  {label} failed — {err or 'check anna-logs --follow'}", fg="red")
+        else:
+            click.secho(f"  {label} not connected yet — watch anna-logs --follow", fg="yellow")
+
+
+def _print_talk_to_her(state: WizardState, bot_username: str) -> None:
+    click.secho("\nTalk to her", bold=True)
+    if state.use_telegram:
+        if bot_username:
+            click.echo(f"  Telegram : DM @{bot_username} and say hi.")
+        else:
+            click.echo("  Telegram : DM your new bot and say hi.")
+    if state.use_slack:
+        click.echo("  Slack    : DM the app, or @-mention it in a channel.")
 
 
 # ---------------------------------------------------------------------------
@@ -676,6 +984,7 @@ def _print_live_commands(state: WizardState) -> None:
     is_flag=True,
     help="Run only the persona interview (re-write IDENTITY.md, SOUL.md, CLAUDE.md).",
 )
+@click.option("--verbose", is_flag=True, help="Show the detailed channel-setup walkthroughs inline.")
 @click.option(
     "--anna-home",
     type=click.Path(file_okay=False),
@@ -690,20 +999,23 @@ def _print_live_commands(state: WizardState) -> None:
     show_default=True,
     help="Markdown vault root.",
 )
-def main(reconfigure: bool, persona: bool, anna_home: str, vault_root: str) -> int:
+def main(reconfigure: bool, persona: bool, verbose: bool, anna_home: str, vault_root: str) -> int:
     """Run the ANNA setup wizard."""
-    configure_logging(level="INFO", format="json")
-    log = get_logger("anna.setup")
+    # The wizard owns stdout as a human conversation, so we deliberately do not
+    # call configure_logging (that wires JSON to stdout for the service). This
+    # keeps the audit JSONL intact while leaving the console clean.
+    _silence_console_logging()
 
     state = WizardState(
         anna_home=Path(anna_home),
         vault_root=Path(vault_root),
         reconfigure=reconfigure,
+        verbose=verbose,
     )
     state.anna_home.mkdir(parents=True, exist_ok=True)
 
     if persona:
-        log.info("setup.persona_only.start", anna_home=str(state.anna_home))
+        _emit_lifecycle(state, event="setup.persona_only.start", anna_home=str(state.anna_home))
         try:
             step_persona_bootstrap(state, standalone=True)
         except click.Abort:
@@ -714,11 +1026,12 @@ def main(reconfigure: bool, persona: bool, anna_home: str, vault_root: str) -> i
             "  systemctl --user restart anna",
             fg="green",
         )
-        log.info("setup.persona_only.complete")
+        _emit_lifecycle(state, event="setup.persona_only.complete")
         return 0
 
-    log.info("setup.start", anna_home=str(state.anna_home), reconfigure=reconfigure)
+    _emit_lifecycle(state, event="setup.start", anna_home=str(state.anna_home), reconfigure=reconfigure)
 
+    click.secho("Welcome — let's get ANNA set up. This takes a couple of minutes.", bold=True, fg="cyan")
     try:
         step_storage_path(state)
         step_channel_selection(state)
@@ -726,16 +1039,16 @@ def main(reconfigure: bool, persona: bool, anna_home: str, vault_root: str) -> i
         step_slack_path(state)
         step_auth_path(state)
         step_persona_bootstrap(state)
-        step_final_wiring(state)
+        probe = step_final_wiring(state)
     except click.UsageError as exc:
         click.secho(f"Setup aborted: {exc}", fg="red")
         return 2
     except click.Abort:
-        click.secho("Setup cancelled by operator.", fg="yellow")
+        click.secho("Setup cancelled. Nothing was started; re-run anna-setup any time.", fg="yellow")
         return 1
 
-    _print_live_commands(state)
-    log.info("setup.complete")
+    _print_readiness_recap(state, probe)
+    _emit_lifecycle(state, event="setup.complete")
     return 0
 
 

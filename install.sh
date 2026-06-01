@@ -29,7 +29,11 @@ die() { printf '\033[1;31m[anna]\033[0m %s\n' "$*" >&2; exit 1; }
 check_prereq() {
     local name="$1"
     local cmd="$2"
-    command -v "$cmd" >/dev/null 2>&1 || die "missing prerequisite: $name ($cmd)"
+    local hint="$3"
+    command -v "$cmd" >/dev/null 2>&1 && return 0
+    warn "missing prerequisite: $name"
+    [ -n "$hint" ] && warn "  install it with: $hint"
+    die "install $name and re-run this script."
 }
 
 check_python_version() {
@@ -40,23 +44,30 @@ check_python_version() {
             say "python $version detected"
             ;;
         *)
-            die "ANNA requires Python 3.11+, found $version"
+            warn "ANNA requires Python 3.11 or newer, found $version."
+            die "install a newer Python (your package manager, pyenv, or python.org) and re-run."
             ;;
     esac
 }
 
 main() {
     say "checking prerequisites"
-    check_prereq "git" "git"
-    check_prereq "curl" "curl"
-    check_prereq "python3" "$PYTHON_BIN"
+    check_prereq "git" "git" "apt install git  /  brew install git"
+    check_prereq "curl" "curl" "apt install curl  /  brew install curl"
+    check_prereq "python3" "$PYTHON_BIN" "apt install python3 python3-venv  /  brew install python"
     check_python_version
 
     if [ -d "$ANNA_HOME/.git" ]; then
-        say "existing checkout at $ANNA_HOME, pulling latest"
-        git -C "$ANNA_HOME" pull --ff-only
+        say "updating existing install at $ANNA_HOME"
+        # Fast-forward only; never rewrite the operator's history. Runtime
+        # artifacts (.env, anna.yaml, core/, vault/, audit/, transcripts/) are
+        # gitignored at the repo root, so a pull won't touch them. If the
+        # operator hand-edited a *tracked* file the ff fails — warn and keep
+        # going with the current checkout rather than aborting the install.
+        git -C "$ANNA_HOME" pull --ff-only || \
+            warn "couldn't fast-forward (local edits to tracked files?). Continuing with the current checkout; inspect with: git -C $ANNA_HOME status"
     else
-        say "cloning $REPO_URL into $ANNA_HOME"
+        say "fresh install: cloning $REPO_URL into $ANNA_HOME"
         git clone "$REPO_URL" "$ANNA_HOME"
     fi
 
