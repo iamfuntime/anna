@@ -53,6 +53,13 @@ dependencies = [
     "google-api-python-client>=2.140",
     "google-auth-oauthlib>=1.2",
     "google-auth-httplib2>=0.2",
+    # Phase 2 tool surface: httpx for web_search (Brave REST), web_fetch,
+    # and vault_download. markdownify converts fetched HTML to Markdown so
+    # the SDK gets clean text instead of raw tags. Playwright (JS-render
+    # fallback for web_fetch) is deferred to a later slice — when added,
+    # the post-install step `playwright install chromium` is required.
+    "httpx>=0.27",
+    "markdownify>=0.13",
 ]
 
 [project.optional-dependencies]
