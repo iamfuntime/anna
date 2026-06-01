@@ -678,10 +678,8 @@ runtime:
 transports:
   slack:
     enabled: {slack_enabled}
-    admin_channel: "{slack_admin}"
   telegram:
     enabled: {telegram_enabled}
-    admin_chat_id: "{telegram_admin}"
 
 vault:
   path: {state.vault_root}
@@ -712,6 +710,10 @@ housekeeping:
 sessions:
   dm_gap_hours: 8
   thread_gap_hours: 1
+
+admin:
+  slack_channel_id: "{slack_admin}"
+  telegram_chat_id: "{telegram_admin}"
 """
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(body, encoding="utf-8")

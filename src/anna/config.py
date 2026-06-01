@@ -49,12 +49,10 @@ class RuntimeConfig(BaseModel):
 
 class SlackTransportConfig(BaseModel):
     enabled: bool = False
-    admin_channel: str = ""
 
 
 class TelegramTransportConfig(BaseModel):
     enabled: bool = False
-    admin_chat_id: str = ""
 
 
 class TransportsConfig(BaseModel):
