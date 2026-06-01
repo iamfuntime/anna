@@ -27,6 +27,17 @@ ExecStart=%h/anna/.venv/bin/anna
 Restart=on-failure
 RestartSec=10
 
+# KillMode=mixed: SIGTERM goes only to the main PID (the asyncio loop in
+# __main__.py); child processes survive long enough for the closeout path
+# in ConversationRouter.shutdown() to query the Claude SDK subprocess for
+# each worker's checkpoint summary. Without this, SIGTERM hits the whole
+# cgroup and the SDK subprocess dies concurrently, forcing closeout to
+# fall back to a placeholder summary. TimeoutStopSec bounds how long
+# systemd waits before SIGKILLing the rest of the cgroup if the main
+# process has not exited.
+KillMode=mixed
+TimeoutStopSec=60
+
 # Forward stdout and stderr to the user journal. ANNA emits structured
 # JSON to stdout; journald stores it. The anna-logs wrapper reads it back
 # with journalctl --user -u anna.
