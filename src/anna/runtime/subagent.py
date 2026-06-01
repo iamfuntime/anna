@@ -25,7 +25,9 @@ full design.
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -334,6 +336,65 @@ class SubAgentRunner:
             # files stay invisible.
             add_dirs=[],
         )
+
+    # ------------------------------------------------------------------
+    # Transcript writer (subtask 7)
+    # ------------------------------------------------------------------
+
+    def _write_transcript_line(
+        self,
+        slug: str,
+        conv_key: str,
+        direction: str,
+        text: str,
+        audit_id: str,
+        **fields: Any,
+    ) -> Path:
+        """Append one JSON line to the per-slug transcript for today.
+
+        Sub-agent transcripts coalesce under
+        ``$ANNA_HOME/transcripts/<subagents.transcript_subdir>/<slug>/<YYYY-MM-DD>.jsonl``
+        rather than the per-conv_key tree the main transcript writer
+        uses. Each delegation typically appends three lines: a ``task``
+        line on spawn, an ``outbound`` line on success, and a ``fail``
+        line on error paths.
+
+        No threading lock is needed — one writer per delegation,
+        slug+day scoped paths. The shape mirrors
+        :func:`anna.log.transcript_event` but the path is set by the
+        runner rather than derived from the conv_key.
+
+        Args:
+            slug: Sub-agent slug; becomes the directory name.
+            conv_key: Synthetic sub-agent conv_key
+                (``subagent:<slug>:<uuid>``).
+            direction: ``task``, ``outbound``, or ``fail``.
+            text: Body content for the line.
+            audit_id: UUID shared with the matching
+                ``audit.subagent.*`` event so the operator can
+                cross-reference.
+            **fields: Extra fields (``parent_conv``,
+                ``duration_seconds``, etc.). Merged into the JSON
+                record verbatim.
+
+        Returns:
+            The absolute path of the file appended to.
+        """
+        day = date.today().isoformat()
+        path = self._config.subagent_transcript_dir / slug / f"{day}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        record: dict[str, Any] = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "direction": direction,
+            "conv_key": conv_key,
+            "text": text,
+            "audit_id": audit_id,
+            **fields,
+        }
+        line = json.dumps(record, ensure_ascii=False)
+        with path.open("a", encoding="utf-8") as fp:
+            fp.write(line + "\n")
+        return path
 
     async def delegate(
         self,

@@ -9,6 +9,8 @@ and failure paths (8). Tests for those subtasks land in this same file.
 from __future__ import annotations
 
 import asyncio
+import json
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -442,3 +444,126 @@ def test_build_system_prompt_is_pure(tmp_path: Path) -> None:
     a = SubAgentRunner._build_system_prompt(**args)  # noqa: SLF001
     b = SubAgentRunner._build_system_prompt(**args)  # noqa: SLF001
     assert a == b
+
+
+# ---------------------------------------------------------------------------
+# Subtask 7: transcript writer
+# ---------------------------------------------------------------------------
+
+
+def test_write_transcript_line_creates_file_at_correct_path(tmp_path: Path) -> None:
+    """File lands at transcripts/subagent/<slug>/<today>.jsonl."""
+    runner = _make_runner(tmp_path)
+    path = runner._write_transcript_line(  # noqa: SLF001
+        slug="threat-researcher",
+        conv_key="subagent:threat-researcher:abc",
+        direction="task",
+        text="dig into CVE",
+        audit_id="audit-uuid-1",
+    )
+    today = date.today().isoformat()
+    expected = tmp_path / "transcripts" / "subagent" / "threat-researcher" / f"{today}.jsonl"
+    assert path == expected
+    assert expected.exists()
+
+
+def test_write_transcript_line_writes_valid_json(tmp_path: Path) -> None:
+    runner = _make_runner(tmp_path)
+    path = runner._write_transcript_line(  # noqa: SLF001
+        slug="threat-researcher",
+        conv_key="subagent:threat-researcher:abc",
+        direction="task",
+        text="dig into CVE",
+        audit_id="audit-uuid-1",
+        parent_conv="slack:dm:U123",
+    )
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    record = json.loads(lines[0])
+    assert record["direction"] == "task"
+    assert record["conv_key"] == "subagent:threat-researcher:abc"
+    assert record["text"] == "dig into CVE"
+    assert record["audit_id"] == "audit-uuid-1"
+    assert record["parent_conv"] == "slack:dm:U123"
+    # ts field is set by the writer.
+    assert "ts" in record
+
+
+def test_write_transcript_line_appends_on_repeat_calls(tmp_path: Path) -> None:
+    """Two delegations to the same slug+day append to the same file."""
+    runner = _make_runner(tmp_path)
+    runner._write_transcript_line(  # noqa: SLF001
+        slug="threat-researcher",
+        conv_key="subagent:threat-researcher:abc",
+        direction="task",
+        text="task one",
+        audit_id="a1",
+    )
+    runner._write_transcript_line(  # noqa: SLF001
+        slug="threat-researcher",
+        conv_key="subagent:threat-researcher:abc",
+        direction="outbound",
+        text="reply one",
+        audit_id="a1",
+        duration_seconds=12.4,
+    )
+    runner._write_transcript_line(  # noqa: SLF001
+        slug="threat-researcher",
+        conv_key="subagent:threat-researcher:def",
+        direction="task",
+        text="task two",
+        audit_id="a2",
+    )
+    today = date.today().isoformat()
+    path = tmp_path / "transcripts" / "subagent" / "threat-researcher" / f"{today}.jsonl"
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 3
+    records = [json.loads(line) for line in lines]
+    assert records[0]["direction"] == "task"
+    assert records[0]["text"] == "task one"
+    assert records[1]["direction"] == "outbound"
+    assert records[1]["duration_seconds"] == 12.4
+    assert records[2]["direction"] == "task"
+    assert records[2]["text"] == "task two"
+
+
+def test_write_transcript_line_creates_parent_directories(tmp_path: Path) -> None:
+    """The transcripts/subagent/<slug>/ tree is mkdir-p'd on first call."""
+    runner = _make_runner(tmp_path)
+    # Pre-condition: nothing exists yet under transcripts/.
+    transcripts_dir = tmp_path / "transcripts"
+    assert not transcripts_dir.exists()
+    runner._write_transcript_line(  # noqa: SLF001
+        slug="brand-new-slug",
+        conv_key="subagent:brand-new-slug:xyz",
+        direction="task",
+        text="hello",
+        audit_id="audit-1",
+    )
+    assert (transcripts_dir / "subagent" / "brand-new-slug").is_dir()
+
+
+def test_write_transcript_line_per_slug_isolation(tmp_path: Path) -> None:
+    """Two slugs land in separate directories on the same day."""
+    runner = _make_runner(tmp_path)
+    runner._write_transcript_line(  # noqa: SLF001
+        slug="threat-researcher",
+        conv_key="subagent:threat-researcher:abc",
+        direction="task",
+        text="t1",
+        audit_id="a1",
+    )
+    runner._write_transcript_line(  # noqa: SLF001
+        slug="vuln-triager",
+        conv_key="subagent:vuln-triager:abc",
+        direction="task",
+        text="t2",
+        audit_id="a2",
+    )
+    today = date.today().isoformat()
+    tr_path = tmp_path / "transcripts" / "subagent" / "threat-researcher" / f"{today}.jsonl"
+    vt_path = tmp_path / "transcripts" / "subagent" / "vuln-triager" / f"{today}.jsonl"
+    assert tr_path.exists()
+    assert vt_path.exists()
+    assert json.loads(tr_path.read_text(encoding="utf-8"))["text"] == "t1"
+    assert json.loads(vt_path.read_text(encoding="utf-8"))["text"] == "t2"
