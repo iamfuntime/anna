@@ -38,8 +38,18 @@ class InboundEvent:
     worker sends to ``conversation_key`` via the router's send callback
     as it has always done.
 
-    Excluded from compare / hash so the field's unhashable value does
-    not break dataclass equality.
+    ``stream_subscriber`` is an optional per-event callback the worker
+    awaits once per ``TextBlock`` as ``AssistantMessage`` events arrive
+    from ``client.receive_response()``. Set by the Phase 2 §5 CLI
+    transport so the operator's TUI can render streaming text deltas
+    live; Slack and Telegram leave it ``None`` and keep the existing
+    buffered final-text send path unchanged. The worker is responsible
+    for exception isolation so a misbehaving subscriber cannot drop the
+    buffered finalize.
+
+    Both callable / future fields are excluded from compare / hash so
+    the dataclass remains hashable and equality compares on the
+    semantic payload only.
     """
 
     transport: str
@@ -51,6 +61,9 @@ class InboundEvent:
     is_thread: bool
     raw: dict[str, Any] = field(default_factory=dict)
     completion_future: asyncio.Future[str] | None = field(
+        default=None, compare=False, hash=False, repr=False
+    )
+    stream_subscriber: Callable[[str], Awaitable[None]] | None = field(
         default=None, compare=False, hash=False, repr=False
     )
 
