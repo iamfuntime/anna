@@ -14,6 +14,7 @@ import pytest
 
 from anna.agents.registry import SubAgentRegistry
 from anna.config import AnnaConfig
+from anna.runtime.schedule_store import ScheduleStore
 from anna.runtime.supervisor import Supervisor
 from anna.skills.registry import SkillRegistry
 from anna.tools.self_edit_server import SelfEditTools, build_self_edit_server
@@ -29,7 +30,7 @@ def _make_config(tmp_path: Path) -> AnnaConfig:
     return cfg
 
 
-def _make_tools(cfg: AnnaConfig) -> SelfEditTools:
+def _make_tools(cfg: AnnaConfig, *, with_schedule_store: bool = False) -> SelfEditTools:
     supervisor = Supervisor(config=cfg)
     agents_registry = SubAgentRegistry(
         supervisor=supervisor,
@@ -43,11 +44,18 @@ def _make_tools(cfg: AnnaConfig) -> SelfEditTools:
         audit_dir=cfg.audit_dir,
         fsync_on_write=False,
     )
+    schedule_store = None
+    if with_schedule_store:
+        # Override the scheduler state_path under the test cfg's anna_home so
+        # the store does not write into the real ~/anna directory.
+        cfg.scheduler.state_path = str(cfg.anna_home / "schedules.yaml")
+        schedule_store = ScheduleStore(config=cfg, supervisor=supervisor)
     return SelfEditTools(
         config=cfg,
         supervisor=supervisor,
         agents_registry=agents_registry,
         skills_registry=skills_registry,
+        schedule_store=schedule_store,
     )
 
 
@@ -242,7 +250,157 @@ async def test_checkpoint_read_recent_returns_file_contents(tmp_path: Path) -> N
 # ---------------------------------------------------------------------------
 
 
-def test_build_self_edit_server_exposes_seven_tools(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_schedule_create_with_cron(tmp_path: Path) -> None:
+    cfg = _make_config(tmp_path)
+    tools = _make_tools(cfg, with_schedule_store=True)
+    out = await tools.schedule_create(
+        id="morning-brief",
+        prompt="Compose a morning brief.",
+        destination_transport="slack",
+        destination_channel="C0AFD2LM38R",
+        cron="0 6 * * *",
+        creator_conv=CONV_KEY,
+    )
+    assert "morning-brief" in out["content"][0]["text"]
+    assert tools.schedule_store is not None
+    assert tools.schedule_store.get("morning-brief") is not None
+    audits = _read_audit_records(cfg.audit_dir)
+    assert any(a.get("event") == "audit.schedule.created" for a in audits)
+
+
+@pytest.mark.asyncio
+async def test_schedule_create_with_natural_language(tmp_path: Path) -> None:
+    cfg = _make_config(tmp_path)
+    tools = _make_tools(cfg, with_schedule_store=True)
+    await tools.schedule_create(
+        id="weekly-report",
+        prompt="Write the weekly report.",
+        destination_transport="slack",
+        destination_channel="C07MLJPHX9V",
+        natural_language="every Monday at 9am",
+        creator_conv=CONV_KEY,
+    )
+    s = tools.schedule_store.get("weekly-report")  # type: ignore[union-attr]
+    assert s is not None
+    assert s.cron == "0 9 * * MON"
+    assert s.natural_language == "every Monday at 9am"
+
+
+@pytest.mark.asyncio
+async def test_schedule_create_requires_exactly_one_of_cron_or_nl(tmp_path: Path) -> None:
+    cfg = _make_config(tmp_path)
+    tools = _make_tools(cfg, with_schedule_store=True)
+    with pytest.raises(ValueError, match=r"exactly one"):
+        await tools.schedule_create(
+            id="x",
+            prompt="p",
+            destination_transport="slack",
+            destination_channel="C",
+            creator_conv=CONV_KEY,
+        )
+    with pytest.raises(ValueError, match=r"exactly one"):
+        await tools.schedule_create(
+            id="x",
+            prompt="p",
+            destination_transport="slack",
+            destination_channel="C",
+            cron="0 6 * * *",
+            natural_language="every morning at 6am",
+            creator_conv=CONV_KEY,
+        )
+
+
+@pytest.mark.asyncio
+async def test_schedule_create_without_store_raises(tmp_path: Path) -> None:
+    cfg = _make_config(tmp_path)
+    tools = _make_tools(cfg, with_schedule_store=False)
+    with pytest.raises(RuntimeError, match=r"scheduler is not configured"):
+        await tools.schedule_create(
+            id="x",
+            prompt="p",
+            destination_transport="slack",
+            destination_channel="C",
+            cron="0 6 * * *",
+            creator_conv=CONV_KEY,
+        )
+
+
+@pytest.mark.asyncio
+async def test_schedule_update_partial(tmp_path: Path) -> None:
+    cfg = _make_config(tmp_path)
+    tools = _make_tools(cfg, with_schedule_store=True)
+    await tools.schedule_create(
+        id="m",
+        prompt="p",
+        destination_transport="slack",
+        destination_channel="C1",
+        cron="0 6 * * *",
+        creator_conv=CONV_KEY,
+    )
+    await tools.schedule_update(
+        id="m",
+        creator_conv=CONV_KEY,
+        enabled=False,
+        timeout_seconds=600,
+    )
+    s = tools.schedule_store.get("m")  # type: ignore[union-attr]
+    assert s.enabled is False
+    assert s.timeout_seconds == 600
+
+
+@pytest.mark.asyncio
+async def test_schedule_update_no_changes_raises(tmp_path: Path) -> None:
+    cfg = _make_config(tmp_path)
+    tools = _make_tools(cfg, with_schedule_store=True)
+    await tools.schedule_create(
+        id="m",
+        prompt="p",
+        destination_transport="slack",
+        destination_channel="C1",
+        cron="0 6 * * *",
+        creator_conv=CONV_KEY,
+    )
+    with pytest.raises(ValueError, match=r"no fields"):
+        await tools.schedule_update(id="m", creator_conv=CONV_KEY)
+
+
+@pytest.mark.asyncio
+async def test_schedule_delete(tmp_path: Path) -> None:
+    cfg = _make_config(tmp_path)
+    tools = _make_tools(cfg, with_schedule_store=True)
+    await tools.schedule_create(
+        id="m",
+        prompt="p",
+        destination_transport="slack",
+        destination_channel="C1",
+        cron="0 6 * * *",
+        creator_conv=CONV_KEY,
+    )
+    await tools.schedule_delete(id="m", creator_conv=CONV_KEY)
+    assert tools.schedule_store.get("m") is None  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_schedule_list_empty_and_populated(tmp_path: Path) -> None:
+    cfg = _make_config(tmp_path)
+    tools = _make_tools(cfg, with_schedule_store=True)
+    empty = await tools.schedule_list()
+    assert "no schedules" in empty["content"][0]["text"]
+    await tools.schedule_create(
+        id="m",
+        prompt="p",
+        destination_transport="slack",
+        destination_channel="C1",
+        cron="0 6 * * *",
+        creator_conv=CONV_KEY,
+    )
+    populated = await tools.schedule_list()
+    assert "m" in populated["content"][0]["text"]
+    assert "ENABLED" in populated["content"][0]["text"]
+
+
+def test_build_self_edit_server_exposes_all_tools(tmp_path: Path) -> None:
     from anna.tools.self_edit_server import SELF_EDIT_TOOL_NAMES
 
     cfg = _make_config(tmp_path)
