@@ -19,6 +19,8 @@ from anna.config import AnnaConfig, load_config
 from anna.log import configure_logging, get_logger
 from anna.runtime.alerter import AdminAlerter
 from anna.runtime.router import ConversationRouter
+from anna.runtime.schedule_store import ScheduleStore
+from anna.runtime.scheduler import Scheduler
 from anna.runtime.startup import (
     build_startup_message,
     read_and_clear_sentinel,
@@ -43,7 +45,30 @@ async def _run(config: AnnaConfig) -> None:
 
     supervisor = Supervisor(config=config)
     adapters = build_enabled_adapters(config)
-    router = ConversationRouter(config=config, supervisor=supervisor, adapters=adapters)
+
+    # Phase 2 scheduler: build the store and load any persisted schedules
+    # before the router so workers see a populated store from the first
+    # MCP-tool invocation. The Scheduler itself launches further down with
+    # the other aux coroutines.
+    schedule_store: ScheduleStore | None = None
+    if config.scheduler.enabled:
+        schedule_store = ScheduleStore(config=config, supervisor=supervisor)
+        try:
+            await schedule_store.load()
+        except Exception as exc:
+            log.error("anna.scheduler.load_failed", error=str(exc))
+            log.warning(
+                "anna.scheduler.disabled",
+                note="failed to load schedules.yaml; running without the scheduler",
+            )
+            schedule_store = None
+
+    router = ConversationRouter(
+        config=config,
+        supervisor=supervisor,
+        adapters=adapters,
+        schedule_store=schedule_store,
+    )
     alerter = AdminAlerter(config=config, adapters=adapters)
     watchdog = Watchdog(config=config, adapters=adapters, router=router, alerter=alerter)
 
@@ -63,6 +88,17 @@ async def _run(config: AnnaConfig) -> None:
     listener_tasks = [asyncio.create_task(a.start(), name=f"listener.{a.name}") for a in adapters.values()]
     watchdog_task = asyncio.create_task(watchdog.run(), name="watchdog")
     housekeeping_task = asyncio.create_task(router.run_housekeeping(), name="housekeeping")
+
+    scheduler_task: asyncio.Task[Any] | None = None
+    if schedule_store is not None:
+        scheduler = Scheduler(
+            config=config,
+            store=schedule_store,
+            router=router,
+            adapters=adapters,
+            alerter=alerter,
+        )
+        scheduler_task = asyncio.create_task(scheduler.run(), name="scheduler")
 
     # Schedule the operator startup ping. It waits a few seconds for
     # adapters to attach, then fires once. We use a background task so
@@ -103,6 +139,8 @@ async def _run(config: AnnaConfig) -> None:
     aux_tasks: list[asyncio.Task[Any]] = [*listener_tasks, watchdog_task, housekeeping_task]
     if startup_alert_task is not None:
         aux_tasks.append(startup_alert_task)
+    if scheduler_task is not None:
+        aux_tasks.append(scheduler_task)
     for task in aux_tasks:
         task.cancel()
 

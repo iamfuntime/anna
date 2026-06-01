@@ -24,6 +24,7 @@ from anna.transports.base import InboundEvent, OutboundMessage
 from anna.vault.checkpoint import list_recent_checkpoints, write_checkpoint
 
 if TYPE_CHECKING:
+    from anna.runtime.schedule_store import ScheduleStore
     from anna.runtime.supervisor import Supervisor
 
 
@@ -56,6 +57,7 @@ class ConversationWorker:
         supervisor: "Supervisor",
         send: SendCallback,
         on_idle_close: IdleCloseCallback | None = None,
+        schedule_store: "ScheduleStore | None" = None,
     ) -> None:
         self.conversation_key = conversation_key
         self.transport = transport
@@ -63,6 +65,7 @@ class ConversationWorker:
         self._supervisor = supervisor
         self._send = send
         self._on_idle_close = on_idle_close
+        self._schedule_store = schedule_store
         self._log = get_logger("anna.worker").bind(conv_key=conversation_key, channel=transport)
 
         self._queue: asyncio.Queue[InboundEvent] = asyncio.Queue(maxsize=128)
@@ -235,6 +238,7 @@ class ConversationWorker:
             supervisor=self._supervisor,
             agents_registry=agents_registry,
             skills_registry=skills_registry,
+            schedule_store=self._schedule_store,
         )
 
     def _build_options(self) -> Any:

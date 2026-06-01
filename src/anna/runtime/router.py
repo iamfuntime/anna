@@ -16,6 +16,7 @@ from typing import Awaitable, Callable
 
 from anna.config import AnnaConfig
 from anna.log import audit_event, get_logger, sweep_audit_retention, sweep_transcript_retention, transcript_event
+from anna.runtime.schedule_store import ScheduleStore
 from anna.runtime.supervisor import Supervisor
 from anna.runtime.worker import ConversationWorker
 from anna.transports.base import ChannelAdapter, InboundEvent, OutboundMessage
@@ -31,10 +32,12 @@ class ConversationRouter:
         config: AnnaConfig,
         supervisor: Supervisor,
         adapters: dict[str, ChannelAdapter],
+        schedule_store: ScheduleStore | None = None,
     ) -> None:
         self._config = config
         self._supervisor = supervisor
         self._adapters = adapters
+        self._schedule_store = schedule_store
         self._log = get_logger("anna.router")
         self._workers: dict[str, ConversationWorker] = {}
         self._workers_lock = asyncio.Lock()
@@ -79,6 +82,7 @@ class ConversationRouter:
                 supervisor=self._supervisor,
                 send=self._send_factory(event.transport),
                 on_idle_close=self._idle_close_callback,
+                schedule_store=self._schedule_store,
             )
             await worker.start()
             self._workers[key] = worker
