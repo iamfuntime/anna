@@ -39,6 +39,11 @@ dependencies = [
     "click>=8.1",
     "pyyaml>=6.0",
     "aiofiles>=23.2",
+    # Phase 2 scheduler. croniter computes next-fire times from cron
+    # expressions; cron-descriptor renders cron back to english for the
+    # schedule_list MCP tool output.
+    "croniter>=2.0",
+    "cron-descriptor>=1.4",
 ]
 
 [project.optional-dependencies]
