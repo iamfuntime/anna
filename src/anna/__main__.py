@@ -29,6 +29,7 @@ from anna.runtime.startup import (
 from anna.runtime.supervisor import Supervisor
 from anna.runtime.watchdog import Watchdog
 from anna.tools.google_clients import GoogleClients
+from anna.tools.web_server import WEB_TOOL_NAMES
 from anna.transports import build_enabled_adapters
 
 
@@ -86,6 +87,27 @@ async def _run(config: AnnaConfig) -> None:
                 "the toggle and restart"
             ),
             account_count=len(config.google.accounts),
+        )
+
+    # Phase 2 §2 tool surface. Logged here for parity with the google block
+    # so the operator sees one line per MCP server at bootstrap. The actual
+    # mount happens in worker._build_options when each worker spins up.
+    if config.tools.enabled:
+        log.info(
+            "anna.web.ready",
+            tools=list(WEB_TOOL_NAMES),
+            web_search_provider=config.tools.web_search.provider,
+            vault_download_destination=str(
+                config.tools.vault_download.resolved_destination
+            ),
+        )
+    else:
+        log.info(
+            "anna.web.disabled",
+            note=(
+                "tools.enabled is false; the anna_web MCP server will not be "
+                "mounted on workers"
+            ),
         )
 
     router = ConversationRouter(

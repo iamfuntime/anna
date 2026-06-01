@@ -21,6 +21,9 @@ from anna.log import audit_event, get_logger
 from anna.skills.registry import SkillRegistry
 from anna.tools.google_server import GOOGLE_TOOL_NAMES, GoogleTools, build_google_server
 from anna.tools.self_edit_server import SELF_EDIT_TOOL_NAMES, SelfEditTools, build_self_edit_server
+from anna.tools.vault_tools import VaultTools
+from anna.tools.web_server import WEB_TOOL_NAMES, build_web_server
+from anna.tools.web_tools import WebTools
 from anna.transports.base import InboundEvent, OutboundMessage
 from anna.vault.checkpoint import list_recent_checkpoints, write_checkpoint
 
@@ -36,14 +39,17 @@ if TYPE_CHECKING:
 _DEFAULT_FS_TOOLS: tuple[str, ...] = ("Read", "Write", "Edit", "Glob", "Grep")
 _SELF_EDIT_PREFIX = "mcp__anna_self_edit__"
 _GOOGLE_PREFIX = "mcp__anna_google__"
+_WEB_PREFIX = "mcp__anna_web__"
 
 
-def _allowed_tool_names(*, include_google: bool) -> list[str]:
+def _allowed_tool_names(*, include_google: bool, include_web: bool) -> list[str]:
     names = list(_DEFAULT_FS_TOOLS) + [
         f"{_SELF_EDIT_PREFIX}{name}" for name in SELF_EDIT_TOOL_NAMES
     ]
     if include_google:
         names.extend(f"{_GOOGLE_PREFIX}{name}" for name in GOOGLE_TOOL_NAMES)
+    if include_web:
+        names.extend(f"{_WEB_PREFIX}{name}" for name in WEB_TOOL_NAMES)
     return names
 
 
@@ -293,6 +299,23 @@ class ConversationWorker:
             mcp_servers["anna_google"] = google_server
             include_google = True
 
+        # Build the Web MCP server (Brave web_search, httpx web_fetch,
+        # vault_download) iff tools.enabled is true. Three pure in-process
+        # tools, no external state — they slot in just like google.
+        include_web = False
+        if self._config.tools.enabled:
+            web_tools = WebTools(config=self._config)
+            vault_tools = VaultTools(config=self._config)
+            web_server = build_web_server(
+                config=self._config,
+                web_tools=web_tools,
+                vault_tools=vault_tools,
+                conv_key=self.conversation_key,
+            )
+            if web_server is not None:
+                mcp_servers["anna_web"] = web_server
+                include_web = True
+
         # Ensure the vault root exists before the SDK process tries to cd
         # into it; otherwise the first tool call fails with ENOENT.
         try:
@@ -319,11 +342,15 @@ class ConversationWorker:
             # prefixes in the SDK's allowed_tools naming convention
             # (``mcp__<server>__<tool>``). anna_self_edit is always
             # mounted; anna_google only when google.enabled and the
-            # runtime provided a GoogleClients handle.
+            # runtime provided a GoogleClients handle; anna_web only
+            # when tools.enabled.
             mcp_servers=mcp_servers,
             # Allow the default filesystem tools, the self-edit MCP tools,
-            # and (when wired) the google MCP tools.
-            allowed_tools=_allowed_tool_names(include_google=include_google),
+            # and (when wired) the google and web MCP tools.
+            allowed_tools=_allowed_tool_names(
+                include_google=include_google,
+                include_web=include_web,
+            ),
             # Vault root is the natural cwd: vault paths become relative
             # (Conversations/foo.md instead of long absolutes).
             cwd=str(vault_root),

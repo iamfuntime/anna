@@ -18,10 +18,12 @@ from anna.runtime.worker import (
     _DEFAULT_FS_TOOLS,
     _GOOGLE_PREFIX,
     _SELF_EDIT_PREFIX,
+    _WEB_PREFIX,
     ConversationWorker,
 )
 from anna.tools.google_server import GOOGLE_TOOL_NAMES
 from anna.tools.self_edit_server import SELF_EDIT_TOOL_NAMES
+from anna.tools.web_server import WEB_TOOL_NAMES
 
 
 CONV_KEY = "slack:dm:UTEST"
@@ -62,16 +64,20 @@ def _make_worker(tmp_path: Path, *, with_google: bool = False) -> ConversationWo
     )
 
 
-def test_build_options_includes_default_fs_and_self_edit_tools(tmp_path: Path) -> None:
+def test_build_options_includes_default_fs_self_edit_and_web_tools(tmp_path: Path) -> None:
     worker = _make_worker(tmp_path)
     options = worker._build_options()
 
-    expected = list(_DEFAULT_FS_TOOLS) + [
-        f"{_SELF_EDIT_PREFIX}{name}" for name in SELF_EDIT_TOOL_NAMES
-    ]
+    # tools.enabled defaults to true so anna_web mounts by default; google
+    # stays off because no GoogleClients was passed.
+    expected = (
+        list(_DEFAULT_FS_TOOLS)
+        + [f"{_SELF_EDIT_PREFIX}{name}" for name in SELF_EDIT_TOOL_NAMES]
+        + [f"{_WEB_PREFIX}{name}" for name in WEB_TOOL_NAMES]
+    )
     assert sorted(options.allowed_tools) == sorted(expected)
-    # Without google_clients the google server must not be mounted.
     assert "anna_google" not in options.mcp_servers
+    assert "anna_web" in options.mcp_servers
 
 
 def test_build_options_mounts_google_server_when_enabled(tmp_path: Path) -> None:
@@ -81,12 +87,31 @@ def test_build_options_mounts_google_server_when_enabled(tmp_path: Path) -> None
         list(_DEFAULT_FS_TOOLS)
         + [f"{_SELF_EDIT_PREFIX}{name}" for name in SELF_EDIT_TOOL_NAMES]
         + [f"{_GOOGLE_PREFIX}{name}" for name in GOOGLE_TOOL_NAMES]
+        + [f"{_WEB_PREFIX}{name}" for name in WEB_TOOL_NAMES]
     )
     assert sorted(options.allowed_tools) == sorted(expected)
     assert "anna_google" in options.mcp_servers
     google_server = options.mcp_servers["anna_google"]
     assert isinstance(google_server, dict)
     assert google_server.get("type") == "sdk"
+
+
+def test_build_options_skips_web_server_when_tools_disabled(tmp_path: Path) -> None:
+    worker = _make_worker(tmp_path)
+    worker._config.tools.enabled = False
+    options = worker._build_options()
+    assert "anna_web" not in options.mcp_servers
+    web_named = [t for t in options.allowed_tools if t.startswith(_WEB_PREFIX)]
+    assert web_named == []
+
+
+def test_build_options_web_server_is_sdk_shape(tmp_path: Path) -> None:
+    worker = _make_worker(tmp_path)
+    options = worker._build_options()
+    assert "anna_web" in options.mcp_servers
+    web_server = options.mcp_servers["anna_web"]
+    assert isinstance(web_server, dict)
+    assert web_server.get("type") == "sdk"
 
 
 def test_build_options_skips_google_when_enabled_false_but_clients_passed(tmp_path: Path) -> None:
