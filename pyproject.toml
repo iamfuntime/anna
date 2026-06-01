@@ -60,6 +60,11 @@ dependencies = [
     # the post-install step `playwright install chromium` is required.
     "httpx>=0.27",
     "markdownify>=0.13",
+    # Phase 2 §5 CLI transport: prompt_toolkit drives the `anna chat`
+    # interactive TUI (input editing, history, mid-stream prompt redraw).
+    # `anna ask` is plain stdin/stdout but lives in the same dependency
+    # so both CLI entrypoints share install footprint.
+    "prompt_toolkit>=3.0",
 ]
 
 [project.optional-dependencies]

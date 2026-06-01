@@ -40,6 +40,19 @@ transports:
     enabled: false
   telegram:
     enabled: false
+  # cli: Phase 2 §5 local CLI transport. The daemon binds a Unix-domain
+  # socket at socket_path; `anna chat` (interactive TUI) and `anna ask`
+  # (one-shot) connect to it from the same host. The socket is created
+  # mode 0600 immediately after bind, so filesystem permissions are the
+  # entire auth boundary — there is no token, no TLS, no remote case.
+  # idle_gap_minutes is the per-CLI idle close, distinct from
+  # sessions.dm_gap_hours (8h) and sessions.thread_gap_hours (1h). v1
+  # ships NDJSON framing only; the field is kept for forward-compat.
+  # cli:
+  #   enabled: true
+  #   socket_path: ~/anna/anna.sock
+  #   idle_gap_minutes: 30
+  #   framing: ndjson
 
 # ============================================================
 # Vault
@@ -277,3 +290,24 @@ subagents:
     - mcp__anna_web__web_search
     - mcp__anna_web__web_fetch
     - mcp__anna_web__vault_download
+
+# ============================================================
+# identities: Phase 2 §5 cross-transport identity aliasing.
+#
+# Each entry maps one or more per-transport identifiers (Slack user ID,
+# Telegram chat ID, CLI OS username) onto a single canonical name. The
+# router rewrites matching inbound events' conv_keys to user:<canonical>
+# so a Slack DM, a Telegram DM, and `anna chat` from the operator all
+# land in the same worker and the same checkpoint directory. canonical
+# is restricted to a-z, 0-9, underscore (becomes part of the on-disk
+# checkpoint directory name).
+#
+# Note: existing per-transport checkpoints under
+# vault/Conversations/<old-conv-key>/ are not auto-migrated; use
+# `anna admin merge-checkpoints` to migrate them once.
+# ============================================================
+# identities:
+#   - canonical: seth
+#     slack_user_id: USP2QLB41
+#     telegram_chat_id: "993947726"
+#     cli_username: funtime

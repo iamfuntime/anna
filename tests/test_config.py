@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from anna.config import AnnaConfig, load_config
+from anna.config import AnnaConfig, IdentityAliasEntry, load_config
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -193,3 +193,89 @@ def test_example_yaml_includes_subagents_block() -> None:
     assert cfg.subagents.transcript_subdir == "subagent"
     assert "Read" in cfg.subagents.allowed_tools
     assert "mcp__anna_web__web_search" in cfg.subagents.allowed_tools
+
+
+def test_cli_transport_defaults_when_block_omitted() -> None:
+    """A config with no transports.cli block uses CLITransportConfig defaults."""
+    raw = {"auth": {"mode": "max"}}
+    cfg = AnnaConfig.model_validate(raw)
+    assert cfg.transports.cli.enabled is True
+    assert cfg.transports.cli.socket_path == "~/anna/anna.sock"
+    assert cfg.transports.cli.idle_gap_minutes == 30
+    assert cfg.transports.cli.framing == "ndjson"
+
+
+def test_cli_transport_resolved_socket_path_expands_tilde() -> None:
+    raw = {"transports": {"cli": {"socket_path": "~/custom/anna.sock"}}}
+    cfg = AnnaConfig.model_validate(raw)
+    resolved = str(cfg.transports.cli.resolved_socket_path)
+    assert resolved.endswith("/custom/anna.sock")
+    assert "~" not in resolved
+
+
+def test_cli_idle_gap_minutes_rejects_non_positive() -> None:
+    with pytest.raises(Exception):
+        AnnaConfig.model_validate({"transports": {"cli": {"idle_gap_minutes": 0}}})
+
+
+def test_cli_idle_gap_minutes_rejects_over_one_day() -> None:
+    with pytest.raises(Exception):
+        AnnaConfig.model_validate({"transports": {"cli": {"idle_gap_minutes": 1500}}})
+
+
+def test_identity_alias_entry_rejects_hyphen() -> None:
+    with pytest.raises(Exception):
+        IdentityAliasEntry(canonical="seth-1")
+
+
+def test_identity_alias_entry_accepts_alnum_underscore() -> None:
+    a = IdentityAliasEntry(canonical="seth")
+    assert a.canonical == "seth"
+    b = IdentityAliasEntry(canonical="seth_work")
+    assert b.canonical == "seth_work"
+
+
+def test_anna_config_rejects_duplicate_canonical() -> None:
+    raw = {
+        "identities": [
+            {"canonical": "seth", "slack_user_id": "USP2QLB41"},
+            {"canonical": "seth", "telegram_chat_id": "993947726"},
+        ]
+    }
+    with pytest.raises(Exception) as excinfo:
+        AnnaConfig.model_validate(raw)
+    # The error message mentions the offending canonical name (each
+    # duplicated value is named in the validator's ValueError).
+    assert "seth" in str(excinfo.value)
+
+
+def test_anna_config_identities_round_trips_through_model_dump() -> None:
+    raw = {
+        "identities": [
+            {
+                "canonical": "seth",
+                "slack_user_id": "USP2QLB41",
+                "telegram_chat_id": "993947726",
+                "cli_username": "funtime",
+            }
+        ]
+    }
+    cfg = AnnaConfig.model_validate(raw)
+    assert len(cfg.identities) == 1
+    assert cfg.identities[0].canonical == "seth"
+    assert cfg.identities[0].slack_user_id == "USP2QLB41"
+    assert cfg.identities[0].telegram_chat_id == "993947726"
+    assert cfg.identities[0].cli_username == "funtime"
+
+    dumped = cfg.model_dump()
+    assert dumped["identities"] == [
+        {
+            "canonical": "seth",
+            "slack_user_id": "USP2QLB41",
+            "telegram_chat_id": "993947726",
+            "cli_username": "funtime",
+        }
+    ]
+    # Re-validating the dumped form produces an equivalent config.
+    cfg2 = AnnaConfig.model_validate(dumped)
+    assert cfg2.identities == cfg.identities

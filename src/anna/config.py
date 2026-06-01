@@ -57,9 +57,50 @@ class TelegramTransportConfig(BaseModel):
     enabled: bool = False
 
 
+class CLITransportConfig(BaseModel):
+    """Phase 2 §5 CLI transport.
+
+    A third ChannelAdapter alongside Slack and Telegram. Speaks NDJSON
+    over a Unix-domain socket at ``socket_path``. Owner-only socket
+    permissions (mode 0600) are the entire auth boundary — there is no
+    token, no TLS, no remote case. For Docker deployments, either
+    bind-mount the socket out or leave this disabled.
+
+    See Inbox/2026-06-01-ANNA-Phase-2-CLI-Transport-Plan.md for the full
+    design.
+    """
+
+    enabled: bool = True
+    # Owner-only Unix-domain socket the daemon binds and `anna chat` /
+    # `anna ask` connect to. Resolved against the operator's home via
+    # os.path.expanduser when consumed.
+    socket_path: str = "~/anna/anna.sock"
+    # Per-CLI idle close, distinct from sessions.dm_gap_hours (8h) and
+    # sessions.thread_gap_hours (1h). 30m lands between the two existing
+    # gaps — long enough that stepping away for coffee doesn't tear the
+    # conv down, short enough that a forgotten terminal doesn't pin a
+    # worker overnight.
+    idle_gap_minutes: int = 30
+    # Wire framing. v1 ships NDJSON only; the Literal keeps the field
+    # forward-compatible without exposing variant choice.
+    framing: Literal["ndjson"] = "ndjson"
+
+    @property
+    def resolved_socket_path(self) -> Path:
+        return Path(os.path.expanduser(self.socket_path))
+
+    @field_validator("idle_gap_minutes")
+    @classmethod
+    def _idle_positive(cls, v: int) -> int:
+        if v <= 0 or v > 24 * 60:
+            raise ValueError("cli.idle_gap_minutes must be between 1 and 1440")
+        return v
+
+
 class TransportsConfig(BaseModel):
     slack: SlackTransportConfig = Field(default_factory=SlackTransportConfig)
     telegram: TelegramTransportConfig = Field(default_factory=TelegramTransportConfig)
+    cli: CLITransportConfig = Field(default_factory=CLITransportConfig)
 
 
 class VaultConfig(BaseModel):
@@ -390,6 +431,43 @@ class SchedulerConfig(BaseModel):
         return Path(os.path.expanduser(self.state_path))
 
 
+class IdentityAliasEntry(BaseModel):
+    """Phase 2 §5 identity alias.
+
+    Maps one or more per-transport identifiers (Slack user ID, Telegram
+    chat ID, CLI OS username) onto a single canonical name. When the
+    router sees an inbound event whose per-transport identifier matches,
+    it rewrites the conv_key from the per-transport shape (e.g.
+    ``slack:dm:USP2QLB41``) to ``user:<canonical>`` so checkpoints and
+    resume context land in one place across transports.
+
+    ``canonical`` is restricted to a-z, 0-9, underscore because it
+    becomes part of the conv_key and the on-disk checkpoint directory
+    name. Same restriction as schedule.id and google.slug.
+
+    See Inbox/2026-06-01-ANNA-Phase-2-CLI-Transport-Plan.md "Identity
+    aliasing" for the full design and the no-auto-migration tradeoff.
+    """
+
+    canonical: str
+    slack_user_id: str | None = None
+    telegram_chat_id: str | None = None
+    cli_username: str | None = None
+
+    @field_validator("canonical")
+    @classmethod
+    def _safe(cls, v: str) -> str:
+        if not v:
+            raise ValueError("identity.canonical cannot be empty")
+        bad = [c for c in v if not (c.isalnum() or c == "_")]
+        if bad:
+            raise ValueError(
+                f"identity.canonical must be a-z, 0-9, underscore only; "
+                f"got disallowed chars: {''.join(sorted(set(bad)))}"
+            )
+        return v
+
+
 # ---------------------------------------------------------------------------
 # Top-level
 # ---------------------------------------------------------------------------
@@ -409,10 +487,21 @@ class AnnaConfig(BaseModel):
     google: GoogleConfig = Field(default_factory=GoogleConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
     subagents: SubagentsConfig = Field(default_factory=SubagentsConfig)
+    identities: list[IdentityAliasEntry] = Field(default_factory=list)
 
     # Derived runtime paths. Not in the YAML file. ANNA_HOME from .env wins,
     # falling back to ~/anna. The setup wizard always writes ANNA_HOME.
     anna_home: Path = Field(default_factory=lambda: Path(os.path.expanduser(os.environ.get("ANNA_HOME", "~/anna"))))
+
+    @model_validator(mode="after")
+    def _check_unique_canonical(self) -> "AnnaConfig":
+        names = [i.canonical for i in self.identities]
+        dupes = sorted({n for n in names if names.count(n) > 1})
+        if dupes:
+            raise ValueError(
+                f"duplicate identities.canonical: {', '.join(dupes)}"
+            )
+        return self
 
     @property
     def audit_dir(self) -> Path:
