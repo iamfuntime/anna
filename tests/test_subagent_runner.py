@@ -296,6 +296,140 @@ def test_build_system_prompt_no_skill_header_per_skill(tmp_path: Path) -> None:
     assert skills_section.count("## skill heading") == 1
 
 
+# ---------------------------------------------------------------------------
+# Subtask 5: sub-agent options builder
+# ---------------------------------------------------------------------------
+
+
+def _make_runner_with_tools(tmp_path: Path, *, tools_enabled: bool = True) -> SubAgentRunner:
+    """Build a runner with full config overrides so tools.enabled is configurable."""
+    raw: dict = {"tools": {"enabled": tools_enabled}}
+    cfg = AnnaConfig.model_validate(raw)
+    cfg = cfg.model_copy(update={"anna_home": tmp_path})
+    cfg.vault.path = str(tmp_path / "vault")
+    supervisor = Supervisor(config=cfg)
+    agents_registry = SubAgentRegistry(
+        supervisor=supervisor,
+        agents_dir=tmp_path / "agents",
+        audit_dir=tmp_path / "audit",
+        fsync_on_write=False,
+    )
+    skills_registry = SkillRegistry(
+        supervisor=supervisor,
+        skills_dir=tmp_path / "skills",
+        audit_dir=tmp_path / "audit",
+        fsync_on_write=False,
+    )
+    return SubAgentRunner(
+        config=cfg,
+        supervisor=supervisor,
+        agents_registry=agents_registry,
+        skills_registry=skills_registry,
+    )
+
+
+def test_build_subagent_options_mounts_anna_web_when_tools_enabled(tmp_path: Path) -> None:
+    runner = _make_runner_with_tools(tmp_path, tools_enabled=True)
+    options = runner._build_subagent_options(  # noqa: SLF001
+        system_prompt="system",
+        conv_key="subagent:slug:abc",
+    )
+    assert set(options.mcp_servers.keys()) == {"anna_web"}
+
+
+def test_build_subagent_options_omits_all_mcp_when_tools_disabled(tmp_path: Path) -> None:
+    runner = _make_runner_with_tools(tmp_path, tools_enabled=False)
+    options = runner._build_subagent_options(  # noqa: SLF001
+        system_prompt="system",
+        conv_key="subagent:slug:abc",
+    )
+    assert options.mcp_servers == {}
+
+
+def test_build_subagent_options_never_mounts_forbidden_servers(tmp_path: Path) -> None:
+    """anna_self_edit / anna_google / anna_delegate are never on a sub-agent."""
+    runner = _make_runner_with_tools(tmp_path, tools_enabled=True)
+    options = runner._build_subagent_options(  # noqa: SLF001
+        system_prompt="system",
+        conv_key="subagent:slug:abc",
+    )
+    keys = set(options.mcp_servers.keys())
+    assert "anna_self_edit" not in keys
+    assert "anna_google" not in keys
+    assert "anna_delegate" not in keys
+
+
+def test_build_subagent_options_allowed_tools_excludes_forbidden_prefixes(tmp_path: Path) -> None:
+    runner = _make_runner_with_tools(tmp_path, tools_enabled=True)
+    options = runner._build_subagent_options(  # noqa: SLF001
+        system_prompt="system",
+        conv_key="subagent:slug:abc",
+    )
+    for name in options.allowed_tools:
+        assert not name.startswith("mcp__anna_self_edit__"), name
+        assert not name.startswith("mcp__anna_google__"), name
+        assert not name.startswith("mcp__anna_delegate__"), name
+
+
+def test_build_subagent_options_allowed_tools_from_config(tmp_path: Path) -> None:
+    """allowed_tools is populated from config.subagents.allowed_tools verbatim."""
+    runner = _make_runner_with_tools(tmp_path, tools_enabled=True)
+    options = runner._build_subagent_options(  # noqa: SLF001
+        system_prompt="system",
+        conv_key="subagent:slug:abc",
+    )
+    assert sorted(options.allowed_tools) == sorted(runner._config.subagents.allowed_tools)  # noqa: SLF001
+
+
+def test_build_subagent_options_permission_mode_default(tmp_path: Path) -> None:
+    """Default permission_mode is acceptEdits (stricter than the worker)."""
+    runner = _make_runner_with_tools(tmp_path, tools_enabled=True)
+    options = runner._build_subagent_options(  # noqa: SLF001
+        system_prompt="system",
+        conv_key="subagent:slug:abc",
+    )
+    assert options.permission_mode == "acceptEdits"
+
+
+def test_build_subagent_options_permission_mode_override(tmp_path: Path) -> None:
+    runner = _make_runner_with_tools(tmp_path, tools_enabled=True)
+    options = runner._build_subagent_options(  # noqa: SLF001
+        system_prompt="system",
+        conv_key="subagent:slug:abc",
+        permission_mode_override="bypassPermissions",
+    )
+    assert options.permission_mode == "bypassPermissions"
+
+
+def test_build_subagent_options_setting_sources_empty(tmp_path: Path) -> None:
+    """No host Claude Code env should leak into a sub-agent."""
+    runner = _make_runner_with_tools(tmp_path, tools_enabled=True)
+    options = runner._build_subagent_options(  # noqa: SLF001
+        system_prompt="system",
+        conv_key="subagent:slug:abc",
+    )
+    assert options.setting_sources == []
+
+
+def test_build_subagent_options_cwd_is_vault_root(tmp_path: Path) -> None:
+    runner = _make_runner_with_tools(tmp_path, tools_enabled=True)
+    options = runner._build_subagent_options(  # noqa: SLF001
+        system_prompt="system",
+        conv_key="subagent:slug:abc",
+    )
+    assert options.cwd == str(runner._config.vault.resolved_path)  # noqa: SLF001
+
+
+def test_build_subagent_options_add_dirs_empty(tmp_path: Path) -> None:
+    """Sub-agents must not see core/ — add_dirs is hard-coded empty."""
+    runner = _make_runner_with_tools(tmp_path, tools_enabled=True)
+    options = runner._build_subagent_options(  # noqa: SLF001
+        system_prompt="system",
+        conv_key="subagent:slug:abc",
+    )
+    assert options.add_dirs == []
+
+
 def test_build_system_prompt_is_pure(tmp_path: Path) -> None:
     """No side effects: two calls with the same args return identical output."""
     args = {

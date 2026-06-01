@@ -259,6 +259,82 @@ class SubAgentRunner:
             sections.append(f"# Context\n{context_yaml}")
         return "\n\n".join(sections)
 
+    # ------------------------------------------------------------------
+    # Sub-agent ClaudeAgentOptions builder (subtask 5)
+    # ------------------------------------------------------------------
+
+    def _build_subagent_options(
+        self,
+        system_prompt: str,
+        conv_key: str,
+        permission_mode_override: str | None = None,
+    ) -> Any:
+        """Construct the ``ClaudeAgentOptions`` used to spawn the sub-agent client.
+
+        This is also where the depth-protection invariant is enforced
+        at the runtime level: ``anna_self_edit``, ``anna_google``, and
+        ``anna_delegate`` are *never* mounted on a sub-agent's options.
+        The only MCP server a sub-agent ever sees is ``anna_web`` (and
+        only when ``config.tools.enabled`` is true).
+
+        Args:
+            system_prompt: Output of :meth:`_build_system_prompt`.
+            conv_key: Synthetic conv_key for this delegation; flows
+                into the ``anna_web`` server closure so the tool calls
+                that fire from inside the sub-agent get audit-stamped
+                with a distinct identifier.
+            permission_mode_override: Optional per-call permission
+                mode. Default is ``acceptEdits`` (stricter than the
+                worker's ``bypassPermissions``); pass to tighten or
+                loosen on a per-delegation basis.
+
+        Returns:
+            ``ClaudeAgentOptions`` ready to feed into ``ClaudeSDKClient``.
+        """
+        # Lazy import so the unit tests in this module do not pull in
+        # the SDK transitively. Mirrors ``ConversationWorker._build_options``.
+        from claude_agent_sdk import ClaudeAgentOptions
+
+        from anna.tools.vault_tools import VaultTools
+        from anna.tools.web_server import build_web_server
+        from anna.tools.web_tools import WebTools
+
+        vault_root = self._config.vault.resolved_path
+
+        mcp_servers: dict[str, Any] = {}
+        if self._config.tools.enabled:
+            web_tools = WebTools(config=self._config)
+            vault_tools = VaultTools(config=self._config)
+            web_server = build_web_server(
+                config=self._config,
+                web_tools=web_tools,
+                vault_tools=vault_tools,
+                conv_key=conv_key,
+            )
+            if web_server is not None:
+                mcp_servers["anna_web"] = web_server
+
+        permission_mode = permission_mode_override or "acceptEdits"
+
+        return ClaudeAgentOptions(
+            system_prompt=system_prompt,
+            # No setting_sources for sub-agents — they live entirely off
+            # their persona file plus skills. No host Claude Code env
+            # leaks in.
+            setting_sources=[],
+            permission_mode=permission_mode,
+            # Only anna_web (when tools enabled). Never anna_self_edit,
+            # anna_google, or anna_delegate. This is the runtime-level
+            # enforcement of one-level-only delegation.
+            mcp_servers=mcp_servers,
+            allowed_tools=list(self._config.subagents.allowed_tools),
+            cwd=str(vault_root),
+            # Empty add_dirs — sub-agents do not see core/. Persona +
+            # skills are the entire identity surface; ANNA's identity
+            # files stay invisible.
+            add_dirs=[],
+        )
+
     async def delegate(
         self,
         *,
