@@ -21,7 +21,7 @@ from anna.log import audit_event, get_logger
 from anna.skills.registry import SkillRegistry
 from anna.tools.self_edit_server import SELF_EDIT_TOOL_NAMES, SelfEditTools, build_self_edit_server
 from anna.transports.base import InboundEvent, OutboundMessage
-from anna.vault.checkpoint import write_checkpoint
+from anna.vault.checkpoint import list_recent_checkpoints, write_checkpoint
 
 if TYPE_CHECKING:
     from anna.runtime.supervisor import Supervisor
@@ -321,12 +321,62 @@ class ConversationWorker:
             f"{format_rule}"
         )
 
-        return (
-            f"{scope}\n\n"
-            f"# Runtime paths\n{runtime}\n\n"
-            f"# Core identity files\n{identity_block}\n\n"
-            f"# Channel context\n{context}"
-        )
+        # Resume context: the two most recent checkpoint files for this
+        # conversation key, oldest first so the assistant reads them
+        # chronologically. Omitted entirely if no checkpoints exist (fresh
+        # conversation) so the prompt stays clean on first contact.
+        resume_block = self._assemble_resume_block(vault_root)
+
+        sections: list[str] = [
+            scope,
+            f"# Runtime paths\n{runtime}",
+        ]
+        if resume_block:
+            sections.append(resume_block)
+        sections.append(f"# Core identity files\n{identity_block}")
+        sections.append(f"# Channel context\n{context}")
+        return "\n\n".join(sections)
+
+    def _assemble_resume_block(self, vault_root: Path) -> str:
+        """Read the two newest checkpoints for this conv_key and format them.
+
+        Returns the formatted block (with leading ``# Recent checkpoints``
+        heading), or an empty string when no checkpoints exist.
+        """
+        try:
+            paths = list_recent_checkpoints(
+                vault_root=vault_root,
+                conversation_key=self.conversation_key,
+                limit=2,
+            )
+        except OSError as exc:
+            self._log.warning("worker.resume.list_failed", error=str(exc))
+            return ""
+        if not paths:
+            return ""
+
+        # list_recent_checkpoints returns newest first; reverse so the
+        # earliest checkpoint reads first.
+        parts: list[str] = []
+        for path in reversed(paths):
+            # Filename shape: YYYY-MM-DD-HHMM.md. Strip the suffix for the
+            # human-readable label.
+            stamp = path.stem
+            try:
+                body = path.read_text(encoding="utf-8")
+            except OSError as exc:
+                self._log.warning(
+                    "worker.resume.read_failed",
+                    file=str(path),
+                    error=str(exc),
+                )
+                continue
+            parts.append(f"## {stamp}\n{body.strip()}")
+
+        if not parts:
+            return ""
+        body = "\n\n".join(parts)
+        return f"# Recent checkpoints (resume context)\n{body}"
 
     async def _closeout(self) -> None:
         """Per v3 §6: write a checkpoint, then run eviction on every core file.
