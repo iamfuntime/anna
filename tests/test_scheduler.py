@@ -368,6 +368,90 @@ async def test_poll_once_fires_due_schedules(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_poll_once_does_not_redispatch_while_fire_in_flight(tmp_path: Path) -> None:
+    """Regression: a slow fire must not re-fire on subsequent polls.
+
+    2026-06-01 incident: a schedule with cron `2 15 * * *` produced 4
+    Slack messages because each ~150s skill run kept the schedule
+    "due" across 5 polls (state.last_fired_at stayed null until the
+    first run completed). Fix: mark_dispatched updates last_fired_at
+    BEFORE the fire task is created.
+    """
+    cfg = _make_config(tmp_path)
+    store = ScheduleStore(config=cfg, supervisor=Supervisor(config=cfg))
+    await store.create(
+        Schedule(
+            id="slow-fire",
+            cron="*/1 * * * *",
+            timezone="UTC",
+            prompt="x",
+            destination=ScheduleDestination(transport="slack", channel="C1"),
+            created_at=datetime(2020, 1, 1, tzinfo=timezone.utc),
+        )
+    )
+    router = FakeRouter()
+    # Hold the worker's reply long enough for multiple polls to interleave.
+    router.delay_before_resolve = 0.2
+    sched = Scheduler(
+        config=cfg,
+        store=store,
+        router=router,  # type: ignore[arg-type]
+        adapters={"slack": FakeAdapter()},
+        alerter=FakeAlerter(),  # type: ignore[arg-type]
+    )
+
+    # First poll dispatches one fire and marks the schedule dispatched.
+    await sched._poll_once()
+    # Second and third polls happen while the first fire is still in flight.
+    await sched._poll_once()
+    await sched._poll_once()
+
+    # Drain whatever was dispatched.
+    await asyncio.gather(*list(sched._inflight), return_exceptions=True)
+
+    audits = _read_audit_records(cfg.audit_dir)
+    fires = _events(audits, "audit.schedule.fire")
+    assert len(fires) == 1, (
+        f"expected exactly 1 fire across 3 polls while the first run was "
+        f"in flight, got {len(fires)}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_mark_dispatched_preserves_failure_state(tmp_path: Path) -> None:
+    """mark_dispatched must not reset consecutive_failures or last_status.
+
+    Only mark_fired (on success) clears failure state. If a schedule has
+    been failing and is about to retry, the optimistic dispatch mark
+    should leave the failure history intact so the threshold-disable
+    logic still works.
+    """
+    cfg = _make_config(tmp_path)
+    store = ScheduleStore(config=cfg, supervisor=Supervisor(config=cfg))
+    await store.create(
+        _make_schedule(
+            state=ScheduleState(
+                last_fired_at=datetime(2026, 6, 1, 5, 0, tzinfo=timezone.utc),
+                last_status="fail",
+                consecutive_failures=2,
+            )
+        )
+    )
+
+    await store.mark_dispatched(
+        "morning-brief", when=datetime(2026, 6, 1, 6, 0, tzinfo=timezone.utc)
+    )
+
+    schedule = store.get("morning-brief")
+    assert schedule is not None
+    assert schedule.state.last_fired_at == datetime(
+        2026, 6, 1, 6, 0, tzinfo=timezone.utc
+    )
+    assert schedule.state.last_status == "fail"
+    assert schedule.state.consecutive_failures == 2
+
+
+@pytest.mark.asyncio
 async def test_dest_conv_key_format() -> None:
     assert (
         Scheduler._dest_conv_key(transport="slack", channel="C0AFD2LM38R")

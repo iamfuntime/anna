@@ -226,6 +226,34 @@ class ScheduleStore:
     # State mutations driven by the scheduler itself
     # ------------------------------------------------------------------
 
+    async def mark_dispatched(
+        self,
+        schedule_id: str,
+        *,
+        when: datetime,
+    ) -> None:
+        """Optimistically record that a fire was dispatched.
+
+        Called by :meth:`Scheduler._poll_once` BEFORE the fire task is
+        created, so the next poll's :meth:`due_schedules` check uses
+        this ``last_fired_at`` as the baseline for the next cron tick
+        and does not re-dispatch the same schedule while the first run
+        is still in flight. Preserves ``consecutive_failures`` and
+        ``last_status`` because the run has not finished yet. The
+        completion or failure paths overwrite the full state when they
+        land.
+        """
+        async with await self._supervisor.acquire(_STORE_KEY):
+            schedule = self._cache.get(schedule_id)
+            if schedule is None:
+                return
+            schedule.state = ScheduleState(
+                last_fired_at=when,
+                last_status=schedule.state.last_status,
+                consecutive_failures=schedule.state.consecutive_failures,
+            )
+            await self.save()
+
     async def mark_fired(
         self,
         schedule_id: str,

@@ -133,6 +133,14 @@ class Scheduler:
         now = datetime.now(timezone.utc)
         due = self._store.due_schedules(now)
         for schedule in due:
+            # Optimistically mark the schedule as dispatched BEFORE creating
+            # the fire task. due_schedules() computes the next cron tick from
+            # state.last_fired_at; without this, a long-running fire (>poll
+            # interval) leaves last_fired_at null and every poll re-dispatches
+            # the same schedule. See the 2026-06-01 morning-brief-test
+            # incident: cron `2 15 * * *` produced 4 concurrent fires because
+            # the 153-243s run kept the schedule "due" across 5 polls.
+            await self._store.mark_dispatched(schedule.id, when=now)
             task = asyncio.create_task(
                 self._guarded_fire(schedule),
                 name=f"scheduler.fire.{schedule.id}",
