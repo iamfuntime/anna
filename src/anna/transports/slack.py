@@ -20,12 +20,18 @@ from typing import Any
 from anna.config import AnnaConfig
 from anna.log import get_logger
 from anna.transports.base import ChannelAdapter, InboundEvent, InboundHandler, OutboundMessage
+from anna.transports.slack_thread_state import ThreadParticipation
 
 
 class SlackAdapter(ChannelAdapter):
     name = "slack"
 
-    def __init__(self, *, config: AnnaConfig) -> None:
+    def __init__(
+        self,
+        *,
+        config: AnnaConfig,
+        thread_participation: ThreadParticipation,
+    ) -> None:
         self._config = config
         self._log = get_logger("anna.transport.slack")
         self._handlers: list[InboundHandler] = []
@@ -34,6 +40,7 @@ class SlackAdapter(ChannelAdapter):
         self._handler_task: asyncio.Task[None] | None = None
         self._client: Any = None
         self._connect_attempt = 0
+        self._thread_participation = thread_participation
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -53,6 +60,11 @@ class SlackAdapter(ChannelAdapter):
             raise RuntimeError(
                 "Slack transport enabled but SLACK_BOT_TOKEN or SLACK_APP_TOKEN missing"
             )
+
+        # Load the thread-participation set before the socket-mode
+        # client connects so the first inbound message hits a populated
+        # filter. ``load`` is idempotent and tolerates a missing file.
+        await self._thread_participation.load()
 
         self._app = AsyncApp(token=bot_token)
         self._client = self._app.client
@@ -118,6 +130,16 @@ class SlackAdapter(ChannelAdapter):
             )
             raise
 
+        # If we just posted in a channel thread, mark participation so
+        # future un-@'d replies in that thread route to us. DMs are
+        # already conversational; their conv_keys start with
+        # ``slack:dm:`` and have no thread_ts so they're skipped here.
+        if thread_ts and not message.conversation_key.startswith("slack:dm:"):
+            await self._thread_participation.mark(
+                channel_id=channel,
+                thread_ts=thread_ts,
+            )
+
     def _channel_and_thread_for(self, conv_key: str) -> tuple[str, str | None]:
         """Recover the Slack channel and thread_ts from a conversation_key.
 
@@ -149,10 +171,46 @@ class SlackAdapter(ChannelAdapter):
 
         @self._app.event("message")
         async def _on_message(event: dict[str, Any], body: dict[str, Any]) -> None:
-            # Ignore bot echoes and message-edit subtypes.
-            if event.get("bot_id") or event.get("subtype"):
-                return
+            await self._handle_message_event(event, body)
+
+    async def _handle_message_event(
+        self, event: dict[str, Any], body: dict[str, Any]
+    ) -> None:
+        """Filter a ``message`` event and dispatch if it should reach
+        a worker.
+
+        Bot echoes and message-edit subtypes are dropped. DMs always
+        dispatch. Channel messages only dispatch when they're thread
+        replies in a thread ANNA has already posted in — top-level
+        channel messages still require an ``app_mention``, which fires
+        the ``_on_mention`` handler above.
+        """
+        # Ignore bot echoes and message-edit subtypes.
+        if event.get("bot_id") or event.get("subtype"):
+            return
+
+        channel_type = event.get("channel_type", "")
+        thread_ts = event.get("thread_ts")
+        channel_id = event.get("channel", "")
+
+        # DMs always dispatch — every DM is conversational by
+        # definition. Existing behavior, unchanged.
+        if channel_type == "im":
             await self._dispatch_event(event, body)
+            return
+
+        # Channel messages: only dispatch if it's a thread reply
+        # AND ANNA has participated in that thread. Top-level channel
+        # messages still require @-mention (which fires the
+        # app_mention handler separately).
+        if thread_ts is None:
+            return
+        if not self._thread_participation.has(
+            channel_id=channel_id, thread_ts=thread_ts
+        ):
+            return
+
+        await self._dispatch_event(event, body)
 
     async def _dispatch_event(self, event: dict[str, Any], body: dict[str, Any]) -> None:
         try:
