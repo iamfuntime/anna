@@ -569,6 +569,10 @@ class ConversationWorker:
 
     async def _handle(self, event: InboundEvent) -> None:
         if self._client is None:
+            if event.completion_future is not None and not event.completion_future.done():
+                event.completion_future.set_exception(
+                    RuntimeError("worker has no SDK client; cannot dispatch")
+                )
             return
 
         try:
@@ -581,6 +585,9 @@ class ConversationWorker:
             await self._client.query(event.text)  # type: ignore[attr-defined]
         except Exception as exc:
             self._log.error("worker.sdk_query_failed", error=str(exc))
+            if event.completion_future is not None and not event.completion_future.done():
+                event.completion_future.set_exception(exc)
+                return
             await self._send(OutboundMessage(
                 conversation_key=event.conversation_key,
                 text=f"I hit an error talking to the model: {exc}",
@@ -599,6 +606,9 @@ class ConversationWorker:
                     break
         except Exception as exc:
             self._log.error("worker.sdk_receive_failed", error=str(exc))
+            if event.completion_future is not None and not event.completion_future.done():
+                event.completion_future.set_exception(exc)
+                return
             await self._send(OutboundMessage(
                 conversation_key=event.conversation_key,
                 text=f"I hit an error reading the model response: {exc}",
@@ -608,6 +618,14 @@ class ConversationWorker:
         reply_text = "\n".join(c for c in reply_chunks if c).strip()
         if not reply_text:
             reply_text = "(no response)"
+
+        # Scheduler-driven (or any future caller-driven) dispatch short-circuits
+        # the normal send path. The caller awaits the future and routes the
+        # output itself. Transport-originated events have completion_future
+        # unset and use the standard send-back path.
+        if event.completion_future is not None and not event.completion_future.done():
+            event.completion_future.set_result(reply_text)
+            return
 
         await self._send(OutboundMessage(
             conversation_key=event.conversation_key,

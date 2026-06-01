@@ -17,6 +17,7 @@ key the router uses to multiplex workers.
 
 from __future__ import annotations
 
+import asyncio
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -25,7 +26,22 @@ from typing import Any
 
 @dataclass(frozen=True)
 class InboundEvent:
-    """Normalized event from any transport."""
+    """Normalized event from any transport.
+
+    ``completion_future`` is an optional asyncio.Future the caller can
+    attach to receive the worker's final assistant message in-process
+    rather than via the normal outbound send path. Used by the Phase 2
+    scheduler so a scheduled fire can route its output to a destination
+    that differs from the worker's natural send target. When set, the
+    worker resolves the future with the reply text and skips the
+    outbound send; when unset (the transport-originated default), the
+    worker sends to ``conversation_key`` via the router's send callback
+    as it has always done.
+
+    Excluded from compare / hash so the field's unhashable value does
+    not break dataclass equality.
+    """
+
     transport: str
     conversation_key: str
     sender_id: str
@@ -34,6 +50,9 @@ class InboundEvent:
     is_dm: bool
     is_thread: bool
     raw: dict[str, Any] = field(default_factory=dict)
+    completion_future: asyncio.Future[str] | None = field(
+        default=None, compare=False, hash=False, repr=False
+    )
 
 
 @dataclass(frozen=True)
