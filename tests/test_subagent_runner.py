@@ -125,15 +125,20 @@ def test_runner_logger_name(tmp_path: Path) -> None:
     assert runner._log is not None  # noqa: SLF001
 
 
-async def test_delegate_stub_raises_not_implemented(tmp_path: Path) -> None:
-    """Until subtask 6 lands, delegate raises NotImplementedError."""
+async def test_delegate_missing_persona_raises_not_found(tmp_path: Path) -> None:
+    """Subtask 6 happy path is wired; missing persona still raises early.
+
+    Replaces the original ``NotImplementedError`` smoke test now that
+    :meth:`SubAgentRunner.delegate` is implemented.
+    """
     runner = _make_runner(tmp_path)
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(SubAgentError) as exc_info:
         await runner.delegate(
             agent_slug="threat-researcher",
             task="dig into CVE-2026-0001",
             parent_conv_key="slack:dm:U123",
         )
+    assert exc_info.value.kind == "not_found"
 
 
 # ---------------------------------------------------------------------------
@@ -567,3 +572,275 @@ def test_write_transcript_line_per_slug_isolation(tmp_path: Path) -> None:
     assert vt_path.exists()
     assert json.loads(tr_path.read_text(encoding="utf-8"))["text"] == "t1"
     assert json.loads(vt_path.read_text(encoding="utf-8"))["text"] == "t2"
+
+
+# ---------------------------------------------------------------------------
+# Subtask 6: delegate happy path
+# ---------------------------------------------------------------------------
+
+
+from dataclasses import dataclass as _dataclass
+from typing import Any as _Any
+
+
+@_dataclass
+class _FakeTextBlock:
+    text: str
+
+
+@_dataclass
+class _FakeToolUseBlock:
+    id: str
+    name: str
+    input: dict[str, _Any]
+
+
+@_dataclass
+class _FakeAssistantMessage:
+    content: list[_Any]
+
+
+@_dataclass
+class _FakeResultMessage:
+    total_cost_usd: float | None = None
+    duration_ms: int = 0
+    duration_api_ms: int = 0
+    is_error: bool = False
+    num_turns: int = 1
+    session_id: str = "fake"
+    subtype: str = "success"
+
+
+class _FakeReplyClient:
+    """Fake ClaudeSDKClient that yields one assistant message + result."""
+
+    def __init__(
+        self,
+        *,
+        reply: str = "all done",
+        tool_calls: list[str] | None = None,
+        cost: float | None = 0.0042,
+    ) -> None:
+        self._reply = reply
+        self._tool_calls = tool_calls or []
+        self._cost = cost
+        self.queries: list[str] = []
+        self.entered = False
+        self.exited = False
+
+    def __init_options__(self, options: _Any) -> None:
+        pass
+
+    async def __aenter__(self):
+        self.entered = True
+        return self
+
+    async def __aexit__(self, *_a):
+        self.exited = True
+        return None
+
+    async def query(self, prompt: str) -> None:
+        self.queries.append(prompt)
+
+    async def receive_response(self):
+        content: list[_Any] = []
+        for name in self._tool_calls:
+            content.append(_FakeToolUseBlock(id=name, name=name, input={}))
+        content.append(_FakeTextBlock(text=self._reply))
+        yield _FakeAssistantMessage(content=content)
+        yield _FakeResultMessage(total_cost_usd=self._cost)
+
+
+def _install_fake_sdk(monkeypatch, client_factory) -> None:
+    """Patch the SDK names looked up by ``SubAgentRunner.delegate``.
+
+    The runner does a lazy ``from claude_agent_sdk import ...`` inside
+    ``delegate``, so patching the module attributes here is enough.
+    """
+    import claude_agent_sdk as sdk
+
+    monkeypatch.setattr(sdk, "AssistantMessage", _FakeAssistantMessage, raising=False)
+    monkeypatch.setattr(sdk, "ResultMessage", _FakeResultMessage, raising=False)
+    monkeypatch.setattr(sdk, "TextBlock", _FakeTextBlock, raising=False)
+    monkeypatch.setattr(sdk, "ToolUseBlock", _FakeToolUseBlock, raising=False)
+    monkeypatch.setattr(
+        sdk,
+        "ClaudeSDKClient",
+        lambda options=None: client_factory(options),
+        raising=False,
+    )
+
+
+def _write_persona(tmp_path: Path, slug: str, body: str = "persona body") -> None:
+    agents_dir = tmp_path / "agents"
+    agents_dir.mkdir(parents=True, exist_ok=True)
+    (agents_dir / f"{slug}.md").write_text(body, encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_delegate_happy_path_returns_ok_result(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Happy path: persona loads, fake SDK runs, DelegateResult populated."""
+    runner = _make_runner(tmp_path)
+    _write_persona(tmp_path, "threat-researcher")
+
+    captured: list[_FakeReplyClient] = []
+
+    def _factory(_options):
+        c = _FakeReplyClient(
+            reply="CVE-2026-0001 affects Foo v1.2.",
+            tool_calls=["mcp__anna_web__web_search", "Read"],
+            cost=0.0123,
+        )
+        captured.append(c)
+        return c
+
+    _install_fake_sdk(monkeypatch, _factory)
+
+    result = await runner.delegate(
+        agent_slug="threat-researcher",
+        task="dig into CVE-2026-0001",
+        parent_conv_key="slack:dm:U123",
+    )
+
+    assert isinstance(result, DelegateResult)
+    assert result.status == "ok"
+    assert result.text == "CVE-2026-0001 affects Foo v1.2."
+    assert result.tool_calls == ["mcp__anna_web__web_search", "Read"]
+    assert result.cost_usd == pytest.approx(0.0123)
+    assert result.duration_ms >= 0
+    today = date.today().isoformat()
+    expected = tmp_path / "transcripts" / "subagent" / "threat-researcher" / f"{today}.jsonl"
+    assert result.transcript_path == expected
+    assert expected.exists()
+    # SDK lifecycle was exercised end-to-end.
+    assert len(captured) == 1
+    assert captured[0].entered is True
+    assert captured[0].exited is True
+    assert captured[0].queries == ["dig into CVE-2026-0001"]
+
+
+@pytest.mark.asyncio
+async def test_delegate_writes_task_and_outbound_transcript_lines(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Two transcript lines per delegation: task, then outbound."""
+    runner = _make_runner(tmp_path)
+    _write_persona(tmp_path, "threat-researcher")
+    _install_fake_sdk(
+        monkeypatch,
+        lambda opts: _FakeReplyClient(reply="reply body"),
+    )
+
+    result = await runner.delegate(
+        agent_slug="threat-researcher",
+        task="dig into CVE",
+        parent_conv_key="slack:dm:U123",
+    )
+    lines = result.transcript_path.read_text(encoding="utf-8").splitlines()
+    records = [json.loads(line) for line in lines]
+    assert len(records) == 2
+    assert records[0]["direction"] == "task"
+    assert records[0]["text"] == "dig into CVE"
+    assert records[0]["parent_conv"] == "slack:dm:U123"
+    assert records[1]["direction"] == "outbound"
+    assert records[1]["text"] == "reply body"
+    assert records[1]["parent_conv"] == "slack:dm:U123"
+    # task + outbound share the same audit_id.
+    assert records[0]["audit_id"] == records[1]["audit_id"]
+    # synthetic conv_key shape.
+    assert records[0]["conv_key"].startswith("subagent:threat-researcher:")
+
+
+@pytest.mark.asyncio
+async def test_delegate_emits_spawn_and_complete_audit_events(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """spawn + complete events fire in order, share audit_id."""
+    runner = _make_runner(tmp_path)
+    _write_persona(tmp_path, "threat-researcher")
+    _install_fake_sdk(
+        monkeypatch,
+        lambda opts: _FakeReplyClient(reply="reply"),
+    )
+
+    await runner.delegate(
+        agent_slug="threat-researcher",
+        task="t",
+        parent_conv_key="slack:dm:U123",
+    )
+
+    audit_dir = tmp_path / "audit"
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    audit_path = audit_dir / f"audit-{today}.jsonl"
+    assert audit_path.exists()
+    events = [json.loads(line) for line in audit_path.read_text().splitlines()]
+    names = [e["event"] for e in events]
+    assert "audit.subagent.spawn" in names
+    assert "audit.subagent.complete" in names
+    # spawn comes before complete.
+    assert names.index("audit.subagent.spawn") < names.index(
+        "audit.subagent.complete"
+    )
+    spawn = next(e for e in events if e["event"] == "audit.subagent.spawn")
+    complete = next(e for e in events if e["event"] == "audit.subagent.complete")
+    assert spawn["audit_id"] == complete["audit_id"]
+    assert spawn["slug"] == "threat-researcher"
+    assert spawn["task"] == "t"
+    assert spawn["timeout_seconds"] == runner._config.subagents.default_timeout_seconds  # noqa: SLF001
+    assert complete["output_length"] == len("reply")
+
+
+@pytest.mark.asyncio
+async def test_delegate_truncates_task_in_spawn_audit(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Long tasks are truncated to 500 chars in the spawn audit event."""
+    runner = _make_runner(tmp_path)
+    _write_persona(tmp_path, "slug")
+    _install_fake_sdk(
+        monkeypatch,
+        lambda opts: _FakeReplyClient(reply="r"),
+    )
+
+    long_task = "x" * 2000
+    await runner.delegate(
+        agent_slug="slug",
+        task=long_task,
+        parent_conv_key="slack:dm:U123",
+    )
+    audit_dir = tmp_path / "audit"
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    events = [
+        json.loads(line)
+        for line in (audit_dir / f"audit-{today}.jsonl").read_text().splitlines()
+    ]
+    spawn = next(e for e in events if e["event"] == "audit.subagent.spawn")
+    assert len(spawn["task"]) == 500
+
+
+@pytest.mark.asyncio
+async def test_delegate_releases_semaphore_on_success(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The semaphore counter returns to its baseline after a successful run."""
+    runner = _make_runner(tmp_path)
+    _write_persona(tmp_path, "slug")
+    _install_fake_sdk(
+        monkeypatch,
+        lambda opts: _FakeReplyClient(reply="r"),
+    )
+
+    baseline = runner._semaphore._value  # noqa: SLF001
+    await runner.delegate(
+        agent_slug="slug",
+        task="t",
+        parent_conv_key="slack:dm:U123",
+    )
+    assert runner._semaphore._value == baseline  # noqa: SLF001
+
+
+# `datetime` and `timezone` are imported at top of file via `from datetime
+# import date`; pull the rest for audit-path queries.
+from datetime import datetime, timezone  # noqa: E402

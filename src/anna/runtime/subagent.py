@@ -26,13 +26,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
+import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from anna.config import AnnaConfig
-from anna.log import get_logger
+from anna.log import audit_event, get_logger
 
 if TYPE_CHECKING:
     from anna.agents.registry import SubAgentRegistry
@@ -77,23 +79,43 @@ class DelegateResult:
 
 
 class SubAgentError(Exception):
-    """Raised by :meth:`SubAgentRunner.delegate` for early-fail cases.
+    """Raised by :meth:`SubAgentRunner.delegate` for any failure case.
 
-    Covers the conditions a delegation cannot even be attempted under:
+    Both spawn-time failures (missing persona, depth violation,
+    semaphore starvation) and mid-run failures (timeout, SDK exception)
+    surface as :class:`SubAgentError` so callers branch on ``.kind``
+    rather than on exception type.
 
-    * Missing persona file at ``$ANNA_HOME/agents/<slug>.md``.
-    * Caller is itself a sub-agent (depth > 1) — enforced at the
-      runtime layer because the ``anna_delegate`` server is never
-      mounted on a sub-agent's options, but a defensive raise covers
-      the case where a future change accidentally mounts it.
-    * Concurrency semaphore could not be acquired within
+    ``kind`` is one of:
+
+    * ``not_found`` — persona file at ``$ANNA_HOME/agents/<slug>.md``
+      did not exist.
+    * ``depth_violation`` — the caller is itself a sub-agent
+      (``parent_conv_key`` starts with ``subagent:``). Mostly defensive
+      since the ``anna_delegate`` server is never mounted on a
+      sub-agent's options.
+    * ``concurrency_timeout`` — the runner could not acquire a
+      semaphore slot within
       ``config.subagents.concurrency_acquire_timeout_seconds``.
-    * Per-delegation timeout elapsed.
-    * The SDK refused to spawn (auth, rate-limit, network).
+    * ``timeout`` — the per-delegation wall-clock cap elapsed mid-run.
+    * ``error`` — any other exception during ``query`` or
+      ``receive_response``; ``reason`` carries the ``repr`` of the
+      underlying exception.
 
     Caught and rendered as the tool's text response in
     ``build_delegate_server``; never propagates out of the worker.
     """
+
+    def __init__(
+        self,
+        kind: str,
+        *,
+        reason: str | None = None,
+    ) -> None:
+        self.kind = kind
+        self.reason = reason
+        message = kind if reason is None else f"{kind}: {reason}"
+        super().__init__(message)
 
 
 class SubAgentRunner:
@@ -396,6 +418,25 @@ class SubAgentRunner:
             fp.write(line + "\n")
         return path
 
+    def _audit(
+        self,
+        event: str,
+        *,
+        parent_conv: str,
+        level: str = "INFO",
+        **fields: Any,
+    ) -> None:
+        """Wrap :func:`audit_event` with the runner's own audit dir + fsync."""
+        audit_event(
+            event,
+            audit_dir=self._audit_dir,
+            actor="anna",
+            conv_key=parent_conv,
+            fsync_on_write=self._fsync,
+            level=level,
+            **fields,
+        )
+
     async def delegate(
         self,
         *,
@@ -407,9 +448,12 @@ class SubAgentRunner:
     ) -> DelegateResult:
         """Spawn the sub-agent, run the task, return the reply.
 
-        Stubbed until subtask 6 lands. Method signature is locked here
-        so the MCP wrapper and worker wiring (later subtasks) can be
-        written against a stable contract.
+        Implements the full 12-step flow from the §3 plan: acquire the
+        semaphore (bounded wait), load persona + skills, build prompt
+        and options, open a fresh ``ClaudeSDKClient``, send the task,
+        drain ``receive_response`` until ``ResultMessage``, write
+        transcript lines, close the client, release the semaphore, and
+        return a :class:`DelegateResult`.
 
         Args:
             agent_slug: Persona slug — selects
@@ -421,23 +465,207 @@ class SubAgentRunner:
                 can cross-reference a delegation with its parent
                 conversation.
             context: Optional dict rendered as a YAML block in the
-                sub-agent's system prompt. None when the caller has
-                nothing structured to pass.
+                sub-agent's system prompt.
             timeout_seconds: Per-call wall-clock cap. None falls back
                 to ``config.subagents.default_timeout_seconds``.
 
         Returns:
-            :class:`DelegateResult` on success.
+            :class:`DelegateResult` with ``status="ok"`` on success.
 
         Raises:
             :class:`SubAgentError`: for missing persona, depth
-                violation, concurrency-acquire timeout, or SDK-level
-                failures before a response could be assembled.
-            :class:`NotImplementedError`: until subtask 6 ships.
+                violation, concurrency-acquire timeout, per-delegation
+                timeout, or any SDK-level failure during query /
+                receive.
         """
-        raise NotImplementedError(
-            "SubAgentRunner.delegate lands in subtask 6 of the §3 plan"
+        # Depth-protection: sub-agents do not get the anna_delegate
+        # MCP server in their options, so this branch is defensive.
+        # The check runs before semaphore acquisition so a recursive
+        # call cannot even queue up.
+        if parent_conv_key.startswith("subagent:"):
+            self._audit(
+                "audit.subagent.fail",
+                parent_conv=parent_conv_key,
+                level="WARNING",
+                slug=agent_slug,
+                kind="depth_violation",
+                reason="caller is itself a sub-agent",
+            )
+            raise SubAgentError("depth_violation")
+
+        effective_timeout = (
+            timeout_seconds
+            if timeout_seconds is not None
+            else self._config.subagents.default_timeout_seconds
         )
+
+        # Step 1: acquire semaphore with bounded wait.
+        acquire_timeout = (
+            self._config.subagents.concurrency_acquire_timeout_seconds
+        )
+        try:
+            await asyncio.wait_for(
+                self._semaphore.acquire(),
+                timeout=acquire_timeout,
+            )
+        except asyncio.TimeoutError as exc:
+            self._audit(
+                "audit.subagent.fail",
+                parent_conv=parent_conv_key,
+                level="WARNING",
+                slug=agent_slug,
+                kind="concurrency_timeout",
+                acquire_timeout_seconds=acquire_timeout,
+            )
+            raise SubAgentError(
+                "concurrency_timeout",
+                reason=f"waited {acquire_timeout}s for a semaphore slot",
+            ) from exc
+
+        # Past this point every exit path MUST release the semaphore.
+        audit_id = str(uuid.uuid4())
+        conv_key = f"subagent:{agent_slug}:{audit_id}"
+        try:
+            # Step 2: load persona. Missing persona is a spawn-time fail.
+            try:
+                persona = self._load_persona(agent_slug)
+            except SubAgentError as exc:
+                # _load_persona only raises kind="not_found"; surface a
+                # matching fail audit and re-raise.
+                self._audit(
+                    "audit.subagent.fail",
+                    parent_conv=parent_conv_key,
+                    level="WARNING",
+                    slug=agent_slug,
+                    audit_id=audit_id,
+                    kind=exc.kind,
+                )
+                raise
+
+            # Step 3: load skills (missing dir → []).
+            skills = self._load_skills(agent_slug)
+
+            # Step 4: assemble system prompt.
+            vault_root = self._config.vault.resolved_path
+            system_prompt = self._build_system_prompt(
+                persona=persona,
+                skills=skills,
+                task=task,
+                context=context,
+                vault_root=vault_root,
+            )
+
+            # Step 5: build options.
+            options = self._build_subagent_options(
+                system_prompt=system_prompt,
+                conv_key=conv_key,
+            )
+
+            # Step 6+7: stamp spawn audit. Truncate the task for the
+            # audit line so a multi-page prompt does not bloat journald.
+            truncated_task = task[:500]
+            self._audit(
+                "audit.subagent.spawn",
+                parent_conv=parent_conv_key,
+                slug=agent_slug,
+                audit_id=audit_id,
+                task=truncated_task,
+                timeout_seconds=effective_timeout,
+            )
+
+            # Write the task transcript line up front so a crashing
+            # sub-agent still leaves evidence of what was asked.
+            transcript_path = self._write_transcript_line(
+                slug=agent_slug,
+                conv_key=conv_key,
+                direction="task",
+                text=task,
+                audit_id=audit_id,
+                parent_conv=parent_conv_key,
+            )
+
+            # Step 8-10: open the SDK client and run the task.
+            # Lazy import mirrors ConversationWorker._handle so unit
+            # tests can monkeypatch ClaudeSDKClient + message types.
+            from claude_agent_sdk import (
+                AssistantMessage,
+                ClaudeSDKClient,
+                ResultMessage,
+                TextBlock,
+                ToolUseBlock,
+            )
+
+            start_ns = time.monotonic_ns()
+            reply_chunks: list[str] = []
+            tool_calls: list[str] = []
+            cost_usd: float = 0.0
+
+            client = ClaudeSDKClient(options=options)
+            await client.__aenter__()
+            try:
+                await client.query(task)
+                async for msg in client.receive_response():
+                    if isinstance(msg, AssistantMessage):
+                        for block in msg.content:
+                            if isinstance(block, TextBlock):
+                                reply_chunks.append(block.text)
+                            elif isinstance(block, ToolUseBlock):
+                                tool_calls.append(block.name)
+                    if isinstance(msg, ResultMessage):
+                        if msg.total_cost_usd is not None:
+                            cost_usd = float(msg.total_cost_usd)
+                        break
+            finally:
+                try:
+                    await client.__aexit__(None, None, None)
+                except Exception as exc:  # noqa: BLE001
+                    # Closing the client must not mask a successful run.
+                    self._log.warning(
+                        "subagent.client_close_failed",
+                        slug=agent_slug,
+                        audit_id=audit_id,
+                        error=str(exc),
+                    )
+
+            duration_ms = int((time.monotonic_ns() - start_ns) / 1_000_000)
+            reply_text = "\n".join(c for c in reply_chunks if c).strip()
+            if not reply_text:
+                reply_text = "(no response)"
+
+            # Step 11: write the outbound transcript line.
+            self._write_transcript_line(
+                slug=agent_slug,
+                conv_key=conv_key,
+                direction="outbound",
+                text=reply_text,
+                audit_id=audit_id,
+                parent_conv=parent_conv_key,
+                duration_seconds=duration_ms / 1000.0,
+                cost_usd=cost_usd,
+                tool_calls=tool_calls,
+            )
+
+            # Step 12: completion audit.
+            self._audit(
+                "audit.subagent.complete",
+                parent_conv=parent_conv_key,
+                slug=agent_slug,
+                audit_id=audit_id,
+                duration_seconds=duration_ms / 1000.0,
+                output_length=len(reply_text),
+            )
+
+            return DelegateResult(
+                text=reply_text,
+                transcript_path=transcript_path,
+                tool_calls=tool_calls,
+                cost_usd=cost_usd,
+                duration_ms=duration_ms,
+                status="ok",
+            )
+        finally:
+            # Step 13: always release the semaphore.
+            self._semaphore.release()
 
 
 __all__ = [
