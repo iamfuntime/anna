@@ -154,6 +154,27 @@ async def _run(config: AnnaConfig) -> None:
             ),
         )
 
+    # Phase 2 §5 CLI transport. The adapter itself is constructed inside
+    # build_enabled_adapters and started with the other listener tasks
+    # below; this block just emits the boot-time visibility line that
+    # mirrors anna.web.ready / anna.subagent.ready.
+    if config.transports.cli.enabled:
+        log.info(
+            "anna.cli.ready",
+            socket_path=str(config.transports.cli.resolved_socket_path),
+            idle_gap_minutes=config.transports.cli.idle_gap_minutes,
+            identities=[i.canonical for i in config.identities],
+        )
+    else:
+        log.info(
+            "anna.cli.disabled",
+            note=(
+                "transports.cli.enabled is false; the CLI socket will not "
+                "be bound and `anna chat`/`anna ask` will not have anything "
+                "to connect to"
+            ),
+        )
+
     router = ConversationRouter(
         config=config,
         supervisor=supervisor,

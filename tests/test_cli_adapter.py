@@ -17,6 +17,7 @@ from typing import Any
 import pytest
 
 from anna.config import AnnaConfig, IdentityAliasEntry
+from anna.transports import build_enabled_adapters
 from anna.transports.base import InboundEvent, OutboundMessage
 from anna.transports.cli import CLIAdapter
 
@@ -506,3 +507,25 @@ def test_conversation_key_for_dict_oneshot_unique() -> None:
     assert a.startswith("cli:oneshot:")
     assert b.startswith("cli:oneshot:")
     assert a != b
+
+
+# ---------------------------------------------------------------------------
+# build_enabled_adapters wiring (subtask 13)
+# ---------------------------------------------------------------------------
+
+
+def test_build_enabled_adapters_includes_cli_when_enabled(tmp_path: Path) -> None:
+    """``build_enabled_adapters`` registers a CLIAdapter when transports.cli.enabled."""
+    cfg = AnnaConfig()
+    object.__setattr__(cfg, "anna_home", tmp_path / "anna_home")
+    cfg.transports.slack.enabled = False
+    cfg.transports.telegram.enabled = False
+    cfg.transports.cli.enabled = True
+    cfg.transports.cli.socket_path = str(tmp_path / "anna.sock")
+
+    adapters = build_enabled_adapters(cfg)
+
+    assert "cli" in adapters
+    assert isinstance(adapters["cli"], CLIAdapter)
+    assert "slack" not in adapters
+    assert "telegram" not in adapters

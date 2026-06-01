@@ -8,12 +8,14 @@ from __future__ import annotations
 
 from anna.config import AnnaConfig
 from anna.transports.base import ChannelAdapter, InboundEvent, OutboundMessage
+from anna.transports.cli import CLIAdapter
 from anna.transports.slack import SlackAdapter
 from anna.transports.slack_thread_state import ThreadParticipation
 from anna.transports.telegram import TelegramAdapter
 
 __all__ = [
     "ChannelAdapter",
+    "CLIAdapter",
     "InboundEvent",
     "OutboundMessage",
     "SlackAdapter",
@@ -45,4 +47,6 @@ def build_enabled_adapters(config: AnnaConfig) -> dict[str, ChannelAdapter]:
         )
     if config.transports.telegram.enabled:
         adapters["telegram"] = TelegramAdapter(config=config)
+    if config.transports.cli.enabled:
+        adapters["cli"] = CLIAdapter(config=config)
     return adapters
