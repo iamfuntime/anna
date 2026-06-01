@@ -701,6 +701,21 @@ class ConversationWorker:
                     for block in msg.content:
                         if TextBlock is not None and isinstance(block, TextBlock):
                             reply_chunks.append(block.text)
+                            # Phase 2 §5: emit streaming deltas to the
+                            # per-event subscriber (set by the CLI adapter)
+                            # before the buffered finalize lands. Exception
+                            # isolation is mandatory: a misbehaving
+                            # subscriber must NOT abort the buffered send
+                            # that Slack and Telegram depend on.
+                            if event.stream_subscriber is not None:
+                                try:
+                                    await event.stream_subscriber(block.text)
+                                except Exception as exc:
+                                    self._log.warning(
+                                        "worker.stream_subscriber_failed",
+                                        error=str(exc),
+                                        conv_key=event.conversation_key,
+                                    )
                 if ResultMessage is not None and isinstance(msg, ResultMessage):
                     break
         except Exception as exc:
