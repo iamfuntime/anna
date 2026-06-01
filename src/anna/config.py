@@ -161,6 +161,32 @@ class AdminConfig(BaseModel):
     startup_alert: bool = True
 
 
+class SchedulerConfig(BaseModel):
+    """Phase 2 scheduler. Fires scheduled prompts through the worker pool.
+
+    Schedules persist to ``state_path`` as YAML. The scheduler coroutine
+    polls every ``poll_interval_seconds`` for schedules whose next-fire
+    time has passed and dispatches a synthetic ``InboundEvent`` through
+    the conversation router. Output routes to the per-schedule
+    destination (a non-admin Slack channel or Telegram chat). Three
+    consecutive failures auto-disables the schedule and alerts admin.
+
+    See Inbox/2026-06-01-ANNA-Phase-2-Scheduler-Buildout-Plan.md for the
+    full design.
+    """
+
+    enabled: bool = True
+    state_path: str = "~/anna/schedules.yaml"
+    default_timeout_seconds: int = 300
+    max_concurrent: int = 3
+    poll_interval_seconds: int = 30
+    failure_threshold: int = 3
+
+    @property
+    def resolved_state_path(self) -> Path:
+        return Path(os.path.expanduser(self.state_path))
+
+
 # ---------------------------------------------------------------------------
 # Top-level
 # ---------------------------------------------------------------------------
@@ -176,6 +202,7 @@ class AnnaConfig(BaseModel):
     housekeeping: HousekeepingConfig = Field(default_factory=HousekeepingConfig)
     sessions: SessionsConfig = Field(default_factory=SessionsConfig)
     admin: AdminConfig = Field(default_factory=AdminConfig)
+    scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
 
     # Derived runtime paths. Not in the YAML file. ANNA_HOME from .env wins,
     # falling back to ~/anna. The setup wizard always writes ANNA_HOME.

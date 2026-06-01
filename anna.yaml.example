@@ -126,3 +126,33 @@ admin:
   # $ANNA_HOME/state/last_clean_shutdown) or UNCLEAN (sentinel missing —
   # crash, kill, or power loss). Set false to silence boot pings.
   startup_alert: true
+
+# ============================================================
+# Scheduler (Phase 2)
+#
+# Fires scheduled prompts through the worker pool. Schedules persist
+# to state_path as YAML; create/update/delete them at runtime via the
+# anna_self_edit MCP tools (schedule_create, schedule_update, etc.).
+# The scheduler polls every poll_interval_seconds for due schedules,
+# dispatches a synthetic InboundEvent through the router, and routes
+# the worker's final reply to the per-schedule destination (a non-admin
+# Slack channel or Telegram chat). Three consecutive failures
+# auto-disables the schedule and alerts admin.
+# ============================================================
+scheduler:
+  enabled: true
+  # Where the on-disk schedule list lives. Operator-editable for one-off
+  # repairs, but normal create/update/delete should go through the MCP
+  # tools so the supervisor lock and audit trail are honored.
+  state_path: ~/anna/schedules.yaml
+  # Per-fire wall-clock cap if a schedule does not specify its own.
+  default_timeout_seconds: 300
+  # Hard cap on simultaneously-firing schedules. Beyond this, fires queue.
+  max_concurrent: 3
+  # Loop cadence. 30s matches the cron 1-minute floor with one cycle of
+  # safety margin; finer granularity would not buy anything.
+  poll_interval_seconds: 30
+  # Consecutive-failure count that auto-disables a schedule and fires
+  # AdminAlerter.warn(). The schedule stays in state_path with enabled:
+  # false until the operator re-enables it.
+  failure_threshold: 3
