@@ -185,3 +185,53 @@ google:
   # behind this flag. Keep off until you trust scheduled prompts to send
   # mail on their own.
   write_enabled: false
+
+# ============================================================
+# tools: Phase 2 §2 in-process tool surface (slim slice).
+# Three tools mounted as the anna_web MCP server:
+#   - web_search: Brave Search REST
+#   - web_fetch:  httpx GET + HTML→Markdown (Playwright fallback deferred)
+#   - vault_download: URL → ~/Obsidian/ANNA/Inbox/<safe-slug>.<ext>
+# shell_exec is deferred to the Docker slice; until then the worker's
+# Bash tool covers the capability.
+# ============================================================
+tools:
+  # Master kill switch. False = anna_web is not mounted, the three tools
+  # are unavailable. True (default) = all three tools register at worker
+  # startup.
+  enabled: true
+  web_search:
+    # Currently only "brave" ships. Future providers (Tavily, Kagi) slot
+    # in behind the same interface; flip this value when a new provider
+    # lands.
+    provider: brave
+    # Name of the env var that holds the API key. Keep the key itself in
+    # ~/anna/.env (mode 0600), never in this file.
+    api_key_env: BRAVE_SEARCH_API_KEY
+    # Per-call cap. Hard-bounded 1..50 by the model validator.
+    max_results: 10
+    # Per-call wall-clock timeout. Brave is fast; 15s is generous.
+    timeout_seconds: 15
+  web_fetch:
+    # Per-call wall-clock timeout for the httpx GET.
+    timeout_seconds: 30
+    # Browser-shaped UA. Default is a current Chrome-on-Linux string so
+    # reputation-aware sites (Cloudflare, certain news outlets) don't
+    # rate-limit a clearly-bot UA. Override only if a specific situation
+    # needs a different identity.
+    user_agent: >-
+      Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36
+      (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36
+    # Forward-compat flag for the Playwright JS-render fallback. Leave
+    # false until the dep ships in a later slice and `playwright install
+    # chromium` has run in the venv.
+    playwright_fallback: false
+  vault_download:
+    # Where downloaded files land. ~ expands; relative paths resolve
+    # against the process cwd, not anna_home, so keep this absolute or
+    # tilde-rooted.
+    destination: ~/Obsidian/ANNA/Inbox
+    # Size cap per file. Mid-stream abort and partial-file cleanup if
+    # the response exceeds this. 50 MB covers CVE PDFs and threat
+    # reports; raise if you need bigger.
+    max_size_bytes: 52428800

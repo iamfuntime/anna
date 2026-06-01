@@ -80,3 +80,61 @@ def test_invalid_daily_sweep_time_rejected() -> None:
     raw = {"housekeeping": {"daily_sweep_time": "25:99"}}
     with pytest.raises(Exception):
         AnnaConfig.model_validate(raw)
+
+
+def test_tools_defaults_when_block_omitted() -> None:
+    """A config with no tools: block uses ToolsConfig defaults."""
+    raw = {"auth": {"mode": "max"}}
+    cfg = AnnaConfig.model_validate(raw)
+    assert cfg.tools.enabled is True
+    assert cfg.tools.web_search.provider == "brave"
+    assert cfg.tools.web_search.api_key_env == "BRAVE_SEARCH_API_KEY"
+    assert cfg.tools.web_search.max_results == 10
+    assert cfg.tools.web_search.timeout_seconds == 15
+    assert cfg.tools.web_fetch.timeout_seconds == 30
+    assert "Chrome/" in cfg.tools.web_fetch.user_agent
+    assert cfg.tools.web_fetch.playwright_fallback is False
+    assert cfg.tools.vault_download.destination == "~/Obsidian/ANNA/Inbox"
+    assert cfg.tools.vault_download.max_size_bytes == 52_428_800
+
+
+def test_tools_disabled_persists() -> None:
+    raw = {"tools": {"enabled": False}}
+    cfg = AnnaConfig.model_validate(raw)
+    assert cfg.tools.enabled is False
+
+
+def test_tools_web_search_max_results_validation() -> None:
+    for bad in (0, -1, 51, 1000):
+        with pytest.raises(Exception):
+            AnnaConfig.model_validate({"tools": {"web_search": {"max_results": bad}}})
+
+
+def test_tools_web_fetch_timeout_validation() -> None:
+    for bad in (0, -5, 301, 9999):
+        with pytest.raises(Exception):
+            AnnaConfig.model_validate({"tools": {"web_fetch": {"timeout_seconds": bad}}})
+
+
+def test_tools_vault_download_max_size_validation() -> None:
+    with pytest.raises(Exception):
+        AnnaConfig.model_validate({"tools": {"vault_download": {"max_size_bytes": 0}}})
+    with pytest.raises(Exception):
+        AnnaConfig.model_validate({"tools": {"vault_download": {"max_size_bytes": -1}}})
+
+
+def test_tools_vault_download_destination_expands_tilde() -> None:
+    raw = {"tools": {"vault_download": {"destination": "~/custom/inbox"}}}
+    cfg = AnnaConfig.model_validate(raw)
+    resolved = str(cfg.tools.vault_download.resolved_destination)
+    assert resolved.endswith("/custom/inbox")
+    assert "~" not in resolved
+
+
+def test_example_yaml_includes_tools_block() -> None:
+    """Confirms anna.yaml.example's tools: block round-trips through the model."""
+    raw = yaml.safe_load(EXAMPLE_PATH.read_text(encoding="utf-8"))
+    cfg = AnnaConfig.model_validate(raw)
+    assert cfg.tools.enabled is True
+    assert cfg.tools.web_search.provider == "brave"
+    assert cfg.tools.web_fetch.playwright_fallback is False

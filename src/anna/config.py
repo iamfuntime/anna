@@ -228,6 +228,96 @@ class GoogleConfig(BaseModel):
         return self
 
 
+class WebSearchConfig(BaseModel):
+    """Brave Search REST wrapper config.
+
+    The API key is read from the env var named in ``api_key_env`` (default
+    ``BRAVE_SEARCH_API_KEY``). If the variable is unset or empty at call
+    time the tool surfaces a clear error rather than silently returning
+    empty results.
+    """
+
+    provider: Literal["brave"] = "brave"
+    api_key_env: str = "BRAVE_SEARCH_API_KEY"
+    max_results: int = 10
+    timeout_seconds: int = 15
+
+    @field_validator("max_results")
+    @classmethod
+    def _max_results_positive(cls, v: int) -> int:
+        if v <= 0 or v > 50:
+            raise ValueError("web_search.max_results must be between 1 and 50")
+        return v
+
+
+class WebFetchConfig(BaseModel):
+    """httpx-based URL fetch + HTML-to-Markdown conversion config.
+
+    ``user_agent`` defaults to a current Chrome-on-Linux string so
+    reputation-aware sites don't rate-limit ANNA the way they would an
+    unknown UA. Override per-deployment if a specific situation requires
+    it. ``playwright_fallback`` is a forward-compat flag — true is not
+    yet wired (the dep ships in a later slice with the chromium install
+    step). Leave as false.
+    """
+
+    timeout_seconds: int = 30
+    user_agent: str = (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    )
+    playwright_fallback: bool = False
+
+    @field_validator("timeout_seconds")
+    @classmethod
+    def _timeout_positive(cls, v: int) -> int:
+        if v <= 0 or v > 300:
+            raise ValueError("web_fetch.timeout_seconds must be between 1 and 300")
+        return v
+
+
+class VaultDownloadConfig(BaseModel):
+    """URL → vault-Inbox download config.
+
+    ``destination`` resolves user-home (``~``). Files larger than
+    ``max_size_bytes`` abort mid-stream and the partial file is removed.
+    """
+
+    destination: str = "~/Obsidian/ANNA/Inbox"
+    max_size_bytes: int = 52_428_800  # 50 MB
+
+    @property
+    def resolved_destination(self) -> Path:
+        return Path(os.path.expanduser(self.destination))
+
+    @field_validator("max_size_bytes")
+    @classmethod
+    def _max_size_positive(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError("vault_download.max_size_bytes must be > 0")
+        return v
+
+
+class ToolsConfig(BaseModel):
+    """Phase 2 §2 tool surface (slim slice).
+
+    Three in-process tools mounted on each worker as the ``anna_web`` MCP
+    server: web_search (Brave REST), web_fetch (httpx + future Playwright
+    fallback), and vault_download (URL → ``~/Obsidian/ANNA/Inbox``).
+
+    Gated by ``enabled`` so a deployment that doesn't want any of these
+    can skip the mount cleanly. shell_exec is deferred to the Docker
+    slice — when ANNA runs inside a container the security-posture
+    question (open Bash vs allowlisted exec) gets a real answer; until
+    then the worker's existing Bash tool covers the capability.
+    """
+
+    enabled: bool = True
+    web_search: WebSearchConfig = Field(default_factory=WebSearchConfig)
+    web_fetch: WebFetchConfig = Field(default_factory=WebFetchConfig)
+    vault_download: VaultDownloadConfig = Field(default_factory=VaultDownloadConfig)
+
+
 class SchedulerConfig(BaseModel):
     """Phase 2 scheduler. Fires scheduled prompts through the worker pool.
 
@@ -271,6 +361,7 @@ class AnnaConfig(BaseModel):
     admin: AdminConfig = Field(default_factory=AdminConfig)
     scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
     google: GoogleConfig = Field(default_factory=GoogleConfig)
+    tools: ToolsConfig = Field(default_factory=ToolsConfig)
 
     # Derived runtime paths. Not in the YAML file. ANNA_HOME from .env wins,
     # falling back to ~/anna. The setup wizard always writes ANNA_HOME.
