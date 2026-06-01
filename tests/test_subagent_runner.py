@@ -1144,3 +1144,148 @@ async def test_delegate_timeout_emits_fail_audit_and_raises(
 
     # Semaphore released so a follow-on call can proceed.
     assert runner._semaphore._value == 3  # noqa: SLF001
+
+
+# ---------------------------------------------------------------------------
+# Subtask 12: concurrency + depth-protection invariant
+# ---------------------------------------------------------------------------
+
+
+class _TimedHoldClient:
+    """Fake SDK client that records acquire / release wall-clock times.
+
+    The fake holds inside ``receive_response`` for ``hold_seconds`` after
+    recording ``acquired_at`` (the moment the SDK lifecycle starts) and
+    releases by recording ``released_at`` just before the final
+    ResultMessage. The semaphore in ``SubAgentRunner.delegate`` is
+    acquired before any SDK call, so the ``acquired_at`` timestamp on
+    the fake is a faithful proxy for when the runner finally got a
+    slot.
+    """
+
+    def __init__(self, *, hold_seconds: float, observations: list[dict[str, float]]) -> None:
+        self._hold_seconds = hold_seconds
+        self._observations = observations
+        self._obs: dict[str, float] = {}
+
+    async def __aenter__(self):
+        self._obs["acquired_at"] = asyncio.get_event_loop().time()
+        return self
+
+    async def __aexit__(self, *_a):
+        self._obs["released_at"] = asyncio.get_event_loop().time()
+        self._observations.append(self._obs)
+        return None
+
+    async def query(self, prompt: str) -> None:
+        return None
+
+    async def receive_response(self):
+        await asyncio.sleep(self._hold_seconds)
+        yield _FakeAssistantMessage(content=[_FakeTextBlock(text="done")])
+        yield _FakeResultMessage(total_cost_usd=0.0)
+
+
+@pytest.mark.asyncio
+async def test_delegate_concurrency_is_semaphore_bounded(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """N+1 concurrent delegates: the extra call only starts once a slot frees.
+
+    With ``max_concurrent=2`` and three concurrent delegates each
+    holding the SDK lifecycle for ~0.4s, we expect the first two to run
+    in parallel and the third to wait for one of them to release the
+    semaphore before its own SDK lifecycle even starts. The
+    ``_TimedHoldClient`` records ``acquired_at`` / ``released_at``
+    around ``__aenter__`` / ``__aexit__`` so we can assert
+    ``third.acquired_at >= min(first.released_at, second.released_at)``.
+    """
+    cfg = AnnaConfig.model_validate(
+        {
+            "subagents": {
+                "max_concurrent": 2,
+                # Generous acquire timeout so the third call definitely
+                # gets in once a slot opens up. We do not want to race
+                # the concurrency-acquire-timeout path here.
+                "concurrency_acquire_timeout_seconds": 30,
+            },
+        }
+    )
+    cfg = cfg.model_copy(update={"anna_home": tmp_path})
+    supervisor = Supervisor(config=cfg)
+    runner = SubAgentRunner(
+        config=cfg,
+        supervisor=supervisor,
+        agents_registry=SubAgentRegistry(
+            supervisor=supervisor,
+            agents_dir=tmp_path / "agents",
+            audit_dir=tmp_path / "audit",
+            fsync_on_write=False,
+        ),
+        skills_registry=SkillRegistry(
+            supervisor=supervisor,
+            skills_dir=tmp_path / "skills",
+            audit_dir=tmp_path / "audit",
+            fsync_on_write=False,
+        ),
+    )
+    _write_persona(tmp_path, "slug")
+
+    hold_seconds = 0.4
+    observations: list[dict[str, float]] = []
+
+    def _factory(_options):
+        return _TimedHoldClient(
+            hold_seconds=hold_seconds,
+            observations=observations,
+        )
+
+    _install_fake_sdk(monkeypatch, _factory)
+
+    # Fire three concurrent delegates and wait for all to complete.
+    results = await asyncio.gather(
+        runner.delegate(
+            agent_slug="slug",
+            task="t1",
+            parent_conv_key="slack:dm:U123",
+        ),
+        runner.delegate(
+            agent_slug="slug",
+            task="t2",
+            parent_conv_key="slack:dm:U123",
+        ),
+        runner.delegate(
+            agent_slug="slug",
+            task="t3",
+            parent_conv_key="slack:dm:U123",
+        ),
+    )
+
+    # All three completed cleanly.
+    assert all(r.status == "ok" for r in results)
+    assert len(observations) == 3
+    # Sort by acquire time so we can talk about "the third" deterministically.
+    observations.sort(key=lambda o: o["acquired_at"])
+    first, second, third = observations
+    # The first two ran in parallel: their acquire times are within a
+    # small slack of each other (well under the hold duration).
+    parallel_gap = abs(second["acquired_at"] - first["acquired_at"])
+    assert parallel_gap < hold_seconds / 2, (
+        f"first two acquires should be near-simultaneous; gap={parallel_gap:.3f}s"
+    )
+    # The third did NOT start until at least one of the first two
+    # released its semaphore slot. We give a small slack for asyncio
+    # scheduling jitter.
+    earliest_release = min(first["released_at"], second["released_at"])
+    assert third["acquired_at"] >= earliest_release - 0.05, (
+        f"third delegate should wait for a slot; "
+        f"third.acquired_at={third['acquired_at']:.3f}, "
+        f"earliest_release={earliest_release:.3f}"
+    )
+    # And the third's acquire-time gap is comparable to the hold
+    # duration, not zero.
+    third_wait = third["acquired_at"] - first["acquired_at"]
+    assert third_wait >= hold_seconds * 0.5, (
+        f"third delegate should have waited ~{hold_seconds}s; "
+        f"actual wait={third_wait:.3f}s"
+    )
