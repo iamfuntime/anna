@@ -81,6 +81,16 @@ main() {
     pip install --upgrade pip >/dev/null
     pip install -e "$ANNA_HOME"
 
+    # Seed the markdown vault before the wizard so the operator's first
+    # boot of ANNA finds Conversations/, Identity/, agents/, skills/ etc.
+    # already in place. The script is idempotent: re-running install.sh
+    # never overwrites operator content.
+    if [ -x "$ANNA_HOME/scripts/seed_vault.sh" ]; then
+        say "seeding markdown vault"
+        ANNA_HOME="$ANNA_HOME" bash "$ANNA_HOME/scripts/seed_vault.sh" || \
+            warn "vault seed step failed; continuing — re-run scripts/seed_vault.sh manually if needed"
+    fi
+
     say "handing off to the setup wizard"
     exec anna-setup
 }
