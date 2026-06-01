@@ -184,6 +184,81 @@ class SubAgentRunner:
             bodies.append(path.read_text(encoding="utf-8"))
         return bodies
 
+    # ------------------------------------------------------------------
+    # System prompt assembly (subtask 4)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_system_prompt(
+        persona: str,
+        skills: list[str],
+        task: str,
+        context: dict[str, Any] | None,
+        vault_root: Path,
+    ) -> str:
+        """Splice the persona, skills, delegation framing, task, and optional context.
+
+        Pure function — no I/O, no logger, no clock. The shape is:
+
+        ```
+        <persona verbatim>
+
+        # Skills
+        <skill_1_text>
+
+        <skill_2_text>
+
+        # Delegation context
+        <fixed framing block naming the available tools and vault root>
+
+        # Task
+        <task>
+
+        # Context
+        <yaml.safe_dump(context)>     ← only when context is not None
+        ```
+
+        Skills are concatenated by blank lines with no per-skill
+        heading — each skill file already includes its own headings,
+        and an extra ``## <slug>`` wrapper would compound that.
+
+        The ``# Skills`` section is omitted entirely when there are no
+        skills, so a persona-only sub-agent gets a tidy prompt.
+        Similarly, ``# Context`` is only present when the caller passed
+        a non-None dict.
+        """
+        import yaml
+
+        delegation_block = (
+            "You are running as a one-shot sub-agent spawned by ANNA. You "
+            "do not have the delegate tool; you cannot spawn further "
+            "sub-agents. You have web_search, web_fetch, and "
+            "vault_download for outside-the-vault work, plus the file "
+            "ops (Read, Write, Edit, Glob, Grep) scoped to the ANNA "
+            "vault. Your reply is returned to the parent agent as a "
+            "single tool result; write the final answer as one message.\n"
+            f"Vault root: {vault_root}."
+        )
+
+        sections: list[str] = [persona.rstrip()]
+        if skills:
+            skills_body = "\n\n".join(s.strip() for s in skills if s.strip())
+            if skills_body:
+                sections.append(f"# Skills\n{skills_body}")
+        sections.append(f"# Delegation context\n{delegation_block}")
+        sections.append(f"# Task\n{task.strip()}")
+        if context is not None:
+            # default_flow_style=False keeps YAML readable; sort_keys
+            # for determinism (a context dict built from operator data
+            # can have insertion-order keys that flap across runs).
+            context_yaml = yaml.safe_dump(
+                context,
+                default_flow_style=False,
+                sort_keys=True,
+            ).rstrip()
+            sections.append(f"# Context\n{context_yaml}")
+        return "\n\n".join(sections)
+
     async def delegate(
         self,
         *,

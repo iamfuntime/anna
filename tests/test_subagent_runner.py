@@ -199,3 +199,112 @@ def test_load_skills_ignores_non_md_files(tmp_path: Path) -> None:
     (skills_dir / "README").write_text("readme — skip me", encoding="utf-8")
     bodies = runner._load_skills("threat-researcher")  # noqa: SLF001
     assert bodies == ["real body"]
+
+
+# ---------------------------------------------------------------------------
+# Subtask 4: system prompt assembly
+# ---------------------------------------------------------------------------
+
+
+def test_build_system_prompt_persona_only(tmp_path: Path) -> None:
+    """No skills, no context → persona + delegation framing + task."""
+    prompt = SubAgentRunner._build_system_prompt(  # noqa: SLF001
+        persona="You are a threat researcher.",
+        skills=[],
+        task="dig into CVE-2026-0001",
+        context=None,
+        vault_root=tmp_path / "vault",
+    )
+    assert prompt.startswith("You are a threat researcher.")
+    assert "# Skills" not in prompt
+    assert "# Delegation context" in prompt
+    assert "You do not have the delegate tool" in prompt
+    assert "# Task\ndig into CVE-2026-0001" in prompt
+    assert "# Context" not in prompt
+    assert str(tmp_path / "vault") in prompt
+
+
+def test_build_system_prompt_persona_and_skills(tmp_path: Path) -> None:
+    """Skills are concatenated with blank-line separators under # Skills."""
+    prompt = SubAgentRunner._build_system_prompt(  # noqa: SLF001
+        persona="You are a threat researcher.",
+        skills=["## CVE digging\nUse Brave + Mitre.", "## Vendor advisories\nCheck PSIRT feeds."],
+        task="task body",
+        context=None,
+        vault_root=tmp_path / "vault",
+    )
+    assert "# Skills" in prompt
+    assert "## CVE digging\nUse Brave + Mitre." in prompt
+    assert "## Vendor advisories\nCheck PSIRT feeds." in prompt
+    # Blank-line separator between skills.
+    skills_idx = prompt.index("# Skills")
+    delegation_idx = prompt.index("# Delegation context")
+    skills_section = prompt[skills_idx:delegation_idx]
+    assert "Use Brave + Mitre.\n\n## Vendor advisories" in skills_section
+
+
+def test_build_system_prompt_persona_and_context(tmp_path: Path) -> None:
+    """Context dict renders as YAML under # Context when non-None."""
+    prompt = SubAgentRunner._build_system_prompt(  # noqa: SLF001
+        persona="You are a threat researcher.",
+        skills=[],
+        task="task body",
+        context={"cve_id": "CVE-2026-0001", "severity": "high"},
+        vault_root=tmp_path / "vault",
+    )
+    assert "# Context" in prompt
+    # YAML rendering (safe_dump, sort_keys=True).
+    assert "cve_id: CVE-2026-0001" in prompt
+    assert "severity: high" in prompt
+    # Section ordering: Task before Context.
+    assert prompt.index("# Task") < prompt.index("# Context")
+
+
+def test_build_system_prompt_persona_skills_and_context(tmp_path: Path) -> None:
+    """All four sections present, in the canonical order."""
+    prompt = SubAgentRunner._build_system_prompt(  # noqa: SLF001
+        persona="You are a researcher.",
+        skills=["skill body one", "skill body two"],
+        task="task body",
+        context={"key": "value"},
+        vault_root=tmp_path / "vault",
+    )
+    # Canonical order: persona → Skills → Delegation context → Task → Context.
+    persona_idx = prompt.index("You are a researcher.")
+    skills_idx = prompt.index("# Skills")
+    delegation_idx = prompt.index("# Delegation context")
+    task_idx = prompt.index("# Task")
+    context_idx = prompt.index("# Context")
+    assert persona_idx < skills_idx < delegation_idx < task_idx < context_idx
+
+
+def test_build_system_prompt_no_skill_header_per_skill(tmp_path: Path) -> None:
+    """No '## <slug>' wrapper around individual skills — they own their headings.
+
+    A regression here would compound the skill's own markdown headings
+    and confuse the model's section parsing.
+    """
+    prompt = SubAgentRunner._build_system_prompt(  # noqa: SLF001
+        persona="persona",
+        skills=["## skill heading\nbody"],
+        task="t",
+        context=None,
+        vault_root=tmp_path / "vault",
+    )
+    skills_section = prompt[prompt.index("# Skills"):prompt.index("# Delegation")]
+    # Exactly one '## skill heading' — no wrapped slug heading layered above it.
+    assert skills_section.count("## skill heading") == 1
+
+
+def test_build_system_prompt_is_pure(tmp_path: Path) -> None:
+    """No side effects: two calls with the same args return identical output."""
+    args = {
+        "persona": "p",
+        "skills": ["s1", "s2"],
+        "task": "t",
+        "context": {"a": 1},
+        "vault_root": tmp_path / "v",
+    }
+    a = SubAgentRunner._build_system_prompt(**args)  # noqa: SLF001
+    b = SubAgentRunner._build_system_prompt(**args)  # noqa: SLF001
+    assert a == b
