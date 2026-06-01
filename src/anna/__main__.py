@@ -9,17 +9,31 @@ in parallel until the process is signalled.
 from __future__ import annotations
 
 import asyncio
+import os
 import signal
 import sys
+from datetime import datetime, timezone
 from typing import Any
 
 from anna.config import AnnaConfig, load_config
 from anna.log import configure_logging, get_logger
 from anna.runtime.alerter import AdminAlerter
 from anna.runtime.router import ConversationRouter
+from anna.runtime.startup import (
+    build_startup_message,
+    read_and_clear_sentinel,
+    write_clean_shutdown_sentinel,
+)
 from anna.runtime.supervisor import Supervisor
 from anna.runtime.watchdog import Watchdog
 from anna.transports import build_enabled_adapters
+
+
+# Seconds to wait after kicking listener tasks before firing the
+# startup alert. Slack/Telegram adapters need a moment for their
+# socket / polling client to attach before ``health_check()`` returns
+# True. 3s is comfortably above the ~0.5s observed in production logs.
+_STARTUP_ALERT_DELAY_SECONDS = 3.0
 
 
 async def _run(config: AnnaConfig) -> None:
@@ -38,11 +52,36 @@ async def _run(config: AnnaConfig) -> None:
     for adapter in adapters.values():
         adapter.subscribe(router.dispatch)
 
+    # Read the clean-shutdown sentinel BEFORE we start anything that might
+    # fail; if we crash during boot we still want the next boot's alert to
+    # report unclean. The sentinel is consumed on read.
+    last_clean = read_and_clear_sentinel(config.state_dir)
+    boot_time = datetime.now(timezone.utc)
+
     # Start every adapter listener concurrently. Each lives in its own task
     # so a Slack outage cannot block Telegram.
     listener_tasks = [asyncio.create_task(a.start(), name=f"listener.{a.name}") for a in adapters.values()]
     watchdog_task = asyncio.create_task(watchdog.run(), name="watchdog")
     housekeeping_task = asyncio.create_task(router.run_housekeeping(), name="housekeeping")
+
+    # Schedule the operator startup ping. It waits a few seconds for
+    # adapters to attach, then fires once. We use a background task so
+    # the main coroutine can proceed straight to the signal wait.
+    startup_alert_task: asyncio.Task[Any] | None = None
+    if config.admin.startup_alert:
+        startup_alert_task = asyncio.create_task(
+            _send_startup_alert(
+                alerter=alerter,
+                last_clean=last_clean,
+                boot_time=boot_time,
+            ),
+            name="startup_alert",
+        )
+    else:
+        log.info(
+            "anna.startup_alert.disabled",
+            note="admin.startup_alert is false in anna.yaml",
+        )
 
     stop_event = asyncio.Event()
 
@@ -61,13 +100,16 @@ async def _run(config: AnnaConfig) -> None:
     await stop_event.wait()
 
     log.info("anna.shutdown.start")
-    for task in (*listener_tasks, watchdog_task, housekeeping_task):
+    aux_tasks: list[asyncio.Task[Any]] = [*listener_tasks, watchdog_task, housekeeping_task]
+    if startup_alert_task is not None:
+        aux_tasks.append(startup_alert_task)
+    for task in aux_tasks:
         task.cancel()
 
     # Let listener / watchdog / housekeeping cancellation settle before we
     # tear down per-conversation workers. We don't want a still-running
     # dispatch to revive a worker we just stopped.
-    await asyncio.gather(*listener_tasks, watchdog_task, housekeeping_task, return_exceptions=True)
+    await asyncio.gather(*aux_tasks, return_exceptions=True)
 
     # Close every active conversation worker. Each worker's stop() runs the
     # closeout sequence (checkpoint write + per-core-file eviction), so this
@@ -83,7 +125,49 @@ async def _run(config: AnnaConfig) -> None:
         except Exception as exc:
             log.warning("anna.shutdown.adapter_stop_failed", adapter=adapter.name, error=str(exc))
 
+    # Write the clean-shutdown sentinel last. If anything above raised, we
+    # skip the sentinel write so the next boot's startup alert correctly
+    # reports the prior shutdown as unclean.
+    try:
+        write_clean_shutdown_sentinel(config.state_dir)
+    except OSError as exc:
+        log.warning("anna.shutdown.sentinel_write_failed", error=str(exc))
+
     log.info("anna.shutdown.complete")
+
+
+async def _send_startup_alert(
+    *,
+    alerter: AdminAlerter,
+    last_clean: datetime | None,
+    boot_time: datetime,
+) -> None:
+    """Wait briefly for adapters to attach, then fire the startup ping."""
+    log = get_logger("anna.main")
+    try:
+        await asyncio.sleep(_STARTUP_ALERT_DELAY_SECONDS)
+    except asyncio.CancelledError:
+        return
+    message = build_startup_message(
+        last_clean_shutdown=last_clean,
+        boot_time=boot_time,
+        pid=os.getpid(),
+    )
+    try:
+        delivered = await alerter.notify_startup(message)
+    except Exception as exc:
+        log.error("anna.startup_alert.failed", error=str(exc))
+        return
+    if delivered:
+        log.info(
+            "anna.startup_alert.sent",
+            clean=last_clean is not None,
+        )
+    else:
+        log.warning(
+            "anna.startup_alert.undeliverable",
+            note="no surviving transport with an admin destination",
+        )
 
 
 def main() -> int:

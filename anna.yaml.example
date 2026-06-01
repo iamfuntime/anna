@@ -112,8 +112,9 @@ sessions:
 #
 # When the watchdog restarts a transport, the operator should learn about
 # it on the OTHER transport. When the SDK auth fails, both transports get
-# notified. Either field may be left blank; the alerter logs a warning
-# and skips when no destination is configured for the surviving channel.
+# notified. Either destination may be left blank; the alerter logs a
+# warning and skips when no destination is configured for the surviving
+# channel.
 # Env-var equivalents: ANNA_ADMIN_SLACK_CHANNEL_ID, ANNA_ADMIN_TELEGRAM_CHAT_ID.
 # ============================================================
 admin:
@@ -121,3 +122,7 @@ admin:
   slack_channel_id: ""
   # Operator's Telegram chat ID as a string.
   telegram_chat_id: ""
+  # Fire a one-shot alert at boot tagged clean (sentinel found at
+  # $ANNA_HOME/state/last_clean_shutdown) or UNCLEAN (sentinel missing —
+  # crash, kill, or power loss). Set false to silence boot pings.
+  startup_alert: true

@@ -52,6 +52,15 @@ class AdminAlerter:
         prefixed = f"[CRITICAL] {message}"
         return await self._dispatch(message=prefixed, level="CRITICAL", exclude_channel=exclude_channel)
 
+    async def notify_startup(self, message: str) -> bool:
+        """Send a boot-time alert tagged ``STARTUP`` in the audit log.
+
+        Same routing as :meth:`warn` (first healthy adapter with a
+        destination wins); the distinct level lets the audit log
+        distinguish startup pings from transport-failure warnings.
+        """
+        return await self._dispatch(message=message, level="STARTUP", exclude_channel=None)
+
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------

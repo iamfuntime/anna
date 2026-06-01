@@ -715,6 +715,7 @@ sessions:
 admin:
   slack_channel_id: "{slack_admin}"
   telegram_chat_id: "{telegram_admin}"
+  startup_alert: true
 """
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(body, encoding="utf-8")

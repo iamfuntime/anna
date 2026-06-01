@@ -143,15 +143,22 @@ class AdminConfig(BaseModel):
     """Operator-side destinations for out-of-band alerts.
 
     Used by :class:`anna.runtime.alerter.AdminAlerter` when a transport
-    restart or SDK auth failure needs to reach the operator on the
-    surviving channel. Both fields are optional; if a destination is
-    unset for the surviving transport, the alerter logs a WARNING and
-    skips. The Slack value is a channel ID (e.g. ``C0123ABC``); the
-    Telegram value is the operator's chat ID as a string.
+    restart, SDK auth failure, or service restart needs to reach the
+    operator on the surviving channel. The two destination fields are
+    optional; if unset for the surviving transport, the alerter logs a
+    WARNING and skips. The Slack value is a channel ID (e.g.
+    ``C0123ABC``); the Telegram value is the operator's chat ID as a
+    string.
+
+    ``startup_alert`` controls the boot-time ping that fires after
+    adapters connect. The message tags the restart as clean (sentinel
+    found) or unclean (sentinel missing — likely crash, OOM-kill, or
+    power loss).
     """
 
     slack_channel_id: str = ""
     telegram_chat_id: str = ""
+    startup_alert: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +192,11 @@ class AnnaConfig(BaseModel):
     @property
     def core_dir(self) -> Path:
         return self.anna_home / "core"
+
+    @property
+    def state_dir(self) -> Path:
+        """Runtime state files (clean-shutdown sentinel, etc.)."""
+        return self.anna_home / "state"
 
 
 # ---------------------------------------------------------------------------
