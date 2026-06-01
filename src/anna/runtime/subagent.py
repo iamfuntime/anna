@@ -134,6 +134,56 @@ class SubAgentRunner:
         self._audit_dir: Path = config.audit_dir
         self._fsync: bool = config.logging.audit.fsync_on_write
 
+    # ------------------------------------------------------------------
+    # Persona + skills loading (subtask 3)
+    # ------------------------------------------------------------------
+
+    def _load_persona(self, slug: str) -> str:
+        """Read ``$ANNA_HOME/agents/<slug>.md`` off disk and return the body.
+
+        Reads on every call — no caching — so the operator can edit a
+        persona file without restarting ANNA. The registry is *not*
+        consulted because :class:`SubAgentRegistry` exposes only
+        ``list_personas()`` and a single-slug lookup would either need
+        a linear scan or a new ``get(slug)`` method; the runner skips
+        both by reading the well-known path directly.
+
+        Returns:
+            Persona text, possibly empty if the file exists but is blank.
+
+        Raises:
+            :class:`SubAgentError`: when the persona file does not
+                exist. The error message is the literal string
+                ``"not_found"`` to match the status field on a
+                ``DelegateResult`` of the same shape.
+        """
+        path = self._config.anna_home / "agents" / f"{slug}.md"
+        try:
+            return path.read_text(encoding="utf-8")
+        except FileNotFoundError as exc:
+            raise SubAgentError("not_found") from exc
+
+    def _load_skills(self, slug: str) -> list[str]:
+        """Return skill body texts for the given agent slug, alphabetical order.
+
+        Walks ``$ANNA_HOME/skills/<slug>/`` for ``*.md`` files, reads
+        each, and returns the bodies sorted alphabetically by skill
+        slug (filename stem). The sort matters because the spliced
+        prompt is otherwise dependent on filesystem iteration order,
+        which varies by OS and makes test assertions flaky.
+
+        Missing skills directory is not an error — most personas ship
+        without skills until the operator iterates them in. Returns
+        ``[]`` in that case.
+        """
+        skills_dir = self._config.anna_home / "skills" / slug
+        if not skills_dir.is_dir():
+            return []
+        bodies: list[str] = []
+        for path in sorted(skills_dir.glob("*.md")):
+            bodies.append(path.read_text(encoding="utf-8"))
+        return bodies
+
     async def delegate(
         self,
         *,

@@ -132,3 +132,70 @@ async def test_delegate_stub_raises_not_implemented(tmp_path: Path) -> None:
             task="dig into CVE-2026-0001",
             parent_conv_key="slack:dm:U123",
         )
+
+
+# ---------------------------------------------------------------------------
+# Subtask 3: persona + skills loading
+# ---------------------------------------------------------------------------
+
+
+def test_load_persona_reads_file_off_disk(tmp_path: Path) -> None:
+    """A persona file at agents/<slug>.md is returned verbatim."""
+    runner = _make_runner(tmp_path)
+    agents_dir = tmp_path / "agents"
+    agents_dir.mkdir(parents=True, exist_ok=True)
+    persona = "You are a threat researcher.\n\nFocus on CVEs.\n"
+    (agents_dir / "threat-researcher.md").write_text(persona, encoding="utf-8")
+    assert runner._load_persona("threat-researcher") == persona  # noqa: SLF001
+
+
+def test_load_persona_missing_raises_subagent_error(tmp_path: Path) -> None:
+    """A missing persona file raises SubAgentError('not_found')."""
+    runner = _make_runner(tmp_path)
+    with pytest.raises(SubAgentError) as exc_info:
+        runner._load_persona("does-not-exist")  # noqa: SLF001
+    assert str(exc_info.value) == "not_found"
+
+
+def test_load_persona_empty_file_returns_empty_string(tmp_path: Path) -> None:
+    """An empty persona file returns '' — not an error.
+
+    A persona-create flow that lands an empty file should not crash the
+    runner; the operator can edit it in place and try again.
+    """
+    runner = _make_runner(tmp_path)
+    agents_dir = tmp_path / "agents"
+    agents_dir.mkdir(parents=True, exist_ok=True)
+    (agents_dir / "blank.md").write_text("", encoding="utf-8")
+    assert runner._load_persona("blank") == ""  # noqa: SLF001
+
+
+def test_load_skills_missing_directory_returns_empty(tmp_path: Path) -> None:
+    """No skills directory → [] (not an error)."""
+    runner = _make_runner(tmp_path)
+    assert runner._load_skills("nobody") == []  # noqa: SLF001
+
+
+def test_load_skills_multiple_returns_alphabetical(tmp_path: Path) -> None:
+    """Skill bodies come back sorted by slug for deterministic prompts."""
+    runner = _make_runner(tmp_path)
+    skills_dir = tmp_path / "skills" / "threat-researcher"
+    skills_dir.mkdir(parents=True, exist_ok=True)
+    # Write in NOT-alphabetical order to prove the sort is doing work.
+    (skills_dir / "zeta.md").write_text("z body", encoding="utf-8")
+    (skills_dir / "alpha.md").write_text("a body", encoding="utf-8")
+    (skills_dir / "mike.md").write_text("m body", encoding="utf-8")
+    bodies = runner._load_skills("threat-researcher")  # noqa: SLF001
+    assert bodies == ["a body", "m body", "z body"]
+
+
+def test_load_skills_ignores_non_md_files(tmp_path: Path) -> None:
+    """Non-.md files in the skills dir are ignored."""
+    runner = _make_runner(tmp_path)
+    skills_dir = tmp_path / "skills" / "threat-researcher"
+    skills_dir.mkdir(parents=True, exist_ok=True)
+    (skills_dir / "real.md").write_text("real body", encoding="utf-8")
+    (skills_dir / "notes.txt").write_text("notes — skip me", encoding="utf-8")
+    (skills_dir / "README").write_text("readme — skip me", encoding="utf-8")
+    bodies = runner._load_skills("threat-researcher")  # noqa: SLF001
+    assert bodies == ["real body"]
