@@ -63,14 +63,26 @@ async def _run(config: AnnaConfig) -> None:
     log.info("anna.shutdown.start")
     for task in (*listener_tasks, watchdog_task, housekeeping_task):
         task.cancel()
+
+    # Let listener / watchdog / housekeeping cancellation settle before we
+    # tear down per-conversation workers. We don't want a still-running
+    # dispatch to revive a worker we just stopped.
+    await asyncio.gather(*listener_tasks, watchdog_task, housekeeping_task, return_exceptions=True)
+
+    # Close every active conversation worker. Each worker's stop() runs the
+    # closeout sequence (checkpoint write + per-core-file eviction), so this
+    # is what gives the next boot something to resume from.
+    try:
+        await router.shutdown()
+    except Exception as exc:
+        log.warning("anna.shutdown.router_failed", error=str(exc))
+
     for adapter in adapters.values():
         try:
             await adapter.stop()
         except Exception as exc:
             log.warning("anna.shutdown.adapter_stop_failed", adapter=adapter.name, error=str(exc))
 
-    # Let cancellation propagate cleanly.
-    await asyncio.gather(*listener_tasks, watchdog_task, housekeeping_task, return_exceptions=True)
     log.info("anna.shutdown.complete")
 
 

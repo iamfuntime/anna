@@ -146,6 +146,52 @@ class ConversationRouter:
             conv_key=key,
         )
 
+    async def shutdown(self) -> None:
+        """Stop every active worker so each gets a chance to run closeout.
+
+        Called from the process-level shutdown path in ``__main__.py`` before
+        adapters are torn down. Drains the worker registry first so that any
+        late dispatch attempt cannot revive a worker we are tearing down.
+        Errors in individual ``worker.stop()`` calls are logged but do not
+        prevent the remaining workers from being closed.
+        """
+        async with self._workers_lock:
+            workers = list(self._workers.values())
+            self._workers.clear()
+
+        if not workers:
+            self._log.info("router.shutdown.no_workers")
+            return
+
+        self._log.info("router.shutdown.start", workers=len(workers))
+        results = await asyncio.gather(
+            *(worker.stop() for worker in workers),
+            return_exceptions=True,
+        )
+        failures = 0
+        for worker, result in zip(workers, results):
+            if isinstance(result, BaseException) and not isinstance(
+                result, asyncio.CancelledError
+            ):
+                failures += 1
+                self._log.error(
+                    "router.shutdown.worker_failed",
+                    conv_key=worker.conversation_key,
+                    error=str(result),
+                )
+            else:
+                self._log.info(
+                    "conversation.end",
+                    channel=worker.transport,
+                    conv_key=worker.conversation_key,
+                    reason="shutdown",
+                )
+        self._log.info(
+            "router.shutdown.complete",
+            workers=len(workers),
+            failures=failures,
+        )
+
     # ------------------------------------------------------------------
     # Housekeeping
     # ------------------------------------------------------------------
