@@ -15,11 +15,13 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from anna.agents.registry import SubAgentRegistry
 from anna.config import AnnaConfig
-from anna.core.identity import CoreFile, read_core_file
-from anna.log import get_logger
+from anna.core.eviction import evict_if_over_cap
+from anna.core.identity import CORE_FILES, CoreFile, read_core_file
+from anna.log import audit_event, get_logger
 from anna.skills.registry import SkillRegistry
 from anna.tools.self_edit_server import SELF_EDIT_TOOL_NAMES, SelfEditTools, build_self_edit_server
 from anna.transports.base import InboundEvent, OutboundMessage
+from anna.vault.checkpoint import write_checkpoint
 
 if TYPE_CHECKING:
     from anna.runtime.supervisor import Supervisor
@@ -64,6 +66,8 @@ class ConversationWorker:
         self._task: asyncio.Task[None] | None = None
         self._stopping = False
         self._client: object | None = None
+        self._closed_out = False
+        self._operator_short_name: str | None = None
 
         now = datetime.now(timezone.utc)
         self.last_active: datetime = now
@@ -90,6 +94,17 @@ class ConversationWorker:
             except (asyncio.CancelledError, Exception):
                 pass
             self._task = None
+        # _closeout writes the checkpoint and runs eviction. It MUST run
+        # before the SDK client is closed (eviction needs the client to
+        # propose evictions). The flag guards against double-run if stop()
+        # is called twice (e.g. idle-watcher and router shutdown race).
+        if not self._closed_out and self._client is not None:
+            try:
+                await self._closeout()
+            except Exception as exc:
+                self._log.error("worker.closeout_failed", error=str(exc))
+            finally:
+                self._closed_out = True
         await self._close_client()
         self._log.info("worker.complete")
 
@@ -312,6 +327,122 @@ class ConversationWorker:
             f"# Core identity files\n{identity_block}\n\n"
             f"# Channel context\n{context}"
         )
+
+    async def _closeout(self) -> None:
+        """Per v3 §6: write a checkpoint, then run eviction on every core file.
+
+        Called from :meth:`stop` before the SDK client is closed. The
+        ``_closed_out`` flag guarantees this only runs once even if stop()
+        is invoked twice (e.g. the idle watcher and the router shutdown
+        both fire).
+        """
+        self._log.info("worker.closeout.start", conv_key=self.conversation_key)
+
+        # ----- 1. Checkpoint summary --------------------------------------
+        summary = await self._ask_checkpoint_summary()
+
+        try:
+            ckpt_path = write_checkpoint(
+                vault_root=self._config.vault.resolved_path,
+                transport=self.transport,
+                conversation_key=self.conversation_key,
+                summary=summary,
+                operator_short_name=self._operator_short_name,
+            )
+            audit_event(
+                "audit.checkpoint.written",
+                audit_dir=self._config.audit_dir,
+                actor="anna",
+                conv_key=self.conversation_key,
+                fsync_on_write=self._config.logging.audit.fsync_on_write,
+                checkpoint_file=str(ckpt_path),
+                summary_chars=len(summary),
+            )
+        except OSError as exc:
+            self._log.error("worker.checkpoint_write_failed", error=str(exc))
+            audit_event(
+                "audit.checkpoint.write_failed",
+                audit_dir=self._config.audit_dir,
+                actor="anna",
+                conv_key=self.conversation_key,
+                fsync_on_write=self._config.logging.audit.fsync_on_write,
+                level="WARNING",
+                error=str(exc),
+            )
+
+        # ----- 2. Per-core-file eviction ---------------------------------
+        for which in CORE_FILES.keys():
+            spec = CORE_FILES[which]
+            lock = await self._supervisor.acquire(f"core/{spec.name}")
+            async with lock:
+                try:
+                    archive_path = await evict_if_over_cap(
+                        which=which,
+                        core_dir=self._config.core_dir,
+                        vault_root=self._config.vault.resolved_path,
+                        sdk_client=self._client,
+                        session_close_conv=self.conversation_key,
+                        audit_dir=self._config.audit_dir,
+                        fsync_on_write=self._config.logging.audit.fsync_on_write,
+                    )
+                except Exception as exc:
+                    # eviction.py audits its own failures; this catches any
+                    # outright crash so we still try the next file.
+                    self._log.error(
+                        "worker.eviction_failed",
+                        file=spec.name,
+                        error=str(exc),
+                    )
+                    continue
+                if archive_path is not None:
+                    self._log.info(
+                        "worker.eviction.applied",
+                        file=spec.name,
+                        archive=str(archive_path),
+                    )
+
+        self._log.info("worker.closeout.complete")
+
+    async def _ask_checkpoint_summary(self) -> str:
+        """Round-trip the SDK for a closing summary. Best-effort.
+
+        If the SDK is unavailable or errors, falls back to a minimal
+        placeholder so the checkpoint file still lands. Never raises.
+        """
+        if self._client is None:
+            return "(no SDK client available at closeout; placeholder checkpoint)"
+
+        try:
+            from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
+        except ImportError:
+            AssistantMessage = ResultMessage = TextBlock = None  # type: ignore[assignment,misc]
+
+        prompt = (
+            "Write a brief checkpoint summarizing this conversation — topics "
+            "covered, decisions, open threads, anything to remember next time "
+            "we resume. Two to four short paragraphs. Plain text."
+        )
+        try:
+            await self._client.query(prompt)  # type: ignore[attr-defined]
+        except Exception as exc:
+            self._log.warning("worker.closeout.query_failed", error=str(exc))
+            return f"(closeout query failed: {exc})"
+
+        chunks: list[str] = []
+        try:
+            async for msg in self._client.receive_response():  # type: ignore[attr-defined]
+                if AssistantMessage is not None and isinstance(msg, AssistantMessage):
+                    for block in msg.content:
+                        if TextBlock is not None and isinstance(block, TextBlock):
+                            chunks.append(block.text)
+                if ResultMessage is not None and isinstance(msg, ResultMessage):
+                    break
+        except Exception as exc:
+            self._log.warning("worker.closeout.receive_failed", error=str(exc))
+            return f"(closeout receive failed: {exc})"
+
+        text = "\n".join(c for c in chunks if c).strip()
+        return text or "(empty closeout summary)"
 
     async def _close_client(self) -> None:
         if self._client is None:

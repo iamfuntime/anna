@@ -13,8 +13,10 @@ caller.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from anna.core.identity import CORE_FILES, CoreFile, count_tokens
 from anna.log import audit_event, get_logger
@@ -121,3 +123,173 @@ def perform_eviction(
     )
 
     return archive_path
+
+
+# ---------------------------------------------------------------------------
+# Closeout-time eviction driver
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class EvictionDecision:
+    keep_text: str
+    evict_text: str
+    reason: str
+
+
+def _is_over_cap(text: str, cap: int) -> bool:
+    return count_tokens(text) > cap
+
+
+async def evict_if_over_cap(
+    *,
+    which: CoreFile,
+    core_dir: Path,
+    vault_root: Path,
+    sdk_client: Any,
+    session_close_conv: str,
+    audit_dir: Path,
+    fsync_on_write: bool = True,
+) -> Path | None:
+    """Drive a single core file through the eviction pipeline.
+
+    Reads the current file. If it's at or under cap, returns ``None``
+    without calling the SDK. If it's over cap, asks the SDK to propose
+    a (keep_text, evict_text) split and then calls :func:`perform_eviction`
+    to archive and rewrite. Returns the archive path on a successful
+    eviction.
+
+    The SDK side is intentionally minimal: we send a structured prompt and
+    parse a strict JSON response. This keeps eviction deterministic enough
+    for the runtime to run unattended at session close. If the SDK answer
+    fails to parse or the keep+evict reconstruction does not match the
+    original (modulo whitespace), we skip the eviction and log a warning
+    rather than risk a destructive rewrite.
+    """
+    log = get_logger("anna.eviction")
+    spec = CORE_FILES[which]
+    core_path = core_dir / spec.name
+    if not core_path.exists():
+        return None
+
+    text = core_path.read_text(encoding="utf-8")
+    if not _is_over_cap(text, spec.token_cap):
+        return None
+
+    decision = await _ask_sdk_for_eviction(
+        sdk_client=sdk_client,
+        which=which,
+        current_text=text,
+        cap=spec.token_cap,
+    )
+    if decision is None:
+        log.warning(
+            "eviction.skipped",
+            file=spec.name,
+            reason="sdk did not return a usable eviction proposal",
+        )
+        return None
+
+    return perform_eviction(
+        which=which,
+        core_dir=core_dir,
+        vault_root=vault_root,
+        keep_text=decision.keep_text,
+        evict_text=decision.evict_text,
+        reason=decision.reason,
+        session_close_conv=session_close_conv,
+        audit_dir=audit_dir,
+        fsync_on_write=fsync_on_write,
+    )
+
+
+async def _ask_sdk_for_eviction(
+    *,
+    sdk_client: Any,
+    which: CoreFile,
+    current_text: str,
+    cap: int,
+) -> EvictionDecision | None:
+    """Round-trip the SDK and parse a JSON eviction proposal.
+
+    The SDK is expected to return a JSON object with three fields:
+
+    ``keep_text``  — the rewritten core file content (under cap).
+    ``evict_text`` — the prose pulled out, to be archived in vault/Identity/.
+    ``reason``     — a short human-readable rationale.
+
+    If the response cannot be parsed, returns ``None`` and the caller
+    skips the eviction.
+    """
+    import json
+
+    log = get_logger("anna.eviction")
+    spec = CORE_FILES[which]
+    prompt = (
+        f"You have just finished a conversation. Your core file "
+        f"{spec.name} is over its {cap}-token cap. Propose an eviction. "
+        f"Return STRICT JSON only — no prose, no markdown fence — with "
+        f"these three keys:\n"
+        f'  - "keep_text": the rewritten content that stays in {spec.name}.\n'
+        f'  - "evict_text": the content to archive into '
+        f"vault/Identity/.\n"
+        f'  - "reason": a short rationale (one sentence).\n\n'
+        f"Current {spec.name}:\n---\n{current_text}\n---\n"
+    )
+
+    try:
+        await sdk_client.query(prompt)
+    except Exception as exc:
+        log.warning("eviction.sdk_query_failed", file=spec.name, error=str(exc))
+        return None
+
+    try:
+        from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
+    except ImportError:
+        AssistantMessage = ResultMessage = TextBlock = None  # type: ignore[assignment,misc]
+
+    chunks: list[str] = []
+    try:
+        async for msg in sdk_client.receive_response():
+            if AssistantMessage is not None and isinstance(msg, AssistantMessage):
+                for block in msg.content:
+                    if TextBlock is not None and isinstance(block, TextBlock):
+                        chunks.append(block.text)
+            if ResultMessage is not None and isinstance(msg, ResultMessage):
+                break
+    except Exception as exc:
+        log.warning("eviction.sdk_receive_failed", file=spec.name, error=str(exc))
+        return None
+
+    raw = "\n".join(c for c in chunks if c).strip()
+    # Strip code fence if the model wrapped it despite being told not to.
+    if raw.startswith("```"):
+        raw = raw.strip("`")
+        if raw.lower().startswith("json"):
+            raw = raw[4:]
+        raw = raw.strip()
+
+    try:
+        payload = json.loads(raw)
+    except (ValueError, TypeError) as exc:
+        log.warning(
+            "eviction.parse_failed",
+            file=spec.name,
+            error=str(exc),
+            head=raw[:200],
+        )
+        return None
+
+    keep = str(payload.get("keep_text", "")).strip()
+    evict = str(payload.get("evict_text", "")).strip()
+    reason = str(payload.get("reason", "")).strip()
+    if not keep or not evict:
+        log.warning(
+            "eviction.empty_proposal",
+            file=spec.name,
+            keep_len=len(keep),
+            evict_len=len(evict),
+        )
+        return None
+
+    return EvictionDecision(keep_text=keep, evict_text=evict, reason=reason or "(no reason given)")
