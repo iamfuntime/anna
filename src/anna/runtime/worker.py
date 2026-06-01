@@ -41,6 +41,7 @@ def _allowed_tool_names() -> list[str]:
 
 
 SendCallback = Callable[[OutboundMessage], Awaitable[None]]
+IdleCloseCallback = Callable[[str], Awaitable[None]]
 
 
 class ConversationWorker:
@@ -54,20 +55,26 @@ class ConversationWorker:
         config: AnnaConfig,
         supervisor: "Supervisor",
         send: SendCallback,
+        on_idle_close: IdleCloseCallback | None = None,
     ) -> None:
         self.conversation_key = conversation_key
         self.transport = transport
         self._config = config
         self._supervisor = supervisor
         self._send = send
+        self._on_idle_close = on_idle_close
         self._log = get_logger("anna.worker").bind(conv_key=conversation_key, channel=transport)
 
         self._queue: asyncio.Queue[InboundEvent] = asyncio.Queue(maxsize=128)
         self._task: asyncio.Task[None] | None = None
+        self._idle_task: asyncio.Task[None] | None = None
         self._stopping = False
         self._client: object | None = None
         self._closed_out = False
         self._operator_short_name: str | None = None
+        # Set true once the idle watcher has fired its close callback so we
+        # do not race a second invocation against the in-flight stop().
+        self._idle_close_signalled = False
 
         now = datetime.now(timezone.utc)
         self.last_active: datetime = now
@@ -83,10 +90,26 @@ class ConversationWorker:
         if self._task is not None:
             return
         self._task = asyncio.create_task(self._run(), name=f"worker.{self.conversation_key}")
+        # The idle watcher runs only if the router gave us a close callback.
+        # In standalone unit tests (no router) we skip it.
+        if self._on_idle_close is not None:
+            self._idle_task = asyncio.create_task(
+                self._idle_watch(),
+                name=f"worker.idle.{self.conversation_key}",
+            )
         self._log.info("worker.spawn")
 
     async def stop(self) -> None:
         self._stopping = True
+        # Cancel the idle watcher first so it cannot fire a redundant close
+        # callback while stop() is mid-flight.
+        if self._idle_task is not None:
+            self._idle_task.cancel()
+            try:
+                await self._idle_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._idle_task = None
         if self._task is not None:
             self._task.cancel()
             try:
@@ -120,6 +143,44 @@ class ConversationWorker:
     # ------------------------------------------------------------------
     # Inner loop
     # ------------------------------------------------------------------
+
+    def _idle_gap_seconds(self) -> float:
+        """Idle threshold for this worker, picking dm vs thread gap."""
+        cfg = self._config.sessions
+        return (cfg.dm_gap_hours if self.is_dm else cfg.thread_gap_hours) * 3600.0
+
+    async def _idle_watch(self) -> None:
+        """Continuously check idle time and fire the close callback when due.
+
+        Per the v3 spec, the watcher samples at quarter-gap granularity so
+        a noon-silent DM does not wait until the 03:17 housekeeping sweep
+        to close out. The watcher exits as soon as it triggers (the router
+        will call stop(), which cancels this task).
+        """
+        gap = self._idle_gap_seconds()
+        # Quarter-gap polling. Clamp to a sane floor so unit tests with a
+        # 1-second gap still get a watcher that wakes promptly.
+        poll = max(gap / 4.0, 0.05)
+        try:
+            while not self._stopping:
+                await asyncio.sleep(poll)
+                if self._stopping or self._idle_close_signalled:
+                    return
+                idle = (datetime.now(timezone.utc) - self.last_active).total_seconds()
+                if idle > gap and self._on_idle_close is not None:
+                    self._idle_close_signalled = True
+                    self._log.info(
+                        "worker.idle_close.trigger",
+                        idle_seconds=idle,
+                        gap_seconds=gap,
+                    )
+                    try:
+                        await self._on_idle_close(self.conversation_key)
+                    except Exception as exc:
+                        self._log.error("worker.idle_close.callback_failed", error=str(exc))
+                    return
+        except asyncio.CancelledError:
+            raise
 
     async def _run(self) -> None:
         try:

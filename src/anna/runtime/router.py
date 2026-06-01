@@ -11,7 +11,7 @@ only component with both sides of the conversation in scope.
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, time, timezone
+from datetime import datetime, timezone
 from typing import Awaitable, Callable
 
 from anna.config import AnnaConfig
@@ -78,6 +78,7 @@ class ConversationRouter:
                 config=self._config,
                 supervisor=self._supervisor,
                 send=self._send_factory(event.transport),
+                on_idle_close=self._idle_close_callback,
             )
             await worker.start()
             self._workers[key] = worker
@@ -87,6 +88,28 @@ class ConversationRouter:
                 conv_key=key,
             )
         return worker
+
+    async def _idle_close_callback(self, key: str) -> None:
+        """Called by a worker's idle watcher when it has been silent too long.
+
+        We pop the worker from the registry first (so a fresh inbound message
+        spawns a brand new worker rather than reviving the closing one), then
+        run the full close path so the checkpoint+eviction routine fires.
+        """
+        async with self._workers_lock:
+            worker = self._workers.pop(key, None)
+        if worker is None:
+            return
+        try:
+            await worker.stop()
+        except Exception as exc:
+            self._log.error("conversation.idle_close.stop_failed", conv_key=key, error=str(exc))
+        self._log.info(
+            "conversation.end",
+            channel=worker.transport,
+            conv_key=key,
+            reason="idle",
+        )
 
     def _send_factory(self, transport: str) -> SendCallback:
         """Build a per-transport send callback the worker can invoke."""
@@ -143,6 +166,10 @@ class ConversationRouter:
 
     async def _run_sweep_once(self) -> None:
         self._log.info("housekeeping.sweep.start")
+        # Idle-worker closeout is no longer part of the daily sweep — each
+        # worker now runs its own continuous idle watcher (see
+        # ConversationWorker._idle_watch). The sweep only handles audit
+        # retention and transcript gzip/delete.
         try:
             deleted_audit = sweep_audit_retention(
                 self._config.audit_dir,
@@ -152,7 +179,6 @@ class ConversationRouter:
                 self._config.transcripts_dir,
                 self._config.logging.transcripts.retention_days,
             )
-            closed_idle = await self._close_idle_workers()
             audit_event(
                 "audit.housekeeping.swept",
                 audit_dir=self._config.audit_dir,
@@ -161,25 +187,9 @@ class ConversationRouter:
                 audit_files_deleted=deleted_audit,
                 transcripts_gzipped=gzipped,
                 transcripts_deleted=deleted_tr,
-                idle_workers_closed=closed_idle,
             )
         except Exception as exc:
             self._log.error("housekeeping.sweep.failed", error=str(exc))
-
-    async def _close_idle_workers(self) -> int:
-        now = datetime.now(timezone.utc)
-        dm_gap = self._config.sessions.dm_gap_hours * 3600
-        thread_gap = self._config.sessions.thread_gap_hours * 3600
-
-        to_close: list[str] = []
-        for key, worker in self._workers.items():
-            idle = (now - worker.last_active).total_seconds()
-            gap = dm_gap if worker.is_dm else thread_gap
-            if idle > gap:
-                to_close.append(key)
-        for key in to_close:
-            await self.close_worker(key)
-        return len(to_close)
 
     async def _sleep_until_next_sweep(self) -> None:
         hhmm = self._config.housekeeping.daily_sweep_time
