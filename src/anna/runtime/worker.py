@@ -174,7 +174,16 @@ class ConversationWorker:
     # ------------------------------------------------------------------
 
     def _idle_gap_seconds(self) -> float:
-        """Idle threshold for this worker, picking dm vs thread gap."""
+        """Idle threshold for this worker, picking dm vs thread gap.
+
+        CLI transports take precedence over the dm/thread split: the CLI
+        conv_key shapes (``cli:local:<user>`` and the aliased
+        ``user:<canonical>``) do not match the ``dm`` substring used by
+        ``is_dm``, so without this branch they would default to the
+        thread gap (1h). Phase 2 §5 wants ~30m on the CLI.
+        """
+        if self.transport == "cli":
+            return self._config.transports.cli.idle_gap_minutes * 60.0
         cfg = self._config.sessions
         return (cfg.dm_gap_hours if self.is_dm else cfg.thread_gap_hours) * 3600.0
 
