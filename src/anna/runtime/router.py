@@ -11,10 +11,11 @@ only component with both sides of the conversation in scope.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 from datetime import datetime, timezone
 from typing import Awaitable, Callable
 
-from anna.config import AnnaConfig
+from anna.config import AnnaConfig, IdentityAliasEntry
 from anna.log import audit_event, get_logger, sweep_audit_retention, sweep_transcript_retention, transcript_event
 from anna.runtime.schedule_store import ScheduleStore
 from anna.runtime.subagent import SubAgentRunner
@@ -25,6 +26,59 @@ from anna.transports.base import ChannelAdapter, InboundEvent, OutboundMessage
 
 
 SendCallback = Callable[[OutboundMessage], Awaitable[None]]
+
+
+def _identifier_from_event(event: InboundEvent) -> str | None:
+    """Extract the per-transport identifier the alias config keys on.
+
+    Returns ``None`` for conv_key shapes that don't carry an operator
+    identity (Slack channel threads, Telegram groups, CLI oneshot, future
+    transports). The three shapes that *do* carry an identity are::
+
+        slack:dm:<user_id>
+        telegram:dm:<chat_id>
+        cli:local:<username>
+
+    Per Phase 2 §5 plan ("Identity aliasing"). The CLI oneshot shape
+    ``cli:oneshot:<uuid>`` is deliberately excluded — one-shot turns
+    must never alias to the operator's canonical conv.
+    """
+    parts = event.conversation_key.split(":")
+    if len(parts) < 3:
+        return None
+    transport = event.transport
+    if transport == "slack" and parts[1] == "dm":
+        return parts[2]
+    if transport == "telegram" and parts[1] == "dm":
+        return parts[2]
+    if transport == "cli" and parts[1] == "local":
+        return parts[2]
+    return None
+
+
+def _build_identity_index(
+    identities: list[IdentityAliasEntry],
+) -> dict[str, tuple[IdentityAliasEntry, ...]]:
+    """Group identity aliases by transport for O(small_n) dispatch lookups.
+
+    An entry contributes to a transport's bucket iff the matching field
+    is populated; an entry with only ``slack_user_id`` set never appears
+    in the ``telegram`` or ``cli`` bucket, so a Telegram event sharing
+    the same numeric identifier cannot accidentally alias to it.
+    """
+    buckets: dict[str, list[IdentityAliasEntry]] = {
+        "slack": [],
+        "telegram": [],
+        "cli": [],
+    }
+    for entry in identities:
+        if entry.slack_user_id is not None:
+            buckets["slack"].append(entry)
+        if entry.telegram_chat_id is not None:
+            buckets["telegram"].append(entry)
+        if entry.cli_username is not None:
+            buckets["cli"].append(entry)
+    return {transport: tuple(entries) for transport, entries in buckets.items()}
 
 
 class ConversationRouter:
@@ -47,6 +101,12 @@ class ConversationRouter:
         self._log = get_logger("anna.router")
         self._workers: dict[str, ConversationWorker] = {}
         self._workers_lock = asyncio.Lock()
+        # Phase 2 §5 identity aliasing: precompute a per-transport view of
+        # the alias entries so dispatch stays O(small_n). See the
+        # _identifier_from_event / _normalize_conv_key helpers below.
+        self._identity_index: dict[str, tuple[IdentityAliasEntry, ...]] = (
+            _build_identity_index(config.identities)
+        )
 
     # ------------------------------------------------------------------
     # Dispatch
@@ -54,6 +114,20 @@ class ConversationRouter:
 
     async def dispatch(self, event: InboundEvent) -> None:
         """Subscribe target. Called by every ChannelAdapter for inbound events."""
+        # Phase 2 §5 identity aliasing: rewrite the conv_key before any
+        # downstream consumer (transcript writer, worker registry) sees
+        # it. Non-matched events flow through unchanged.
+        new_key = self._normalize_conv_key(event)
+        if new_key != event.conversation_key:
+            self._log.debug(
+                "router.identity_alias_applied",
+                original_key=event.conversation_key,
+                new_key=new_key,
+                transport=event.transport,
+                canonical=new_key.split(":", 1)[1] if ":" in new_key else new_key,
+            )
+            event = dataclasses.replace(event, conversation_key=new_key)
+
         # Transcript: inbound line.
         transcript_event(
             channel=event.transport,
@@ -74,6 +148,31 @@ class ConversationRouter:
             transport=event.transport,
         )
         await worker.submit(event)
+
+    def _normalize_conv_key(self, event: InboundEvent) -> str:
+        """Phase 2 §5 identity aliasing.
+
+        If the event's per-transport identifier matches a configured
+        ``IdentityAliasEntry``, return ``user:<canonical>`` so the worker
+        registry, checkpoints, and resume context all collapse onto one
+        per-operator conv across transports. Otherwise return the
+        event's existing conversation_key unchanged.
+
+        The lookup is transport-scoped: an entry that only populates
+        ``slack_user_id`` never matches a Telegram event with the same
+        numeric identifier.
+        """
+        ident = _identifier_from_event(event)
+        if ident is None:
+            return event.conversation_key
+        for entry in self._identity_index.get(event.transport, ()):
+            if event.transport == "slack" and entry.slack_user_id == ident:
+                return f"user:{entry.canonical}"
+            if event.transport == "telegram" and entry.telegram_chat_id == ident:
+                return f"user:{entry.canonical}"
+            if event.transport == "cli" and entry.cli_username == ident:
+                return f"user:{entry.canonical}"
+        return event.conversation_key
 
     async def _get_or_spawn_worker(self, event: InboundEvent) -> ConversationWorker:
         key = event.conversation_key
