@@ -30,10 +30,12 @@ class Watchdog:
         config: AnnaConfig,
         adapters: dict[str, ChannelAdapter],
         router: Any,
+        alerter: Any | None = None,
     ) -> None:
         self._config = config
         self._adapters = adapters
         self._router = router
+        self._alerter = alerter
         self._log = get_logger("anna.watchdog")
         self._transport_failures: dict[str, int] = defaultdict(int)
         self._sdk_failures = 0
@@ -118,6 +120,20 @@ class Watchdog:
                             transport=name,
                             error=str(exc),
                         )
+                    # Notify the operator on the other transport so they
+                    # know one channel hiccuped even if it self-healed.
+                    if self._alerter is not None:
+                        try:
+                            await self._alerter.warn(
+                                f"Transport {name} was restarted after 3 consecutive failed pings.",
+                                exclude_channel=name,
+                            )
+                        except Exception as exc:
+                            self._log.error(
+                                "watchdog.alerter.warn_failed",
+                                transport=name,
+                                error=str(exc),
+                            )
                     self._transport_failures[name] = 0
 
     # ------------------------------------------------------------------
@@ -165,6 +181,16 @@ class Watchdog:
                     auth_path=self._config.auth.mode,
                     last_error=str(exc),
                 )
+                if self._alerter is not None:
+                    try:
+                        await self._alerter.critical(
+                            f"SDK auth failed (mode={self._config.auth.mode}): {exc}"
+                        )
+                    except Exception as alert_exc:
+                        self._log.error(
+                            "watchdog.alerter.critical_failed",
+                            error=str(alert_exc),
+                        )
             else:
                 self._log.warning("watchdog.sdk.ping_failed", error=str(exc))
 

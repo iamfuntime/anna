@@ -139,6 +139,21 @@ class SessionsConfig(BaseModel):
     thread_gap_hours: float = 1.0
 
 
+class AdminConfig(BaseModel):
+    """Operator-side destinations for out-of-band alerts.
+
+    Used by :class:`anna.runtime.alerter.AdminAlerter` when a transport
+    restart or SDK auth failure needs to reach the operator on the
+    surviving channel. Both fields are optional; if a destination is
+    unset for the surviving transport, the alerter logs a WARNING and
+    skips. The Slack value is a channel ID (e.g. ``C0123ABC``); the
+    Telegram value is the operator's chat ID as a string.
+    """
+
+    slack_channel_id: str = ""
+    telegram_chat_id: str = ""
+
+
 # ---------------------------------------------------------------------------
 # Top-level
 # ---------------------------------------------------------------------------
@@ -153,6 +168,7 @@ class AnnaConfig(BaseModel):
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     housekeeping: HousekeepingConfig = Field(default_factory=HousekeepingConfig)
     sessions: SessionsConfig = Field(default_factory=SessionsConfig)
+    admin: AdminConfig = Field(default_factory=AdminConfig)
 
     # Derived runtime paths. Not in the YAML file. ANNA_HOME from .env wins,
     # falling back to ~/anna. The setup wizard always writes ANNA_HOME.
@@ -209,6 +225,17 @@ def _apply_env_overrides(data: dict[str, Any]) -> dict[str, Any]:
     fmt = os.environ.get("ANNA_LOG_FORMAT")
     if fmt:
         data.setdefault("logging", {})["format"] = fmt
+
+    # Admin destinations fall back to .env so the operator can keep the
+    # channel IDs out of anna.yaml if they prefer.
+    admin_slack = os.environ.get("ANNA_ADMIN_SLACK_CHANNEL_ID")
+    admin_tg = os.environ.get("ANNA_ADMIN_TELEGRAM_CHAT_ID")
+    if admin_slack or admin_tg:
+        admin = data.setdefault("admin", {})
+        if admin_slack and not admin.get("slack_channel_id"):
+            admin["slack_channel_id"] = admin_slack
+        if admin_tg and not admin.get("telegram_chat_id"):
+            admin["telegram_chat_id"] = admin_tg
 
     return data
 

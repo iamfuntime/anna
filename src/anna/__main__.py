@@ -15,6 +15,7 @@ from typing import Any
 
 from anna.config import AnnaConfig, load_config
 from anna.log import configure_logging, get_logger
+from anna.runtime.alerter import AdminAlerter
 from anna.runtime.router import ConversationRouter
 from anna.runtime.supervisor import Supervisor
 from anna.runtime.watchdog import Watchdog
@@ -29,7 +30,8 @@ async def _run(config: AnnaConfig) -> None:
     supervisor = Supervisor(config=config)
     adapters = build_enabled_adapters(config)
     router = ConversationRouter(config=config, supervisor=supervisor, adapters=adapters)
-    watchdog = Watchdog(config=config, adapters=adapters, router=router)
+    alerter = AdminAlerter(config=config, adapters=adapters)
+    watchdog = Watchdog(config=config, adapters=adapters, router=router, alerter=alerter)
 
     # Subscribe the router to every transport. Each adapter calls the
     # handler back with normalized InboundEvent objects.

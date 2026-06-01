@@ -112,3 +112,18 @@ sessions:
   dm_gap_hours: 8
   # Hours of inactivity before a thread or group-style conversation is closed.
   thread_gap_hours: 1
+
+# ============================================================
+# Operator alerts
+#
+# When the watchdog restarts a transport, the operator should learn about
+# it on the OTHER transport. When the SDK auth fails, both transports get
+# notified. Either field may be left blank; the alerter logs a warning
+# and skips when no destination is configured for the surviving channel.
+# Env-var equivalents: ANNA_ADMIN_SLACK_CHANNEL_ID, ANNA_ADMIN_TELEGRAM_CHAT_ID.
+# ============================================================
+admin:
+  # Slack channel ID (e.g. C0123ABC) the bot is a member of.
+  slack_channel_id: ""
+  # Operator's Telegram chat ID as a string.
+  telegram_chat_id: ""
