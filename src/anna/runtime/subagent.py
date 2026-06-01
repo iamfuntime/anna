@@ -584,9 +584,11 @@ class SubAgentRunner:
                 parent_conv=parent_conv_key,
             )
 
-            # Step 8-10: open the SDK client and run the task.
-            # Lazy import mirrors ConversationWorker._handle so unit
-            # tests can monkeypatch ClaudeSDKClient + message types.
+            # Step 8-10: open the SDK client and run the task, wrapped
+            # in asyncio.wait_for so a runaway sub-agent does not hold
+            # the semaphore past timeout_seconds. Lazy import mirrors
+            # ConversationWorker._handle so unit tests can monkeypatch
+            # ClaudeSDKClient + message types.
             from claude_agent_sdk import (
                 AssistantMessage,
                 ClaudeSDKClient,
@@ -601,31 +603,102 @@ class SubAgentRunner:
             cost_usd: float = 0.0
 
             client = ClaudeSDKClient(options=options)
-            await client.__aenter__()
-            try:
-                await client.query(task)
-                async for msg in client.receive_response():
-                    if isinstance(msg, AssistantMessage):
-                        for block in msg.content:
-                            if isinstance(block, TextBlock):
-                                reply_chunks.append(block.text)
-                            elif isinstance(block, ToolUseBlock):
-                                tool_calls.append(block.name)
-                    if isinstance(msg, ResultMessage):
-                        if msg.total_cost_usd is not None:
-                            cost_usd = float(msg.total_cost_usd)
-                        break
-            finally:
+
+            async def _drive() -> None:
+                """Open the client, send the task, drain the response.
+
+                Inner coroutine so asyncio.wait_for can cancel the
+                whole open/query/receive chain on timeout. The finally
+                block guarantees __aexit__ runs whether the body
+                completes, raises, or is cancelled.
+                """
+                await client.__aenter__()
                 try:
-                    await client.__aexit__(None, None, None)
-                except Exception as exc:  # noqa: BLE001
-                    # Closing the client must not mask a successful run.
-                    self._log.warning(
-                        "subagent.client_close_failed",
-                        slug=agent_slug,
-                        audit_id=audit_id,
-                        error=str(exc),
-                    )
+                    await client.query(task)
+                    async for msg in client.receive_response():
+                        if isinstance(msg, AssistantMessage):
+                            for block in msg.content:
+                                if isinstance(block, TextBlock):
+                                    reply_chunks.append(block.text)
+                                elif isinstance(block, ToolUseBlock):
+                                    tool_calls.append(block.name)
+                        if isinstance(msg, ResultMessage):
+                            nonlocal cost_usd
+                            if msg.total_cost_usd is not None:
+                                cost_usd = float(msg.total_cost_usd)
+                            break
+                finally:
+                    try:
+                        await client.__aexit__(None, None, None)
+                    except Exception as close_exc:  # noqa: BLE001
+                        # Closing the client must not mask the outer
+                        # exception (or a successful run).
+                        self._log.warning(
+                            "subagent.client_close_failed",
+                            slug=agent_slug,
+                            audit_id=audit_id,
+                            error=str(close_exc),
+                        )
+
+            try:
+                await asyncio.wait_for(_drive(), timeout=effective_timeout)
+            except asyncio.TimeoutError as exc:
+                duration_ms = int(
+                    (time.monotonic_ns() - start_ns) / 1_000_000
+                )
+                self._write_transcript_line(
+                    slug=agent_slug,
+                    conv_key=conv_key,
+                    direction="fail",
+                    text=f"timeout after {effective_timeout}s",
+                    audit_id=audit_id,
+                    parent_conv=parent_conv_key,
+                    kind="timeout",
+                    duration_seconds=duration_ms / 1000.0,
+                )
+                self._audit(
+                    "audit.subagent.fail",
+                    parent_conv=parent_conv_key,
+                    level="WARNING",
+                    slug=agent_slug,
+                    audit_id=audit_id,
+                    kind="timeout",
+                    duration_seconds=duration_ms / 1000.0,
+                    timeout_seconds=effective_timeout,
+                )
+                raise SubAgentError(
+                    "timeout",
+                    reason=f"exceeded {effective_timeout}s",
+                ) from exc
+            except SubAgentError:
+                # Sub-agent errors raised inside _drive (none today, but
+                # future hook points) propagate without remapping.
+                raise
+            except Exception as exc:  # noqa: BLE001
+                duration_ms = int(
+                    (time.monotonic_ns() - start_ns) / 1_000_000
+                )
+                self._write_transcript_line(
+                    slug=agent_slug,
+                    conv_key=conv_key,
+                    direction="fail",
+                    text=repr(exc),
+                    audit_id=audit_id,
+                    parent_conv=parent_conv_key,
+                    kind="error",
+                    duration_seconds=duration_ms / 1000.0,
+                )
+                self._audit(
+                    "audit.subagent.fail",
+                    parent_conv=parent_conv_key,
+                    level="WARNING",
+                    slug=agent_slug,
+                    audit_id=audit_id,
+                    kind="error",
+                    reason=repr(exc),
+                    duration_seconds=duration_ms / 1000.0,
+                )
+                raise SubAgentError("error", reason=repr(exc)) from exc
 
             duration_ms = int((time.monotonic_ns() - start_ns) / 1_000_000)
             reply_text = "\n".join(c for c in reply_chunks if c).strip()

@@ -844,3 +844,303 @@ async def test_delegate_releases_semaphore_on_success(
 # `datetime` and `timezone` are imported at top of file via `from datetime
 # import date`; pull the rest for audit-path queries.
 from datetime import datetime, timezone  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# Subtask 8: failure paths
+# ---------------------------------------------------------------------------
+
+
+class _RaiseOnQueryClient:
+    """Fake SDK client whose query() raises a configurable exception."""
+
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+        self.entered = False
+        self.exited = False
+
+    async def __aenter__(self):
+        self.entered = True
+        return self
+
+    async def __aexit__(self, *_a):
+        self.exited = True
+        return None
+
+    async def query(self, prompt: str) -> None:
+        raise self._exc
+
+    async def receive_response(self):
+        if False:  # pragma: no cover - unreachable
+            yield None
+
+
+class _RaiseOnReceiveClient:
+    """Fake SDK client whose receive_response() raises mid-stream."""
+
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+        self.entered = False
+        self.exited = False
+
+    async def __aenter__(self):
+        self.entered = True
+        return self
+
+    async def __aexit__(self, *_a):
+        self.exited = True
+        return None
+
+    async def query(self, prompt: str) -> None:
+        return None
+
+    async def receive_response(self):
+        raise self._exc
+        yield  # pragma: no cover - unreachable, makes this an async generator
+
+
+class _SlowReplyClient:
+    """Fake SDK client whose receive_response() never yields ResultMessage.
+
+    Used to exercise the asyncio.wait_for timeout path. The await
+    inside the loop is long enough to outlive the configured
+    timeout_seconds, after which wait_for cancels the task.
+    """
+
+    def __init__(self, sleep_seconds: float) -> None:
+        self._sleep_seconds = sleep_seconds
+        self.entered = False
+        self.exited = False
+
+    async def __aenter__(self):
+        self.entered = True
+        return self
+
+    async def __aexit__(self, *_a):
+        self.exited = True
+        return None
+
+    async def query(self, prompt: str) -> None:
+        return None
+
+    async def receive_response(self):
+        await asyncio.sleep(self._sleep_seconds)
+        # If we ever reach here the test setup is wrong — the
+        # outer wait_for should have fired first.
+        yield _FakeAssistantMessage(content=[_FakeTextBlock(text="late")])
+        yield _FakeResultMessage()
+
+
+def _audit_events(tmp_path: Path) -> list[dict]:
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    path = tmp_path / "audit" / f"audit-{today}.jsonl"
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text().splitlines()]
+
+
+@pytest.mark.asyncio
+async def test_delegate_not_found_emits_fail_audit_and_raises(
+    tmp_path: Path, monkeypatch
+) -> None:
+    runner = _make_runner(tmp_path)
+    # No persona file written → not_found.
+    _install_fake_sdk(monkeypatch, lambda opts: _FakeReplyClient())
+
+    with pytest.raises(SubAgentError) as exc_info:
+        await runner.delegate(
+            agent_slug="ghost",
+            task="t",
+            parent_conv_key="slack:dm:U123",
+        )
+    assert exc_info.value.kind == "not_found"
+
+    events = _audit_events(tmp_path)
+    fail_events = [e for e in events if e["event"] == "audit.subagent.fail"]
+    assert len(fail_events) == 1
+    assert fail_events[0]["kind"] == "not_found"
+    # Spawn-time fail before any sub-agent transcript dir is created.
+    today = date.today().isoformat()
+    transcript_dir = tmp_path / "transcripts" / "subagent" / "ghost"
+    assert not (transcript_dir / f"{today}.jsonl").exists()
+    # Semaphore was released.
+    assert runner._semaphore._value == 3  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_delegate_depth_violation_short_circuits_before_semaphore(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A parent_conv_key starting with ``subagent:`` raises immediately."""
+    runner = _make_runner(tmp_path)
+    _write_persona(tmp_path, "slug")
+    _install_fake_sdk(monkeypatch, lambda opts: _FakeReplyClient())
+
+    with pytest.raises(SubAgentError) as exc_info:
+        await runner.delegate(
+            agent_slug="slug",
+            task="t",
+            parent_conv_key="subagent:other:abc-uuid",
+        )
+    assert exc_info.value.kind == "depth_violation"
+
+    events = _audit_events(tmp_path)
+    fail = next(e for e in events if e["event"] == "audit.subagent.fail")
+    assert fail["kind"] == "depth_violation"
+    # Semaphore was never acquired (still at full capacity).
+    assert runner._semaphore._value == 3  # noqa: SLF001
+    # No spawn audit fired.
+    assert not any(e["event"] == "audit.subagent.spawn" for e in events)
+
+
+@pytest.mark.asyncio
+async def test_delegate_concurrency_acquire_timeout(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The 4th concurrent delegate raises concurrency_timeout once the wait elapses."""
+    # Tighten the acquire timeout so the test does not block.
+    cfg = AnnaConfig.model_validate(
+        {"subagents": {"max_concurrent": 1, "concurrency_acquire_timeout_seconds": 1}}
+    )
+    cfg = cfg.model_copy(update={"anna_home": tmp_path})
+    supervisor = Supervisor(config=cfg)
+    runner = SubAgentRunner(
+        config=cfg,
+        supervisor=supervisor,
+        agents_registry=SubAgentRegistry(
+            supervisor=supervisor,
+            agents_dir=tmp_path / "agents",
+            audit_dir=tmp_path / "audit",
+            fsync_on_write=False,
+        ),
+        skills_registry=SkillRegistry(
+            supervisor=supervisor,
+            skills_dir=tmp_path / "skills",
+            audit_dir=tmp_path / "audit",
+            fsync_on_write=False,
+        ),
+    )
+    _write_persona(tmp_path, "slug")
+    _install_fake_sdk(monkeypatch, lambda opts: _FakeReplyClient())
+
+    # Drain the lone semaphore slot. We hold it manually so the
+    # delegate call has nothing to acquire and trips the timeout.
+    await runner._semaphore.acquire()  # noqa: SLF001
+
+    with pytest.raises(SubAgentError) as exc_info:
+        await runner.delegate(
+            agent_slug="slug",
+            task="t",
+            parent_conv_key="slack:dm:U123",
+        )
+    assert exc_info.value.kind == "concurrency_timeout"
+
+    events = _audit_events(tmp_path)
+    fail = next(e for e in events if e["event"] == "audit.subagent.fail")
+    assert fail["kind"] == "concurrency_timeout"
+    # Release the held slot to leave the runner clean for any follow-on.
+    runner._semaphore.release()  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_delegate_query_exception_emits_fail_audit(
+    tmp_path: Path, monkeypatch
+) -> None:
+    runner = _make_runner(tmp_path)
+    _write_persona(tmp_path, "slug")
+    _install_fake_sdk(
+        monkeypatch,
+        lambda opts: _RaiseOnQueryClient(RuntimeError("rate limit")),
+    )
+
+    with pytest.raises(SubAgentError) as exc_info:
+        await runner.delegate(
+            agent_slug="slug",
+            task="t",
+            parent_conv_key="slack:dm:U123",
+        )
+    assert exc_info.value.kind == "error"
+    assert "rate limit" in (exc_info.value.reason or "")
+
+    events = _audit_events(tmp_path)
+    # Both spawn and fail fire when the exception is mid-run.
+    assert any(e["event"] == "audit.subagent.spawn" for e in events)
+    fail = next(e for e in events if e["event"] == "audit.subagent.fail")
+    assert fail["kind"] == "error"
+    assert "rate limit" in fail["reason"]
+
+    # Transcript fail line was written.
+    today = date.today().isoformat()
+    transcript = tmp_path / "transcripts" / "subagent" / "slug" / f"{today}.jsonl"
+    records = [json.loads(line) for line in transcript.read_text().splitlines()]
+    directions = [r["direction"] for r in records]
+    assert "task" in directions
+    assert "fail" in directions
+    # Semaphore released.
+    assert runner._semaphore._value == 3  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_delegate_receive_exception_emits_fail_audit(
+    tmp_path: Path, monkeypatch
+) -> None:
+    runner = _make_runner(tmp_path)
+    _write_persona(tmp_path, "slug")
+    _install_fake_sdk(
+        monkeypatch,
+        lambda opts: _RaiseOnReceiveClient(ConnectionError("socket closed")),
+    )
+
+    with pytest.raises(SubAgentError) as exc_info:
+        await runner.delegate(
+            agent_slug="slug",
+            task="t",
+            parent_conv_key="slack:dm:U123",
+        )
+    assert exc_info.value.kind == "error"
+    assert "socket closed" in (exc_info.value.reason or "")
+
+    events = _audit_events(tmp_path)
+    fail = next(e for e in events if e["event"] == "audit.subagent.fail")
+    assert fail["kind"] == "error"
+    assert runner._semaphore._value == 3  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_delegate_timeout_emits_fail_audit_and_raises(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A query that outlives timeout_seconds raises SubAgentError(timeout)."""
+    runner = _make_runner(tmp_path)
+    _write_persona(tmp_path, "slug")
+    # The fake client sleeps longer than the timeout we pass below.
+    _install_fake_sdk(
+        monkeypatch,
+        lambda opts: _SlowReplyClient(sleep_seconds=2.0),
+    )
+
+    with pytest.raises(SubAgentError) as exc_info:
+        await runner.delegate(
+            agent_slug="slug",
+            task="t",
+            parent_conv_key="slack:dm:U123",
+            timeout_seconds=1,
+        )
+    assert exc_info.value.kind == "timeout"
+
+    events = _audit_events(tmp_path)
+    fail = next(e for e in events if e["event"] == "audit.subagent.fail")
+    assert fail["kind"] == "timeout"
+    assert fail["timeout_seconds"] == 1
+
+    # Transcript fail line was written.
+    today = date.today().isoformat()
+    transcript = tmp_path / "transcripts" / "subagent" / "slug" / f"{today}.jsonl"
+    records = [json.loads(line) for line in transcript.read_text().splitlines()]
+    directions = [r["direction"] for r in records]
+    assert "fail" in directions
+    fail_record = next(r for r in records if r["direction"] == "fail")
+    assert fail_record["kind"] == "timeout"
+
+    # Semaphore released so a follow-on call can proceed.
+    assert runner._semaphore._value == 3  # noqa: SLF001
