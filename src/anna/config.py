@@ -161,6 +161,73 @@ class AdminConfig(BaseModel):
     startup_alert: bool = True
 
 
+class GoogleAccountConfig(BaseModel):
+    """A single Google account ANNA can read mail and calendar from.
+
+    Two auth flavors are supported:
+
+    * ``auth_type: oauth`` — a personal Google account. The
+      ``credentials_file`` points at the OAuth client JSON downloaded from
+      the GCP console (Desktop application type). The per-account refresh
+      token is captured by ``python -m anna.setup.google_auth add <slug>``
+      and persisted at ``state/google/token_<slug>.json``.
+    * ``auth_type: service_account`` — a Workspace account where the
+      operator controls the domain. ``credentials_file`` points at the
+      service-account key JSON; ANNA uses domain-wide delegation to
+      impersonate the ``email`` address. No browser flow needed; verify
+      with ``python -m anna.setup.google_auth verify <slug>``.
+
+    Paths in ``credentials_file`` are resolved relative to ``$ANNA_HOME``
+    when not absolute. Slugs must be filesystem-safe (a-z, 0-9, underscore)
+    because they become part of token filenames and tool-call arguments.
+    """
+
+    slug: str
+    email: str
+    auth_type: Literal["oauth", "service_account"]
+    credentials_file: str
+
+    @field_validator("slug")
+    @classmethod
+    def _slug_safe(cls, v: str) -> str:
+        if not v:
+            raise ValueError("google account slug cannot be empty")
+        bad = [c for c in v if not (c.isalnum() or c == "_")]
+        if bad:
+            raise ValueError(
+                f"google account slug must be a-z, 0-9, underscore only; "
+                f"got disallowed chars: {''.join(sorted(set(bad)))}"
+            )
+        return v
+
+
+class GoogleConfig(BaseModel):
+    """Top-level Google integration toggle and per-account list.
+
+    The phase-1 tool surface is read-only (Gmail message list/search/read
+    and Calendar event listing). Write tools (drafts, sends, label edits,
+    calendar mutations) are gated behind ``write_enabled``, which defaults
+    off so a scheduled prompt cannot send mail without an explicit opt-in.
+
+    Tokens for OAuth accounts live in ``$ANNA_HOME/state/google/``; the
+    setup CLI creates the directory with 700 perms on first use.
+    """
+
+    enabled: bool = False
+    accounts: list[GoogleAccountConfig] = Field(default_factory=list)
+    write_enabled: bool = False
+
+    @model_validator(mode="after")
+    def _check_unique_slugs(self) -> "GoogleConfig":
+        slugs = [a.slug for a in self.accounts]
+        dupes = sorted({s for s in slugs if slugs.count(s) > 1})
+        if dupes:
+            raise ValueError(
+                f"duplicate google account slugs: {', '.join(dupes)}"
+            )
+        return self
+
+
 class SchedulerConfig(BaseModel):
     """Phase 2 scheduler. Fires scheduled prompts through the worker pool.
 
@@ -203,6 +270,7 @@ class AnnaConfig(BaseModel):
     sessions: SessionsConfig = Field(default_factory=SessionsConfig)
     admin: AdminConfig = Field(default_factory=AdminConfig)
     scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
+    google: GoogleConfig = Field(default_factory=GoogleConfig)
 
     # Derived runtime paths. Not in the YAML file. ANNA_HOME from .env wins,
     # falling back to ~/anna. The setup wizard always writes ANNA_HOME.
@@ -224,6 +292,22 @@ class AnnaConfig(BaseModel):
     def state_dir(self) -> Path:
         """Runtime state files (clean-shutdown sentinel, etc.)."""
         return self.anna_home / "state"
+
+    @property
+    def google_state_dir(self) -> Path:
+        """Per-account Google credentials and refresh tokens."""
+        return self.state_dir / "google"
+
+    def resolve_google_credentials_path(self, account: "GoogleAccountConfig") -> Path:
+        """Resolve a per-account credentials_file against anna_home if relative."""
+        raw = Path(os.path.expanduser(account.credentials_file))
+        if raw.is_absolute():
+            return raw
+        return self.anna_home / raw
+
+    def google_token_path(self, account: "GoogleAccountConfig") -> Path:
+        """Per-OAuth-account refresh-token cache path."""
+        return self.google_state_dir / f"token_{account.slug}.json"
 
 
 # ---------------------------------------------------------------------------

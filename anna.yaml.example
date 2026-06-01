@@ -156,3 +156,32 @@ scheduler:
   # AdminAlerter.warn(). The schedule stays in state_path with enabled:
   # false until the operator re-enables it.
   failure_threshold: 3
+
+# ============================================================
+# google: read-only (phase 1) Gmail + Calendar across multiple accounts.
+# See Inbox/2026-06-01-ANNA-Google-Workspace-OAuth-Setup.md for the
+# one-time GCP project + service-account + Workspace DWD setup.
+# ============================================================
+google:
+  # Master kill switch. When false, the google MCP server is not mounted
+  # and the google_* tools are unavailable to workers.
+  enabled: false
+  # Per-account list. slug is the handle ANNA passes to every tool call.
+  # auth_type is "oauth" (personal Gmail) or "service_account" (Workspace
+  # with domain-wide delegation). credentials_file is resolved relative to
+  # $ANNA_HOME when not absolute.
+  #
+  # accounts:
+  #   - slug: personal_main
+  #     email: you@gmail.com
+  #     auth_type: oauth
+  #     credentials_file: state/google/oauth_client.json
+  #   - slug: emergentsec
+  #     email: you@emergentsec.com
+  #     auth_type: service_account
+  #     credentials_file: state/google/sa_emergentsec.json
+  accounts: []
+  # Phase 2 write tools (drafts, sends, calendar mutations) are gated
+  # behind this flag. Keep off until you trust scheduled prompts to send
+  # mail on their own.
+  write_enabled: false
