@@ -11,15 +11,31 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
+from anna.agents.registry import SubAgentRegistry
 from anna.config import AnnaConfig
 from anna.core.identity import CoreFile, read_core_file
 from anna.log import get_logger
+from anna.skills.registry import SkillRegistry
+from anna.tools.self_edit_server import SELF_EDIT_TOOL_NAMES, SelfEditTools, build_self_edit_server
 from anna.transports.base import InboundEvent, OutboundMessage
 
 if TYPE_CHECKING:
     from anna.runtime.supervisor import Supervisor
+
+
+# Default file-system tools we hand to ANNA so she can read and write her
+# vault. Listed by their canonical SDK names. The MCP self-edit tools are
+# prefixed with ``mcp__anna_self_edit__`` per the SDK convention.
+_DEFAULT_FS_TOOLS: tuple[str, ...] = ("Read", "Write", "Edit", "Glob", "Grep")
+_MCP_TOOL_PREFIX = "mcp__anna_self_edit__"
+
+
+def _allowed_tool_names() -> list[str]:
+    return list(_DEFAULT_FS_TOOLS) + [
+        f"{_MCP_TOOL_PREFIX}{name}" for name in SELF_EDIT_TOOL_NAMES
+    ]
 
 
 SendCallback = Callable[[OutboundMessage], Awaitable[None]]
@@ -107,37 +123,52 @@ class ConversationWorker:
             self._log.error("worker.crashed", error=str(exc))
             raise
 
-    async def _ensure_client(self) -> None:
-        if self._client is not None:
-            return
-        try:
-            from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
-        except ImportError as exc:
-            self._log.critical("worker.sdk_import_failed", error=str(exc))
-            raise
-
-        # setting_sources=[] disables inheriting the operator's user/project
-        # Claude Code settings (CLAUDE.md, agents/, MCP servers, skills). Without
-        # this, ANNA pulls in the entire host Claude Code environment and starts
-        # responding as if she were the operator's primary agent — referencing
-        # the operator's vault, agent roster, and slash commands as if they
-        # were her own. ANNA must speak strictly from her own ~/anna/core files.
+    def _format_rule(self) -> str:
         channel = self.transport
         if channel == "slack":
-            format_rule = (
+            return (
                 "You are replying via Slack. Use plain text or Slack mrkdwn "
                 "(*bold*, _italic_, `code`). Do not use GitHub-flavored "
                 "Markdown tables, headings, or fenced code blocks with "
                 "language hints; Slack will render them as literal characters."
             )
-        elif channel == "telegram":
-            format_rule = (
+        if channel == "telegram":
+            return (
                 "You are replying via Telegram. The reply is sent as plain "
                 "text (no parse_mode), so do not use any Markdown formatting. "
                 "Plain prose, line breaks, and dashes only."
             )
-        else:
-            format_rule = "Reply in plain text."
+        return "Reply in plain text."
+
+    def _build_self_edit_tools(self) -> SelfEditTools:
+        cfg = self._config
+        agents_registry = SubAgentRegistry(
+            supervisor=self._supervisor,
+            agents_dir=cfg.anna_home / "agents",
+            audit_dir=cfg.audit_dir,
+            fsync_on_write=cfg.logging.audit.fsync_on_write,
+        )
+        skills_registry = SkillRegistry(
+            supervisor=self._supervisor,
+            skills_dir=cfg.anna_home / "skills",
+            audit_dir=cfg.audit_dir,
+            fsync_on_write=cfg.logging.audit.fsync_on_write,
+        )
+        return SelfEditTools(
+            config=cfg,
+            supervisor=self._supervisor,
+            agents_registry=agents_registry,
+            skills_registry=skills_registry,
+        )
+
+    def _build_options(self) -> Any:
+        """Construct the ClaudeAgentOptions for this worker.
+
+        Extracted from ``_ensure_client`` so the unit tests can introspect
+        the option set (system prompt, MCP server, tools, cwd) without
+        actually spawning an SDK client.
+        """
+        from claude_agent_sdk import ClaudeAgentOptions
 
         vault_root = self._config.vault.resolved_path
         anna_home = self._config.anna_home
@@ -145,20 +176,68 @@ class ConversationWorker:
         system_prompt = self._assemble_system_prompt(
             anna_home=anna_home,
             vault_root=vault_root,
-            format_rule=format_rule,
+            format_rule=self._format_rule(),
         )
 
-        options = ClaudeAgentOptions(
+        # Build the self-edit MCP server. The conv_key is captured by the
+        # tool closures so each audit event is stamped with the right caller.
+        self_edit_tools = self._build_self_edit_tools()
+        mcp_server = build_self_edit_server(
+            tools=self_edit_tools,
+            conv_key=self.conversation_key,
+        )
+
+        # Ensure the vault root exists before the SDK process tries to cd
+        # into it; otherwise the first tool call fails with ENOENT.
+        try:
+            vault_root.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self._log.warning("worker.vault_mkdir_failed", error=str(exc))
+
+        return ClaudeAgentOptions(
             system_prompt=system_prompt,
+            # setting_sources=[] disables inheriting the operator's user /
+            # project / local Claude Code settings (CLAUDE.md, agents/, MCP
+            # servers, skills). Without this, ANNA pulls in the entire host
+            # Claude Code environment and starts responding as if she were
+            # the operator's primary agent. She must speak strictly from her
+            # own ~/anna/core files.
             setting_sources=[],
             # ANNA runs as a headless systemd service with no operator at a
             # terminal to approve tool calls. The default permission_mode is
             # interactive prompting, which means every tool call hangs forever
-            # waiting for an OK that never comes — that's how the operator
-            # sees "ANNA doesn't have permission to do shit". The config
-            # default is bypassPermissions; tighten in anna.yaml if needed.
+            # waiting for an OK that never comes. The config default is
+            # bypassPermissions; tighten in anna.yaml if needed.
             permission_mode=self._config.runtime.permission_mode,
+            # In-process self-edit server. The dict key becomes the MCP
+            # server prefix in the SDK's allowed_tools naming convention
+            # (``mcp__<server>__<tool>``).
+            mcp_servers={"anna_self_edit": mcp_server},
+            # Allow the default filesystem tools so ANNA can browse and write
+            # her vault, plus the seven MCP tools the self-edit server
+            # exposes for core-file and persona mutations.
+            allowed_tools=_allowed_tool_names(),
+            # Vault root is the natural cwd: vault paths become relative
+            # (Conversations/foo.md instead of long absolutes).
+            cwd=str(vault_root),
+            # add_dirs lets the SDK see core/ as a readable workspace. ANNA
+            # should still prefer the MCP tools for core writes because they
+            # take the supervisor lock, but Read/Glob over core/ is fine and
+            # is the only way she can quote her own files back to the
+            # operator.
+            add_dirs=[str(anna_home / "core")],
         )
+
+    async def _ensure_client(self) -> None:
+        if self._client is not None:
+            return
+        try:
+            from claude_agent_sdk import ClaudeSDKClient
+        except ImportError as exc:
+            self._log.critical("worker.sdk_import_failed", error=str(exc))
+            raise
+
+        options = self._build_options()
         # ClaudeSDKClient is an async context manager. We hold it open for the
         # life of the worker and close it in stop().
         client = ClaudeSDKClient(options=options)
