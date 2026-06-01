@@ -47,9 +47,21 @@ class InboundEvent:
     for exception isolation so a misbehaving subscriber cannot drop the
     buffered finalize.
 
+    ``ephemeral`` marks a session whose worker must NOT write a
+    checkpoint or run resume-context cleanup at closeout. Set true by
+    the Phase 2 §5 CLI adapter for ``anna ask`` (one-shot) sessions so
+    each ad-hoc invocation does not pollute
+    ``vault/Conversations/cli-oneshot-<uuid>/`` with a per-query
+    checkpoint. The flag is read by ``ConversationRouter`` on the first
+    event for a given conv_key and propagated to the worker via its
+    constructor; subsequent events on the same conv_key reuse the
+    already-flagged worker.
+
     Both callable / future fields are excluded from compare / hash so
     the dataclass remains hashable and equality compares on the
-    semantic payload only.
+    semantic payload only. ``ephemeral`` is similarly excluded so a
+    one-shot event still compares equal to its non-ephemeral peer with
+    the same semantic payload.
     """
 
     transport: str
@@ -65,6 +77,9 @@ class InboundEvent:
     )
     stream_subscriber: Callable[[str], Awaitable[None]] | None = field(
         default=None, compare=False, hash=False, repr=False
+    )
+    ephemeral: bool = field(
+        default=False, compare=False, hash=False, repr=False
     )
 
 

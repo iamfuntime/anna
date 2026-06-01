@@ -206,6 +206,71 @@ async def test_closeout_is_idempotent_via_stop(tmp_path: Path) -> None:
     assert len(fake.queries) == queries_after_first, "closeout ran twice"
 
 
+# ---------------------------------------------------------------------------
+# Phase 2 §5 subtask 7: ephemeral workers (CLI one-shot) skip the checkpoint.
+# ---------------------------------------------------------------------------
+
+
+def _make_ephemeral_worker(tmp_path: Path) -> ConversationWorker:
+    cfg = AnnaConfig()
+    object.__setattr__(cfg, "anna_home", tmp_path / "anna_home")
+    cfg.vault.path = str(tmp_path / "vault")
+    cfg.logging.audit.fsync_on_write = False
+    cfg.core_dir.mkdir(parents=True, exist_ok=True)
+    supervisor = Supervisor(config=cfg)
+
+    async def _noop_send(_msg):
+        return None
+
+    return ConversationWorker(
+        conversation_key="cli:oneshot:abc-123",
+        transport="cli",
+        config=cfg,
+        supervisor=supervisor,
+        send=_noop_send,
+        ephemeral=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_ephemeral_worker_skips_checkpoint_on_stop(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """An ephemeral worker's ``stop()`` does NOT call ``write_checkpoint``.
+
+    The one-shot ``anna ask`` flow spawns a fresh worker per invocation;
+    writing a checkpoint per query would pollute
+    ``vault/Conversations/cli-oneshot-*/`` with one file per call. The
+    short-circuit also skips the per-core-file eviction sweep — the
+    fake SDK client must never be queried for either a summary or an
+    eviction proposal — and the SDK client is still torn down normally.
+    """
+    worker = _make_ephemeral_worker(tmp_path)
+    worker._task = None  # bypass task lifecycle for unit-style stop()
+
+    # Sentinel: replace write_checkpoint in the worker's module so the
+    # test fails loudly if it is invoked.
+    def _explode(**kwargs):
+        raise AssertionError("write_checkpoint should not be called in ephemeral mode")
+
+    monkeypatch.setattr("anna.runtime.worker.write_checkpoint", _explode)
+
+    fake = FakeSDKClient(responses=["should never be reached"])
+    worker._client = fake
+
+    await worker.stop()
+
+    # No SDK query attempted (summary skipped along with the checkpoint).
+    assert fake.queries == []
+    # SDK client still torn down by stop().
+    assert fake.closed is True
+    # No conv directory on disk for the would-be checkpoint.
+    safe = worker.conversation_key.replace(":", "-")
+    conv_dir = worker._config.vault.resolved_path / "Conversations" / safe
+    assert not conv_dir.exists()
+
+
 @pytest.mark.asyncio
 async def test_closeout_continues_on_eviction_failure(tmp_path: Path) -> None:
     """If one core file's eviction SDK call fails, others still proceed."""

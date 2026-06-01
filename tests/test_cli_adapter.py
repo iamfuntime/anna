@@ -382,6 +382,67 @@ async def test_send_unknown_conv_key_drops_silently(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_user_message_ephemeral_flag_matches_session_mode(tmp_path: Path) -> None:
+    """Phase 2 §5 subtask 7: ``user_message`` on a one-shot session
+    flags the InboundEvent as ephemeral so the router spawns a worker
+    that skips the checkpoint write at closeout; interactive sessions
+    leave the flag false so the standard checkpoint-on-close behavior
+    is preserved. Both directions verified against the same adapter
+    instance to keep wiring assumptions in one place."""
+    cfg = _make_config(tmp_path)
+    adapter = CLIAdapter(config=cfg)
+
+    received: list[InboundEvent] = []
+
+    async def _handler(event: InboundEvent) -> None:
+        received.append(event)
+
+    adapter.subscribe(_handler)
+    await adapter.start()
+    try:
+        sock_path = Path(cfg.transports.cli.socket_path)
+
+        # One-shot session → ephemeral=True.
+        reader_o, writer_o = await _open_client(sock_path)
+        await _send_line(
+            writer_o,
+            {"type": "hello", "mode": "oneshot", "username": "funtime"},
+        )
+        await _read_frame(reader_o)  # ack
+        await _send_line(
+            writer_o,
+            {"type": "user_message", "text": "ad-hoc question"},
+        )
+        await _wait_for(lambda: len(received) == 1)
+        oneshot_event = received[0]
+        assert oneshot_event.conversation_key.startswith("cli:oneshot:")
+        assert oneshot_event.ephemeral is True
+
+        # Interactive session → ephemeral=False.
+        reader_i, writer_i = await _open_client(sock_path)
+        await _send_line(
+            writer_i,
+            {"type": "hello", "mode": "interactive", "username": "funtime"},
+        )
+        await _read_frame(reader_i)  # ack
+        await _send_line(
+            writer_i,
+            {"type": "user_message", "text": "interactive turn"},
+        )
+        await _wait_for(lambda: len(received) == 2)
+        interactive_event = received[1]
+        assert interactive_event.conversation_key == "cli:local:funtime"
+        assert interactive_event.ephemeral is False
+
+        writer_o.close()
+        await writer_o.wait_closed()
+        writer_i.close()
+        await writer_i.wait_closed()
+    finally:
+        await adapter.stop()
+
+
+@pytest.mark.asyncio
 async def test_cancel_frame_logs_but_does_not_kill_session(tmp_path: Path) -> None:
     """A ``cancel`` frame is logged and the session continues to dispatch later frames."""
     cfg = _make_config(tmp_path)

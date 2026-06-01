@@ -180,6 +180,13 @@ class ConversationRouter:
             worker = self._workers.get(key)
             if worker is not None:
                 return worker
+            # Phase 2 §5 subtask 7: propagate ``event.ephemeral`` to the
+            # worker on the FIRST event for a given conv_key. Subsequent
+            # events on the same conv_key reuse this worker, which
+            # already carries the ephemeral flag. CLI one-shot sessions
+            # (``cli:oneshot:<uuid>``) get a fresh conv_key per
+            # invocation, so each spawn picks up its own flag and the
+            # closeout skips the checkpoint write.
             worker = ConversationWorker(
                 conversation_key=key,
                 transport=event.transport,
@@ -190,6 +197,7 @@ class ConversationRouter:
                 schedule_store=self._schedule_store,
                 google_clients=self._google_clients,
                 subagent_runner=self._subagent_runner,
+                ephemeral=event.ephemeral,
             )
             await worker.start()
             self._workers[key] = worker
@@ -197,6 +205,7 @@ class ConversationRouter:
                 "conversation.start",
                 channel=event.transport,
                 conv_key=key,
+                ephemeral=event.ephemeral,
             )
         return worker
 

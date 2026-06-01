@@ -249,6 +249,13 @@ class CLIAdapter(ChannelAdapter):
             is_thread=False,
             raw={"mode": session.mode, "username": session.username},
             stream_subscriber=_stream,
+            # Phase 2 §5 subtask 7: one-shot ``anna ask`` sessions must
+            # not write a checkpoint at closeout. The router reads this
+            # flag from the first event for a given conv_key and
+            # propagates it to the spawned worker; interactive sessions
+            # leave it false and keep the standard checkpoint-on-close
+            # behavior.
+            ephemeral=(session.mode == "oneshot"),
         )
 
         self._log.debug(

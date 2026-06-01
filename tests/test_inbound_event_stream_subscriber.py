@@ -69,3 +69,33 @@ def test_stream_subscriber_field_metadata_matches_completion_future() -> None:
     sub = fields["stream_subscriber"]
     assert sub.compare == fut.compare == False  # noqa: E712
     assert sub.repr == fut.repr == False  # noqa: E712
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 §5 subtask 7: ``ephemeral`` flag for one-shot CLI sessions.
+# ---------------------------------------------------------------------------
+
+
+def test_ephemeral_defaults_round_trips_and_compare_metadata() -> None:
+    """``ephemeral`` defaults to false, round-trips on construction, is
+    excluded from compare/hash/repr, and so an ephemeral event still
+    compares equal to its non-ephemeral peer. Mirrors the contract for
+    the sibling ``completion_future`` / ``stream_subscriber`` fields:
+    out-of-band routing flags carry no semantic payload and must not
+    perturb dataclass equality."""
+
+    # Default and round-trip.
+    bare = _make_event()
+    assert bare.ephemeral is False
+    flagged = _make_event(ephemeral=True)
+    assert flagged.ephemeral is True
+
+    # Equality unaffected by the out-of-band flag.
+    assert bare == flagged
+
+    # Field metadata mirrors completion_future.
+    fields = {f.name: f for f in dataclasses.fields(InboundEvent)}
+    fut = fields["completion_future"]
+    eph = fields["ephemeral"]
+    assert eph.compare == fut.compare == False  # noqa: E712
+    assert eph.repr == fut.repr == False  # noqa: E712

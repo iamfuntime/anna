@@ -82,6 +82,7 @@ class ConversationWorker:
         schedule_store: "ScheduleStore | None" = None,
         google_clients: "GoogleClients | None" = None,
         subagent_runner: "SubAgentRunner | None" = None,
+        ephemeral: bool = False,
     ) -> None:
         self.conversation_key = conversation_key
         self.transport = transport
@@ -92,6 +93,13 @@ class ConversationWorker:
         self._schedule_store = schedule_store
         self._google_clients = google_clients
         self._subagent_runner = subagent_runner
+        # Phase 2 §5 subtask 7: when true the worker skips the checkpoint
+        # write and the per-core-file eviction sweep at closeout. Set by
+        # the router from the first event's ``ephemeral`` flag when the
+        # CLI adapter spawns a one-shot (``cli:oneshot:<uuid>``) worker;
+        # all other transports leave it false and keep the existing
+        # checkpoint-on-close behavior.
+        self._ephemeral = ephemeral
         self._log = get_logger("anna.worker").bind(conv_key=conversation_key, channel=transport)
 
         self._queue: asyncio.Queue[InboundEvent] = asyncio.Queue(maxsize=128)
@@ -547,8 +555,33 @@ class ConversationWorker:
         ``_closed_out`` flag guarantees this only runs once even if stop()
         is invoked twice (e.g. the idle watcher and the router shutdown
         both fire).
+
+        Phase 2 §5 subtask 7: when ``self._ephemeral`` is true (set by the
+        CLI adapter for one-shot ``anna ask`` sessions), the worker skips
+        the checkpoint write and the per-core-file eviction sweep so each
+        ad-hoc invocation does not pollute
+        ``vault/Conversations/cli-oneshot-<uuid>/``. An audit line records
+        the ephemeral close so the operator can still see the session
+        completed; the SDK client is torn down by the caller in the
+        normal way.
         """
         self._log.info("worker.closeout.start", conv_key=self.conversation_key)
+
+        if self._ephemeral:
+            self._log.info(
+                "worker.closeout.skipped_ephemeral",
+                conv_key=self.conversation_key,
+                transport=self.transport,
+            )
+            audit_event(
+                "audit.checkpoint.skipped_ephemeral",
+                audit_dir=self._config.audit_dir,
+                actor="anna",
+                conv_key=self.conversation_key,
+                fsync_on_write=self._config.logging.audit.fsync_on_write,
+                transport=self.transport,
+            )
+            return
 
         # ----- 1. Checkpoint summary --------------------------------------
         summary = await self._ask_checkpoint_summary()
