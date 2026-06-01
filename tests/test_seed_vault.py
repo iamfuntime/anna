@@ -21,8 +21,6 @@ EXPECTED_DIRS = (
     "Episodic",
     "Identity",
     "SubAgents",
-    "agents",
-    "skills",
 )
 
 

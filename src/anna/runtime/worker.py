@@ -363,8 +363,10 @@ class ConversationWorker:
             f"five identity files below; audit/, transcripts/, anna.yaml, "
             f"and .env live alongside.\n"
             f"Your markdown vault root is {vault_root}. Conversations/, "
-            f"Identity/ archives, agents/, and skills/ live here. All writes "
-            f"go under this path."
+            f"Identity/ archives, and SubAgents/ scratch notes live here. "
+            f"Sub-agent persona files (agents/<slug>.md) and skill files "
+            f"(skills/<agent>/<slug>.md) live under {anna_home}, not in the "
+            f"vault. All vault writes go under {vault_root}."
         )
 
         identity_block = "\n\n".join(

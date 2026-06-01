@@ -76,8 +76,6 @@ main() {
         Episodic
         Identity
         SubAgents
-        agents
-        skills
     )
     for d in "${dirs[@]}"; do
         mkdir -p "$vault_root/$d"
@@ -102,8 +100,10 @@ somewhere under this root. Open it in Obsidian (or any editor) to browse.
 - `Identity/` — archives evicted from her five core identity files.
   Filenames follow `<FILE>-archive-YYYY-MM-DD.md`.
 - `SubAgents/` — sub-agent notes and scratch space.
-- `agents/` — sub-agent persona files (`<slug>.md`).
-- `skills/` — per-agent skill files (`<agent>/<slug>.md`).
+
+Sub-agent persona files (`agents/<slug>.md`) and skill files
+(`skills/<agent>/<slug>.md`) live under `$ANNA_HOME/`, not in the
+vault.
 
 ANNA reads and writes here through the Read/Write/Edit/Glob/Grep tools
 the conversation worker hands her. Core identity files live OUTSIDE this
