@@ -6,9 +6,11 @@ ANNA reads two files at startup:
 * ``anna.yaml`` for non-secret runtime config, validated with pydantic.
 
 The :func:`load_config` function returns an :class:`AnnaConfig` instance that
-the rest of the runtime treats as immutable. A config reload (triggered by the
-watchfiles observer in :mod:`anna.runtime.watchdog`) calls :func:`load_config`
-again and swaps the instance, emitting ``audit.config.reloaded``.
+the rest of the runtime treats as immutable for the lifetime of the process.
+There is no hot-reload: edits to ``anna.yaml`` take effect on the next
+``systemctl --user restart anna``. A reloader was scoped out in Phase 1 as
+not worth the per-consumer plumbing — see MEMORY.md (2026-06-01) for the
+tradeoff.
 """
 
 from __future__ import annotations

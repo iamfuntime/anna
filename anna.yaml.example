@@ -2,8 +2,8 @@
 # ANNA configuration
 #
 # Non-secret runtime config lives here. Secrets live in .env.
-# The runtime loads this file at startup and watches it for
-# changes via watchfiles. A reload emits audit.config.reloaded.
+# The runtime loads this file once at startup. Edits do not take
+# effect until anna is restarted (`systemctl --user restart anna`).
 # ============================================================
 
 # ============================================================
