@@ -15,6 +15,7 @@ import sys
 from datetime import datetime, timezone
 from typing import Any
 
+from anna.agents.registry import SubAgentRegistry
 from anna.config import AnnaConfig, load_config
 from anna.log import configure_logging, get_logger
 from anna.runtime.alerter import AdminAlerter
@@ -26,8 +27,10 @@ from anna.runtime.startup import (
     read_and_clear_sentinel,
     write_clean_shutdown_sentinel,
 )
+from anna.runtime.subagent import SubAgentRunner
 from anna.runtime.supervisor import Supervisor
 from anna.runtime.watchdog import Watchdog
+from anna.skills.registry import SkillRegistry
 from anna.tools.google_clients import GoogleClients
 from anna.tools.web_server import WEB_TOOL_NAMES
 from anna.transports import build_enabled_adapters
@@ -110,12 +113,54 @@ async def _run(config: AnnaConfig) -> None:
             ),
         )
 
+    # Phase 2 §3 sub-agent runtime. One SubAgentRunner per process so the
+    # concurrency semaphore is system-wide rather than per-worker. The
+    # runner is pull-driven by delegate calls; no aux task to launch. We
+    # construct the registries the runner reads off disk (persona + skill
+    # files) right here so the runner has stable references that match
+    # the live tree's layout.
+    subagent_runner: SubAgentRunner | None = None
+    if config.subagents.enabled:
+        subagent_agents_registry = SubAgentRegistry(
+            supervisor=supervisor,
+            agents_dir=config.anna_home / "agents",
+            audit_dir=config.audit_dir,
+            fsync_on_write=config.logging.audit.fsync_on_write,
+        )
+        subagent_skills_registry = SkillRegistry(
+            supervisor=supervisor,
+            skills_dir=config.anna_home / "skills",
+            audit_dir=config.audit_dir,
+            fsync_on_write=config.logging.audit.fsync_on_write,
+        )
+        subagent_runner = SubAgentRunner(
+            config=config,
+            supervisor=supervisor,
+            agents_registry=subagent_agents_registry,
+            skills_registry=subagent_skills_registry,
+        )
+        log.info(
+            "anna.subagent.ready",
+            max_concurrent=config.subagents.max_concurrent,
+            allowed_tools_count=len(config.subagents.allowed_tools),
+            default_timeout_seconds=config.subagents.default_timeout_seconds,
+        )
+    else:
+        log.info(
+            "anna.subagent.disabled",
+            note=(
+                "subagents.enabled is false; the anna_delegate MCP server "
+                "will not be mounted on workers"
+            ),
+        )
+
     router = ConversationRouter(
         config=config,
         supervisor=supervisor,
         adapters=adapters,
         schedule_store=schedule_store,
         google_clients=google_clients,
+        subagent_runner=subagent_runner,
     )
     alerter = AdminAlerter(config=config, adapters=adapters)
     watchdog = Watchdog(config=config, adapters=adapters, router=router, alerter=alerter)
