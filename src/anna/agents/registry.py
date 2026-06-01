@@ -75,6 +75,9 @@ class SubAgentRegistry:
             new_hash = _sha256(persona_text)
             tokens = _count_tokens(persona_text)
 
+            # NB: audit_event's first positional is ``name`` (the event name),
+            # so we cannot pass the sub-agent slug as ``name=...``. Use
+            # ``slug=...`` to match the skill registry's convention.
             if prior_text is None:
                 audit_event(
                     "audit.subagent.created",
@@ -82,7 +85,7 @@ class SubAgentRegistry:
                     actor="anna",
                     conv_key=creator_conv,
                     fsync_on_write=self._fsync,
-                    name=slug,
+                    slug=slug,
                     persona_file=str(path),
                     creator_conv=creator_conv,
                     tokens=tokens,
@@ -95,7 +98,7 @@ class SubAgentRegistry:
                     actor="anna",
                     conv_key=creator_conv,
                     fsync_on_write=self._fsync,
-                    name=slug,
+                    slug=slug,
                     persona_file=str(path),
                     creator_conv=creator_conv,
                     tokens=tokens,
