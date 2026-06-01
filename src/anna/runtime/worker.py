@@ -19,6 +19,7 @@ from anna.core.eviction import evict_if_over_cap
 from anna.core.identity import CORE_FILES, CoreFile, read_core_file
 from anna.log import audit_event, get_logger
 from anna.skills.registry import SkillRegistry
+from anna.tools.delegate_server import DELEGATE_TOOL_NAMES, build_delegate_server
 from anna.tools.google_server import GOOGLE_TOOL_NAMES, GoogleTools, build_google_server
 from anna.tools.self_edit_server import SELF_EDIT_TOOL_NAMES, SelfEditTools, build_self_edit_server
 from anna.tools.vault_tools import VaultTools
@@ -29,6 +30,7 @@ from anna.vault.checkpoint import list_recent_checkpoints, write_checkpoint
 
 if TYPE_CHECKING:
     from anna.runtime.schedule_store import ScheduleStore
+    from anna.runtime.subagent import SubAgentRunner
     from anna.runtime.supervisor import Supervisor
     from anna.tools.google_clients import GoogleClients
 
@@ -40,9 +42,15 @@ _DEFAULT_FS_TOOLS: tuple[str, ...] = ("Read", "Write", "Edit", "Glob", "Grep")
 _SELF_EDIT_PREFIX = "mcp__anna_self_edit__"
 _GOOGLE_PREFIX = "mcp__anna_google__"
 _WEB_PREFIX = "mcp__anna_web__"
+_DELEGATE_PREFIX = "mcp__anna_delegate__"
 
 
-def _allowed_tool_names(*, include_google: bool, include_web: bool) -> list[str]:
+def _allowed_tool_names(
+    *,
+    include_google: bool,
+    include_web: bool,
+    include_delegate: bool = False,
+) -> list[str]:
     names = list(_DEFAULT_FS_TOOLS) + [
         f"{_SELF_EDIT_PREFIX}{name}" for name in SELF_EDIT_TOOL_NAMES
     ]
@@ -50,6 +58,8 @@ def _allowed_tool_names(*, include_google: bool, include_web: bool) -> list[str]
         names.extend(f"{_GOOGLE_PREFIX}{name}" for name in GOOGLE_TOOL_NAMES)
     if include_web:
         names.extend(f"{_WEB_PREFIX}{name}" for name in WEB_TOOL_NAMES)
+    if include_delegate:
+        names.extend(f"{_DELEGATE_PREFIX}{name}" for name in DELEGATE_TOOL_NAMES)
     return names
 
 
@@ -71,6 +81,7 @@ class ConversationWorker:
         on_idle_close: IdleCloseCallback | None = None,
         schedule_store: "ScheduleStore | None" = None,
         google_clients: "GoogleClients | None" = None,
+        subagent_runner: "SubAgentRunner | None" = None,
     ) -> None:
         self.conversation_key = conversation_key
         self.transport = transport
@@ -80,6 +91,7 @@ class ConversationWorker:
         self._on_idle_close = on_idle_close
         self._schedule_store = schedule_store
         self._google_clients = google_clients
+        self._subagent_runner = subagent_runner
         self._log = get_logger("anna.worker").bind(conv_key=conversation_key, channel=transport)
 
         self._queue: asyncio.Queue[InboundEvent] = asyncio.Queue(maxsize=128)
@@ -316,6 +328,25 @@ class ConversationWorker:
                 mcp_servers["anna_web"] = web_server
                 include_web = True
 
+        # Phase 2 §3: mount anna_delegate iff subagents.enabled and the
+        # runtime gave us a SubAgentRunner. The runner is process-wide;
+        # each worker's closure captures only the conv_key so audit
+        # events and sub-agent transcripts cite the originating
+        # conversation. Sub-agents themselves never see this server —
+        # the depth-protection invariant is enforced by simply not
+        # mounting it on a sub-agent's options (see
+        # SubAgentRunner._build_subagent_options).
+        include_delegate = False
+        if self._config.subagents.enabled and self._subagent_runner is not None:
+            delegate_server = build_delegate_server(
+                runner=self._subagent_runner,
+                conv_key=self.conversation_key,
+                config=self._config,
+            )
+            if delegate_server is not None:
+                mcp_servers["anna_delegate"] = delegate_server
+                include_delegate = True
+
         # Ensure the vault root exists before the SDK process tries to cd
         # into it; otherwise the first tool call fails with ENOENT.
         try:
@@ -346,10 +377,11 @@ class ConversationWorker:
             # when tools.enabled.
             mcp_servers=mcp_servers,
             # Allow the default filesystem tools, the self-edit MCP tools,
-            # and (when wired) the google and web MCP tools.
+            # and (when wired) the google, web, and delegate MCP tools.
             allowed_tools=_allowed_tool_names(
                 include_google=include_google,
                 include_web=include_web,
+                include_delegate=include_delegate,
             ),
             # Vault root is the natural cwd: vault paths become relative
             # (Conversations/foo.md instead of long absolutes).

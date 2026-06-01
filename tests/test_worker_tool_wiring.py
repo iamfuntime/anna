@@ -12,15 +12,20 @@ from pathlib import Path
 
 import pytest
 
+from anna.agents.registry import SubAgentRegistry
 from anna.config import AnnaConfig, GoogleAccountConfig
+from anna.runtime.subagent import SubAgentRunner
 from anna.runtime.supervisor import Supervisor
 from anna.runtime.worker import (
     _DEFAULT_FS_TOOLS,
+    _DELEGATE_PREFIX,
     _GOOGLE_PREFIX,
     _SELF_EDIT_PREFIX,
     _WEB_PREFIX,
     ConversationWorker,
 )
+from anna.skills.registry import SkillRegistry
+from anna.tools.delegate_server import DELEGATE_TOOL_NAMES
 from anna.tools.google_server import GOOGLE_TOOL_NAMES
 from anna.tools.self_edit_server import SELF_EDIT_TOOL_NAMES
 from anna.tools.web_server import WEB_TOOL_NAMES
@@ -29,10 +34,17 @@ from anna.tools.web_server import WEB_TOOL_NAMES
 CONV_KEY = "slack:dm:UTEST"
 
 
-def _make_worker(tmp_path: Path, *, with_google: bool = False) -> ConversationWorker:
+def _make_worker(
+    tmp_path: Path,
+    *,
+    with_google: bool = False,
+    with_subagent_runner: bool = False,
+    subagents_enabled: bool = True,
+) -> ConversationWorker:
     cfg = AnnaConfig()
     object.__setattr__(cfg, "anna_home", tmp_path / "anna_home")
     cfg.vault.path = str(tmp_path / "vault")
+    cfg.subagents.enabled = subagents_enabled
     supervisor = Supervisor(config=cfg)
 
     async def _noop_send(_msg):
@@ -54,6 +66,27 @@ def _make_worker(tmp_path: Path, *, with_google: bool = False) -> ConversationWo
         from anna.tools.google_clients import GoogleClients
         google_clients = GoogleClients(config=cfg)
 
+    subagent_runner = None
+    if with_subagent_runner:
+        agents_registry = SubAgentRegistry(
+            supervisor=supervisor,
+            agents_dir=cfg.anna_home / "agents",
+            audit_dir=cfg.audit_dir,
+            fsync_on_write=False,
+        )
+        skills_registry = SkillRegistry(
+            supervisor=supervisor,
+            skills_dir=cfg.anna_home / "skills",
+            audit_dir=cfg.audit_dir,
+            fsync_on_write=False,
+        )
+        subagent_runner = SubAgentRunner(
+            config=cfg,
+            supervisor=supervisor,
+            agents_registry=agents_registry,
+            skills_registry=skills_registry,
+        )
+
     return ConversationWorker(
         conversation_key=CONV_KEY,
         transport="slack",
@@ -61,6 +94,7 @@ def _make_worker(tmp_path: Path, *, with_google: bool = False) -> ConversationWo
         supervisor=supervisor,
         send=_noop_send,
         google_clients=google_clients,
+        subagent_runner=subagent_runner,
     )
 
 
@@ -173,3 +207,55 @@ def test_build_options_creates_vault_root(tmp_path: Path) -> None:
     assert not vault_root.exists()
     worker._build_options()
     assert vault_root.is_dir()
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 §3 — anna_delegate wiring (subtask 10)
+# ---------------------------------------------------------------------------
+
+
+def test_build_options_mounts_delegate_when_enabled_and_runner_provided(
+    tmp_path: Path,
+) -> None:
+    """anna_delegate mounts when subagents.enabled=True AND a runner is passed."""
+    worker = _make_worker(tmp_path, with_subagent_runner=True)
+    options = worker._build_options()
+    assert "anna_delegate" in options.mcp_servers
+    server = options.mcp_servers["anna_delegate"]
+    assert isinstance(server, dict)
+    assert server.get("type") == "sdk"
+
+
+def test_build_options_skips_delegate_when_subagents_disabled(tmp_path: Path) -> None:
+    """anna_delegate stays unmounted when subagents.enabled=False."""
+    worker = _make_worker(
+        tmp_path,
+        with_subagent_runner=True,
+        subagents_enabled=False,
+    )
+    options = worker._build_options()
+    assert "anna_delegate" not in options.mcp_servers
+    delegate_named = [t for t in options.allowed_tools if t.startswith(_DELEGATE_PREFIX)]
+    assert delegate_named == []
+
+
+def test_build_options_skips_delegate_when_no_runner_provided(tmp_path: Path) -> None:
+    """anna_delegate stays unmounted when no runner is supplied to the worker."""
+    worker = _make_worker(tmp_path)  # no with_subagent_runner=True
+    options = worker._build_options()
+    assert "anna_delegate" not in options.mcp_servers
+    delegate_named = [t for t in options.allowed_tools if t.startswith(_DELEGATE_PREFIX)]
+    assert delegate_named == []
+
+
+def test_build_options_allowed_tools_includes_delegate_when_enabled(
+    tmp_path: Path,
+) -> None:
+    """allowed_tools picks up mcp__anna_delegate__delegate when wired."""
+    worker = _make_worker(tmp_path, with_subagent_runner=True)
+    options = worker._build_options()
+    expected = [f"{_DELEGATE_PREFIX}{name}" for name in DELEGATE_TOOL_NAMES]
+    for name in expected:
+        assert name in options.allowed_tools, name
+    # Belt-and-suspenders: the canonical name is present.
+    assert "mcp__anna_delegate__delegate" in options.allowed_tools
