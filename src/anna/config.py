@@ -318,6 +318,52 @@ class ToolsConfig(BaseModel):
     vault_download: VaultDownloadConfig = Field(default_factory=VaultDownloadConfig)
 
 
+class SubagentsConfig(BaseModel):
+    """Phase 2 §3 sub-agent spawn runtime.
+
+    ANNA spawns one-shot sub-agents via the ``anna_delegate`` MCP tool.
+    Each sub-agent is a fresh ``ClaudeSDKClient`` carrying a persona file
+    from ``$ANNA_HOME/agents/<slug>.md`` plus any matching skill files
+    under ``$ANNA_HOME/skills/<slug>/``.
+
+    * ``enabled`` — master kill switch for the sub-agent runtime and the
+      ``anna_delegate`` MCP server. When false, the ``delegate`` tool is
+      not mounted on the worker.
+    * ``max_concurrent`` — process-wide cap on concurrent sub-agent runs.
+      The runner holds one ``asyncio.Semaphore`` of this size.
+    * ``default_timeout_seconds`` — per-delegation wall-clock cap when
+      the caller does not override.
+    * ``concurrency_acquire_timeout_seconds`` — how long a delegation
+      waits on the semaphore before failing with a
+      ``concurrency_timeout``.
+    * ``transcript_subdir`` — directory name under
+      ``$ANNA_HOME/transcripts/`` where sub-agent transcripts coalesce by
+      slug + day.
+    * ``allowed_tools`` — the canonical tool surface a sub-agent sees.
+      Explicitly omits the ``mcp__anna_self_edit__``,
+      ``mcp__anna_google__``, and ``mcp__anna_delegate__`` prefixes so a
+      sub-agent cannot self-edit, read mail, or spawn further sub-agents.
+    """
+
+    enabled: bool = True
+    max_concurrent: int = 3
+    default_timeout_seconds: int = 300
+    concurrency_acquire_timeout_seconds: int = 60
+    transcript_subdir: str = "subagent"
+    allowed_tools: list[str] = Field(
+        default_factory=lambda: [
+            "Read",
+            "Write",
+            "Edit",
+            "Glob",
+            "Grep",
+            "mcp__anna_web__web_search",
+            "mcp__anna_web__web_fetch",
+            "mcp__anna_web__vault_download",
+        ]
+    )
+
+
 class SchedulerConfig(BaseModel):
     """Phase 2 scheduler. Fires scheduled prompts through the worker pool.
 
@@ -362,6 +408,7 @@ class AnnaConfig(BaseModel):
     scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
     google: GoogleConfig = Field(default_factory=GoogleConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    subagents: SubagentsConfig = Field(default_factory=SubagentsConfig)
 
     # Derived runtime paths. Not in the YAML file. ANNA_HOME from .env wins,
     # falling back to ~/anna. The setup wizard always writes ANNA_HOME.
@@ -374,6 +421,17 @@ class AnnaConfig(BaseModel):
     @property
     def transcripts_dir(self) -> Path:
         return self.anna_home / "transcripts"
+
+    @property
+    def subagent_transcript_dir(self) -> Path:
+        """Per-sub-agent transcript root.
+
+        Sub-agent runs coalesce under
+        ``$ANNA_HOME/transcripts/<subagents.transcript_subdir>/<slug>/``
+        rather than the per-conv_key tree the main transcript writer uses
+        — see Inbox/2026-06-01-ANNA-Phase-2-Subagent-Runtime-Plan.md.
+        """
+        return self.transcripts_dir / self.subagents.transcript_subdir
 
     @property
     def core_dir(self) -> Path:

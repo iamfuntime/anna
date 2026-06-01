@@ -235,3 +235,45 @@ tools:
     # the response exceeds this. 50 MB covers CVE PDFs and threat
     # reports; raise if you need bigger.
     max_size_bytes: 52428800
+
+# ============================================================
+# subagents: Phase 2 §3 sub-agent spawn runtime.
+#
+# ANNA spawns one-shot sub-agents through the anna_delegate MCP tool
+# (mounted only on her primary workers — sub-agents do not inherit it,
+# which is how one-level-only delegation is enforced). Each sub-agent
+# is a fresh ClaudeSDKClient carrying a persona from
+# ~/anna/agents/<slug>.md plus any skills under ~/anna/skills/<slug>/.
+# Transcripts coalesce under ~/anna/transcripts/<transcript_subdir>/
+# <slug>/<YYYY-MM-DD>.jsonl regardless of conv_key.
+# ============================================================
+subagents:
+  # Master kill switch for the sub-agent runtime + anna_delegate MCP
+  # server. False = the delegate tool is not mounted on workers.
+  enabled: true
+  # Process-wide cap on concurrent sub-agent runs. The runner holds one
+  # asyncio.Semaphore of this size; a 4th concurrent delegation queues
+  # until a slot frees (or fails with concurrency_timeout).
+  max_concurrent: 3
+  # Per-delegation wall-clock cap when the caller does not override.
+  default_timeout_seconds: 300
+  # How long a delegation waits for a semaphore slot before failing
+  # with kind=concurrency_timeout.
+  concurrency_acquire_timeout_seconds: 60
+  # Directory name under ~/anna/transcripts/ for sub-agent runs. The
+  # full path is ~/anna/transcripts/<transcript_subdir>/<slug>/<day>.jsonl.
+  transcript_subdir: subagent
+  # Canonical tool surface a sub-agent sees. Explicitly omits
+  # mcp__anna_self_edit__*, mcp__anna_google__*, and
+  # mcp__anna_delegate__* so a sub-agent cannot self-edit, read mail,
+  # or spawn further sub-agents. Tighten by dropping Write/Edit if you
+  # want read-only sub-agents.
+  allowed_tools:
+    - Read
+    - Write
+    - Edit
+    - Glob
+    - Grep
+    - mcp__anna_web__web_search
+    - mcp__anna_web__web_fetch
+    - mcp__anna_web__vault_download

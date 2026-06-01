@@ -138,3 +138,58 @@ def test_example_yaml_includes_tools_block() -> None:
     assert cfg.tools.enabled is True
     assert cfg.tools.web_search.provider == "brave"
     assert cfg.tools.web_fetch.playwright_fallback is False
+
+
+def test_subagents_defaults_when_block_omitted() -> None:
+    """A config with no subagents: block uses SubagentsConfig defaults."""
+    raw = {"auth": {"mode": "max"}}
+    cfg = AnnaConfig.model_validate(raw)
+    assert cfg.subagents.enabled is True
+    assert cfg.subagents.max_concurrent == 3
+    assert cfg.subagents.default_timeout_seconds == 300
+    assert cfg.subagents.concurrency_acquire_timeout_seconds == 60
+    assert cfg.subagents.transcript_subdir == "subagent"
+    # Default allowed_tools includes the file ops and the three anna_web
+    # tools, and explicitly excludes anna_self_edit / anna_google /
+    # anna_delegate prefixes.
+    tools = cfg.subagents.allowed_tools
+    assert "Read" in tools
+    assert "Write" in tools
+    assert "Edit" in tools
+    assert "Glob" in tools
+    assert "Grep" in tools
+    assert "mcp__anna_web__web_search" in tools
+    assert "mcp__anna_web__web_fetch" in tools
+    assert "mcp__anna_web__vault_download" in tools
+    assert not any(t.startswith("mcp__anna_self_edit__") for t in tools)
+    assert not any(t.startswith("mcp__anna_google__") for t in tools)
+    assert not any(t.startswith("mcp__anna_delegate__") for t in tools)
+
+
+def test_subagents_disabled_persists() -> None:
+    raw = {"subagents": {"enabled": False}}
+    cfg = AnnaConfig.model_validate(raw)
+    assert cfg.subagents.enabled is False
+
+
+def test_subagent_transcript_dir_derived() -> None:
+    """The derived path joins anna_home + transcripts + transcript_subdir."""
+    cfg = AnnaConfig.model_validate({"auth": {"mode": "max"}})
+    expected = cfg.transcripts_dir / "subagent"
+    assert cfg.subagent_transcript_dir == expected
+    # Custom transcript_subdir flows through.
+    cfg2 = AnnaConfig.model_validate({"subagents": {"transcript_subdir": "agents"}})
+    assert cfg2.subagent_transcript_dir == cfg2.transcripts_dir / "agents"
+
+
+def test_example_yaml_includes_subagents_block() -> None:
+    """Confirms anna.yaml.example's subagents: block round-trips through the model."""
+    raw = yaml.safe_load(EXAMPLE_PATH.read_text(encoding="utf-8"))
+    cfg = AnnaConfig.model_validate(raw)
+    assert cfg.subagents.enabled is True
+    assert cfg.subagents.max_concurrent == 3
+    assert cfg.subagents.default_timeout_seconds == 300
+    assert cfg.subagents.concurrency_acquire_timeout_seconds == 60
+    assert cfg.subagents.transcript_subdir == "subagent"
+    assert "Read" in cfg.subagents.allowed_tools
+    assert "mcp__anna_web__web_search" in cfg.subagents.allowed_tools
