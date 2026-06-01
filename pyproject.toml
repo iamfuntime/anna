@@ -44,6 +44,15 @@ dependencies = [
     # schedule_list MCP tool output.
     "croniter>=2.0",
     "cron-descriptor>=1.4",
+    # Phase 2 Google integration: read-only Gmail + Calendar across multiple
+    # accounts. OAuth2 user-consent flow for personal accounts,
+    # service-account + domain-wide delegation for Workspaces. All requests
+    # go through google-api-python-client; -oauthlib drives the installed-app
+    # OAuth flow used by the setup CLI; -httplib2 is the transport backend
+    # shared by both auth paths.
+    "google-api-python-client>=2.140",
+    "google-auth-oauthlib>=1.2",
+    "google-auth-httplib2>=0.2",
 ]
 
 [project.optional-dependencies]
