@@ -28,6 +28,7 @@ from anna.runtime.startup import (
 )
 from anna.runtime.supervisor import Supervisor
 from anna.runtime.watchdog import Watchdog
+from anna.tools.google_clients import GoogleClients
 from anna.transports import build_enabled_adapters
 
 
@@ -63,11 +64,36 @@ async def _run(config: AnnaConfig) -> None:
             )
             schedule_store = None
 
+    # Phase 2 Google integration. The clients factory is cheap to
+    # construct even when no accounts are configured; the actual
+    # credential I/O is deferred until a tool is invoked. We still
+    # gate on google.enabled so a misconfigured anna.yaml doesn't get
+    # the MCP server mounted on a worker that can't use it.
+    google_clients: GoogleClients | None = None
+    if config.google.enabled:
+        google_clients = GoogleClients(config=config)
+        log.info(
+            "anna.google.ready",
+            account_count=len(config.google.accounts),
+            slugs=[a.slug for a in config.google.accounts],
+        )
+    elif config.google.accounts:
+        log.warning(
+            "anna.google.accounts_without_enabled",
+            note=(
+                "google.accounts is non-empty but google.enabled is false; "
+                "the google MCP server will not be mounted until you flip "
+                "the toggle and restart"
+            ),
+            account_count=len(config.google.accounts),
+        )
+
     router = ConversationRouter(
         config=config,
         supervisor=supervisor,
         adapters=adapters,
         schedule_store=schedule_store,
+        google_clients=google_clients,
     )
     alerter = AdminAlerter(config=config, adapters=adapters)
     watchdog = Watchdog(config=config, adapters=adapters, router=router, alerter=alerter)

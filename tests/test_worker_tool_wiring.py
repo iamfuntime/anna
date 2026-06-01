@@ -12,20 +12,22 @@ from pathlib import Path
 
 import pytest
 
-from anna.config import AnnaConfig
+from anna.config import AnnaConfig, GoogleAccountConfig
 from anna.runtime.supervisor import Supervisor
 from anna.runtime.worker import (
     _DEFAULT_FS_TOOLS,
-    _MCP_TOOL_PREFIX,
+    _GOOGLE_PREFIX,
+    _SELF_EDIT_PREFIX,
     ConversationWorker,
 )
+from anna.tools.google_server import GOOGLE_TOOL_NAMES
 from anna.tools.self_edit_server import SELF_EDIT_TOOL_NAMES
 
 
 CONV_KEY = "slack:dm:UTEST"
 
 
-def _make_worker(tmp_path: Path) -> ConversationWorker:
+def _make_worker(tmp_path: Path, *, with_google: bool = False) -> ConversationWorker:
     cfg = AnnaConfig()
     object.__setattr__(cfg, "anna_home", tmp_path / "anna_home")
     cfg.vault.path = str(tmp_path / "vault")
@@ -34,23 +36,68 @@ def _make_worker(tmp_path: Path) -> ConversationWorker:
     async def _noop_send(_msg):
         return None
 
+    google_clients = None
+    if with_google:
+        cfg.google.enabled = True
+        cfg.google.accounts.append(
+            GoogleAccountConfig(
+                slug="personal_main",
+                email="x@y.com",
+                auth_type="oauth",
+                credentials_file="state/google/oauth_client.json",
+            )
+        )
+        # Use the real GoogleClients; nothing in _build_options touches it
+        # until the SDK actually invokes a tool, so we don't need a fake.
+        from anna.tools.google_clients import GoogleClients
+        google_clients = GoogleClients(config=cfg)
+
     return ConversationWorker(
         conversation_key=CONV_KEY,
         transport="slack",
         config=cfg,
         supervisor=supervisor,
         send=_noop_send,
+        google_clients=google_clients,
     )
 
 
-def test_build_options_includes_default_fs_and_mcp_tools(tmp_path: Path) -> None:
+def test_build_options_includes_default_fs_and_self_edit_tools(tmp_path: Path) -> None:
     worker = _make_worker(tmp_path)
     options = worker._build_options()
 
     expected = list(_DEFAULT_FS_TOOLS) + [
-        f"{_MCP_TOOL_PREFIX}{name}" for name in SELF_EDIT_TOOL_NAMES
+        f"{_SELF_EDIT_PREFIX}{name}" for name in SELF_EDIT_TOOL_NAMES
     ]
     assert sorted(options.allowed_tools) == sorted(expected)
+    # Without google_clients the google server must not be mounted.
+    assert "anna_google" not in options.mcp_servers
+
+
+def test_build_options_mounts_google_server_when_enabled(tmp_path: Path) -> None:
+    worker = _make_worker(tmp_path, with_google=True)
+    options = worker._build_options()
+    expected = (
+        list(_DEFAULT_FS_TOOLS)
+        + [f"{_SELF_EDIT_PREFIX}{name}" for name in SELF_EDIT_TOOL_NAMES]
+        + [f"{_GOOGLE_PREFIX}{name}" for name in GOOGLE_TOOL_NAMES]
+    )
+    assert sorted(options.allowed_tools) == sorted(expected)
+    assert "anna_google" in options.mcp_servers
+    google_server = options.mcp_servers["anna_google"]
+    assert isinstance(google_server, dict)
+    assert google_server.get("type") == "sdk"
+
+
+def test_build_options_skips_google_when_enabled_false_but_clients_passed(tmp_path: Path) -> None:
+    """An operator may toggle google.enabled off without scrubbing the clients."""
+    worker = _make_worker(tmp_path, with_google=True)
+    # Now flip the config off after construction.
+    worker._config.google.enabled = False
+    options = worker._build_options()
+    assert "anna_google" not in options.mcp_servers
+    google_named = [t for t in options.allowed_tools if t.startswith(_GOOGLE_PREFIX)]
+    assert google_named == []
 
 
 def test_build_options_mounts_self_edit_mcp_server(tmp_path: Path) -> None:

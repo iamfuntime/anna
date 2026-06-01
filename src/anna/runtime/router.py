@@ -19,6 +19,7 @@ from anna.log import audit_event, get_logger, sweep_audit_retention, sweep_trans
 from anna.runtime.schedule_store import ScheduleStore
 from anna.runtime.supervisor import Supervisor
 from anna.runtime.worker import ConversationWorker
+from anna.tools.google_clients import GoogleClients
 from anna.transports.base import ChannelAdapter, InboundEvent, OutboundMessage
 
 
@@ -33,11 +34,13 @@ class ConversationRouter:
         supervisor: Supervisor,
         adapters: dict[str, ChannelAdapter],
         schedule_store: ScheduleStore | None = None,
+        google_clients: GoogleClients | None = None,
     ) -> None:
         self._config = config
         self._supervisor = supervisor
         self._adapters = adapters
         self._schedule_store = schedule_store
+        self._google_clients = google_clients
         self._log = get_logger("anna.router")
         self._workers: dict[str, ConversationWorker] = {}
         self._workers_lock = asyncio.Lock()
@@ -83,6 +86,7 @@ class ConversationRouter:
                 send=self._send_factory(event.transport),
                 on_idle_close=self._idle_close_callback,
                 schedule_store=self._schedule_store,
+                google_clients=self._google_clients,
             )
             await worker.start()
             self._workers[key] = worker

@@ -19,6 +19,7 @@ from anna.core.eviction import evict_if_over_cap
 from anna.core.identity import CORE_FILES, CoreFile, read_core_file
 from anna.log import audit_event, get_logger
 from anna.skills.registry import SkillRegistry
+from anna.tools.google_server import GOOGLE_TOOL_NAMES, GoogleTools, build_google_server
 from anna.tools.self_edit_server import SELF_EDIT_TOOL_NAMES, SelfEditTools, build_self_edit_server
 from anna.transports.base import InboundEvent, OutboundMessage
 from anna.vault.checkpoint import list_recent_checkpoints, write_checkpoint
@@ -26,19 +27,24 @@ from anna.vault.checkpoint import list_recent_checkpoints, write_checkpoint
 if TYPE_CHECKING:
     from anna.runtime.schedule_store import ScheduleStore
     from anna.runtime.supervisor import Supervisor
+    from anna.tools.google_clients import GoogleClients
 
 
 # Default file-system tools we hand to ANNA so she can read and write her
 # vault. Listed by their canonical SDK names. The MCP self-edit tools are
 # prefixed with ``mcp__anna_self_edit__`` per the SDK convention.
 _DEFAULT_FS_TOOLS: tuple[str, ...] = ("Read", "Write", "Edit", "Glob", "Grep")
-_MCP_TOOL_PREFIX = "mcp__anna_self_edit__"
+_SELF_EDIT_PREFIX = "mcp__anna_self_edit__"
+_GOOGLE_PREFIX = "mcp__anna_google__"
 
 
-def _allowed_tool_names() -> list[str]:
-    return list(_DEFAULT_FS_TOOLS) + [
-        f"{_MCP_TOOL_PREFIX}{name}" for name in SELF_EDIT_TOOL_NAMES
+def _allowed_tool_names(*, include_google: bool) -> list[str]:
+    names = list(_DEFAULT_FS_TOOLS) + [
+        f"{_SELF_EDIT_PREFIX}{name}" for name in SELF_EDIT_TOOL_NAMES
     ]
+    if include_google:
+        names.extend(f"{_GOOGLE_PREFIX}{name}" for name in GOOGLE_TOOL_NAMES)
+    return names
 
 
 SendCallback = Callable[[OutboundMessage], Awaitable[None]]
@@ -58,6 +64,7 @@ class ConversationWorker:
         send: SendCallback,
         on_idle_close: IdleCloseCallback | None = None,
         schedule_store: "ScheduleStore | None" = None,
+        google_clients: "GoogleClients | None" = None,
     ) -> None:
         self.conversation_key = conversation_key
         self.transport = transport
@@ -66,6 +73,7 @@ class ConversationWorker:
         self._send = send
         self._on_idle_close = on_idle_close
         self._schedule_store = schedule_store
+        self._google_clients = google_clients
         self._log = get_logger("anna.worker").bind(conv_key=conversation_key, channel=transport)
 
         self._queue: asyncio.Queue[InboundEvent] = asyncio.Queue(maxsize=128)
@@ -262,10 +270,28 @@ class ConversationWorker:
         # Build the self-edit MCP server. The conv_key is captured by the
         # tool closures so each audit event is stamped with the right caller.
         self_edit_tools = self._build_self_edit_tools()
-        mcp_server = build_self_edit_server(
+        self_edit_server = build_self_edit_server(
             tools=self_edit_tools,
             conv_key=self.conversation_key,
         )
+
+        # Build the Google MCP server iff google integration is wired up
+        # and the runtime gave us a GoogleClients handle. Workers spawned
+        # in unit tests (no clients passed) and runs with google.enabled
+        # false both fall through without the server.
+        mcp_servers: dict[str, Any] = {"anna_self_edit": self_edit_server}
+        include_google = False
+        if self._google_clients is not None and self._config.google.enabled:
+            google_tools = GoogleTools(
+                config=self._config,
+                clients=self._google_clients,
+            )
+            google_server = build_google_server(
+                tools=google_tools,
+                conv_key=self.conversation_key,
+            )
+            mcp_servers["anna_google"] = google_server
+            include_google = True
 
         # Ensure the vault root exists before the SDK process tries to cd
         # into it; otherwise the first tool call fails with ENOENT.
@@ -289,14 +315,15 @@ class ConversationWorker:
             # waiting for an OK that never comes. The config default is
             # bypassPermissions; tighten in anna.yaml if needed.
             permission_mode=self._config.runtime.permission_mode,
-            # In-process self-edit server. The dict key becomes the MCP
-            # server prefix in the SDK's allowed_tools naming convention
-            # (``mcp__<server>__<tool>``).
-            mcp_servers={"anna_self_edit": mcp_server},
-            # Allow the default filesystem tools so ANNA can browse and write
-            # her vault, plus the seven MCP tools the self-edit server
-            # exposes for core-file and persona mutations.
-            allowed_tools=_allowed_tool_names(),
+            # In-process MCP servers. Dict keys become the MCP server
+            # prefixes in the SDK's allowed_tools naming convention
+            # (``mcp__<server>__<tool>``). anna_self_edit is always
+            # mounted; anna_google only when google.enabled and the
+            # runtime provided a GoogleClients handle.
+            mcp_servers=mcp_servers,
+            # Allow the default filesystem tools, the self-edit MCP tools,
+            # and (when wired) the google MCP tools.
+            allowed_tools=_allowed_tool_names(include_google=include_google),
             # Vault root is the natural cwd: vault paths become relative
             # (Conversations/foo.md instead of long absolutes).
             cwd=str(vault_root),
