@@ -207,6 +207,19 @@ def _print_tool_indicator(name: str) -> None:
     print_formatted_text(FormattedText([("ansigray", label)]))
 
 
+def _print_thinking() -> None:
+    """Print a transient ``[thinking…]`` marker while the SDK warms up.
+
+    The line is printed plain (no spinner in v1 per the plan); the next
+    ``delta`` frame or a ``thinking_done`` flips the in-loop flag so the
+    handler knows the line is already on screen and can skip re-printing
+    it. Rendering on top of the existing line is fine — prompt_toolkit's
+    ``print_formatted_text`` cooperates with the redraw and the operator
+    sees the deltas (or the next prompt) underneath.
+    """
+    print_formatted_text(FormattedText([("ansigray", "[thinking…]")]))
+
+
 def _print_error(message: str) -> None:
     """Print a daemon-reported error in red on stderr."""
     print_formatted_text(
@@ -236,6 +249,15 @@ async def _render_inbound(
     On EOF or external stop, ``stop_event`` is left set so the outer
     coroutine knows to tear down the writer side.
     """
+    # Tracks whether a ``[thinking…]`` line is currently visible. Set on the
+    # ``thinking`` frame and cleared by either ``thinking_done`` or the first
+    # ``delta`` of the turn (whichever arrives first). The plan accepts a
+    # simple "let the next delta overwrite it" — there is no explicit erase;
+    # prompt_toolkit's redraw cooperates with subsequent output. The flag is
+    # primarily a state marker so we don't re-emit the line if multiple
+    # ``thinking`` frames arrive in sequence.
+    thinking_active = False
+
     while not stop_event.is_set():
         try:
             frame = await _read_one_frame(reader)
@@ -252,17 +274,34 @@ async def _render_inbound(
 
         frame_type = frame.get("type")
         if frame_type == "delta":
+            # First delta of the turn implicitly clears the thinking line.
+            # Per the plan this handles the case where the SDK starts
+            # streaming before ``thinking_done`` arrives.
+            thinking_active = False
             text = frame.get("text", "")
             if text:
                 await run_in_terminal(lambda t=text: _print_delta(t))
         elif frame_type == "tool_call":
             name = frame.get("name", "<unknown>")
             await run_in_terminal(lambda n=name: _print_tool_indicator(n))
+        elif frame_type == "thinking":
+            # Mid-prompt "working" marker before the first delta. Idempotent —
+            # if a thinking line is already on screen, don't reprint.
+            if not thinking_active:
+                thinking_active = True
+                await run_in_terminal(_print_thinking)
+        elif frame_type == "thinking_done":
+            # Worker finished; let the next output (delta or new prompt)
+            # overwrite the marker. No explicit erase needed.
+            thinking_active = False
         elif frame_type == "final_text":
             # The TUI already showed everything via deltas; ignore the
             # buffered final text. The audit transcript still records it.
             continue
         elif frame_type == "end_of_turn":
+            # Defensive: a turn that ends without any delta still clears any
+            # stale thinking marker before the prompt redraws.
+            thinking_active = False
             await run_in_terminal(_print_end_of_turn)
         elif frame_type == "error":
             message = frame.get("message", "<unknown error>")

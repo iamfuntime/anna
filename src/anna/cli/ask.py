@@ -198,6 +198,18 @@ async def _stream_response(reader: asyncio.StreamReader) -> int:
             name = frame.get("name", "?")
             sys.stderr.write(f"[tool: {name}]\n")
             sys.stderr.flush()
+        elif frame_type == "thinking":
+            # Lower-fidelity "working" marker for the one-shot client. Goes
+            # to stderr so the captured stdout stays clean for scripting
+            # (``anna ask ... > out.txt``). No erase logic: stderr/stdout
+            # interleaving in a terminal handles itself, and the marker is
+            # a transient operator-facing hint.
+            sys.stderr.write("[thinking…]\n")
+            sys.stderr.flush()
+        elif frame_type == "thinking_done":
+            # Nothing to do — the stderr line stays as a transient marker
+            # and the next delta on stdout flows beneath it.
+            continue
         elif frame_type == "final_text":
             # The daemon emits final_text + end_of_turn after the
             # streaming deltas to preserve audit-trail parity with
