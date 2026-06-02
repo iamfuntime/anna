@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+
+{% block title %}Secrets — ANNA Dashboard{% endblock %}
+
+{% block content %}
+  <h1>Secrets</h1>
+  <p>
+    Values are stored in <code>$ANNA_HOME/.env</code>. Documented variables
+    are listed first; extras are added below.
+  </p>
+
+  <h2>Documented</h2>
+  <table>
+    <thead>
+      <tr><th>Variable</th><th>Value</th></tr>
+    </thead>
+    <tbody id="documented-rows">
+      {% for row in documented_rows %}
+        {% with var=row.var, has_value=row.has_value, value=row.value, is_extra=row.is_extra %}
+          {% include "env_row.html" %}
+        {% endwith %}
+      {% endfor %}
+    </tbody>
+  </table>
+
+  <h2>Extras</h2>
+  <table>
+    <thead>
+      <tr><th>Variable</th><th>Value</th></tr>
+    </thead>
+    <tbody id="extra-rows">
+      {% for row in extra_rows %}
+        {% with var=row.var, has_value=row.has_value, value=row.value, is_extra=row.is_extra %}
+          {% include "env_row.html" %}
+        {% endwith %}
+      {% endfor %}
+    </tbody>
+  </table>
+
+  <h3>Add extra variable</h3>
+  <form
+    hx-post="/env"
+    hx-target="#extra-rows"
+    hx-swap="beforeend"
+  >
+    <label>
+      Key
+      <input type="text" name="key" placeholder="CUSTOM_KEY" required>
+    </label>
+    <label>
+      Value
+      <input type="password" name="value">
+    </label>
+    <label>
+      <input type="checkbox" name="is_extra" value="true" checked>
+      Add as extra (allow_unknown)
+    </label>
+    <button type="submit">add</button>
+  </form>
+{% endblock %}

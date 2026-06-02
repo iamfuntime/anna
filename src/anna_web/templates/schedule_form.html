@@ -1,0 +1,143 @@
+{% extends "base.html" %}
+
+{% block title %}
+  {% if mode == "edit" %}Edit schedule {{ values.id }}{% else %}New schedule{% endif %} — ANNA Dashboard
+{% endblock %}
+
+{% block content %}
+  <header>
+    <h1>
+      {% if mode == "edit" %}Edit schedule <code>{{ values.id }}</code>{% else %}New schedule{% endif %}
+    </h1>
+    <p><a href="/schedules">&larr; back to schedules</a></p>
+  </header>
+
+  {% if errors.get("__all__") %}
+    <article class="form-error" role="alert">{{ errors["__all__"] }}</article>
+  {% endif %}
+
+  <form
+    {% if mode == "edit" %}
+      hx-put="/schedules/{{ values.id }}"
+      method="post"
+      action="/schedules/{{ values.id }}"
+    {% else %}
+      hx-post="/schedules"
+      method="post"
+      action="/schedules"
+    {% endif %}
+    hx-swap="outerHTML"
+  >
+    <label for="schedule-id">
+      ID
+      <input
+        type="text"
+        id="schedule-id"
+        name="id"
+        value="{{ values.id }}"
+        {% if mode == "edit" %}readonly{% endif %}
+        required
+      >
+      {% if errors.get("id") %}<small class="field-error">{{ errors["id"] }}</small>{% endif %}
+    </label>
+
+    <label for="schedule-prompt">
+      Prompt
+      <textarea id="schedule-prompt" name="prompt" rows="4" required>{{ values.prompt }}</textarea>
+      {% if errors.get("prompt") %}<small class="field-error">{{ errors["prompt"] }}</small>{% endif %}
+    </label>
+
+    <fieldset>
+      <legend>Destination</legend>
+      <label for="destination-transport">
+        Transport
+        <select id="destination-transport" name="destination_transport" required>
+          {% for t in ["slack", "telegram"] %}
+            <option value="{{ t }}" {% if values.destination_transport == t %}selected{% endif %}>{{ t }}</option>
+          {% endfor %}
+        </select>
+        {% if errors.get("destination_transport") %}<small class="field-error">{{ errors["destination_transport"] }}</small>{% endif %}
+      </label>
+      <label for="destination-channel">
+        Channel / chat ID
+        <input
+          type="text"
+          id="destination-channel"
+          name="destination_channel"
+          value="{{ values.destination_channel }}"
+          placeholder="C0AFD2LM38R or 993947726"
+          required
+        >
+        {% if errors.get("destination_channel") %}<small class="field-error">{{ errors["destination_channel"] }}</small>{% endif %}
+      </label>
+    </fieldset>
+
+    <fieldset>
+      <legend>Schedule</legend>
+      <small>Set the cron expression directly, or capture the operator's natural-language string alongside it for readability.</small>
+      <label for="schedule-cron">
+        Cron expression (5-field)
+        <input
+          type="text"
+          id="schedule-cron"
+          name="cron"
+          value="{{ values.cron }}"
+          placeholder="0 6 * * *"
+          required
+        >
+        {% if errors.get("cron") %}<small class="field-error">{{ errors["cron"] }}</small>{% endif %}
+      </label>
+      <label for="schedule-natural-language">
+        Natural-language description (optional)
+        <input
+          type="text"
+          id="schedule-natural-language"
+          name="natural_language"
+          value="{{ values.natural_language }}"
+          placeholder="every weekday at 6am"
+        >
+      </label>
+    </fieldset>
+
+    <label for="schedule-timezone">
+      Timezone
+      <input
+        type="text"
+        id="schedule-timezone"
+        name="timezone"
+        value="{{ values.timezone }}"
+        placeholder="America/New_York"
+        required
+      >
+      {% if errors.get("timezone") %}<small class="field-error">{{ errors["timezone"] }}</small>{% endif %}
+    </label>
+
+    <label for="schedule-timeout">
+      Timeout (seconds)
+      <input
+        type="number"
+        id="schedule-timeout"
+        name="timeout_seconds"
+        value="{{ values.timeout_seconds }}"
+        min="1"
+        required
+      >
+      {% if errors.get("timeout_seconds") %}<small class="field-error">{{ errors["timeout_seconds"] }}</small>{% endif %}
+    </label>
+
+    <label for="schedule-enabled">
+      <input
+        type="checkbox"
+        id="schedule-enabled"
+        name="enabled"
+        value="on"
+        {% if values.enabled %}checked{% endif %}
+      >
+      Enabled
+    </label>
+
+    <button type="submit">
+      {% if mode == "edit" %}Save changes{% else %}Create schedule{% endif %}
+    </button>
+  </form>
+{% endblock %}

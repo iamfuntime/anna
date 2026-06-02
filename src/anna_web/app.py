@@ -26,6 +26,10 @@ from fastapi.templating import Jinja2Templates
 
 from anna.config import AnnaConfig, load_config
 from anna.log import get_logger
+from anna_web.config_store import ConfigStore
+from anna_web.env_store import EnvStore
+from anna_web.routes import config_routes, env_routes, schedule_routes
+from anna_web.schedule_store_adapter import ScheduleStoreAdapter
 
 _STATIC_DIR = Path(__file__).parent / "static"
 _TEMPLATES_DIR = Path(__file__).parent / "templates"
@@ -61,10 +65,16 @@ def create_app(cfg: AnnaConfig) -> FastAPI:
     # individual store subtasks land. Scaffolded as a dict so the
     # accessor pattern is stable even with placeholder values.
     app.state.cfg = cfg
+    config_store = ConfigStore(anna_home=cfg.anna_home)
+    app.state.config_store = config_store
+    env_store = EnvStore(anna_home=cfg.anna_home)
+    app.state.env_store = env_store
+    schedule_store = ScheduleStoreAdapter(anna_home=cfg.anna_home, config=cfg)
+    app.state.schedule_store = schedule_store
     app.state.stores = {
-        "config_store": None,
-        "env_store": None,
-        "schedule_store": None,
+        "config_store": config_store,
+        "env_store": env_store,
+        "schedule_store": schedule_store,
         "restart_manager": None,
     }
 
@@ -86,6 +96,10 @@ def create_app(cfg: AnnaConfig) -> FastAPI:
     @app.get("/")
     async def _index(request: Request) -> Response:
         return templates.TemplateResponse(request, "index.html")
+
+    app.include_router(config_routes.router)
+    app.include_router(env_routes.router)
+    app.include_router(schedule_routes.router)
 
     return app
 

@@ -1,0 +1,109 @@
+{# Render one FormField. Dispatches on field.kind. Included recursively
+   from config_section.html and from inside FIELDSET / REPEATED_FIELDSET
+   branches below.
+
+   Context required:
+     field   — the anna_web.schema.FormField
+     errors  — dict[path -> message] (may be empty)
+#}
+{% set kind = field.kind.value %}
+
+{% if kind == "fieldset" %}
+  <fieldset>
+    <legend>{{ field.label }}</legend>
+    {% if field.description %}<small>{{ field.description }}</small>{% endif %}
+    {% for child in field.children %}
+      {% with field=child, errors=errors %}
+        {% include "config_field.html" %}
+      {% endwith %}
+    {% endfor %}
+  </fieldset>
+
+{% elif kind == "repeated_fieldset" %}
+  <fieldset>
+    <legend>{{ field.label }}</legend>
+    {% if field.description %}<small>{{ field.description }}</small>{% endif %}
+    {% for row in field.children %}
+      <fieldset class="repeated-row">
+        <legend>{{ row.label }}</legend>
+        {% for child in row.children %}
+          {% with field=child, errors=errors %}
+            {% include "config_field.html" %}
+          {% endwith %}
+        {% endfor %}
+      </fieldset>
+    {% endfor %}
+    {# TODO(subtask >7 UX pass): HTMX wiring for dynamic "+ add item".
+       For now the button is a data-attr placeholder so the layout
+       lands and the UX hook is documented in the markup. #}
+    <button type="button"
+            class="secondary"
+            data-action="add-fieldset"
+            data-path="{{ field.path }}"
+            disabled>+ add {{ field.label|lower }}</button>
+  </fieldset>
+
+{% elif kind == "repeated_text" %}
+  <label for="{{ field.path }}">{{ field.label }}</label>
+  {% if field.description %}<small>{{ field.description }}</small>{% endif %}
+  {% for item in field.value or [] %}
+    <input type="text" name="{{ field.path }}[]" value="{{ item }}">
+  {% endfor %}
+  {# Always render one empty row so a section that arrived empty still
+     has somewhere for the operator to type a first entry. #}
+  {% if not field.value %}
+    <input type="text" name="{{ field.path }}[]" value="">
+  {% endif %}
+  {# TODO(subtask >7 UX pass): HTMX wiring for dynamic "+ add row". #}
+  <button type="button"
+          class="secondary"
+          data-action="add-row"
+          data-path="{{ field.path }}"
+          disabled>+ add row</button>
+  <small class="error" data-field="{{ field.path }}">{% if errors and errors.get(field.path) %}{{ errors.get(field.path) }}{% endif %}</small>
+
+{% elif kind == "select" %}
+  <label for="{{ field.path }}">{{ field.label }}</label>
+  {% if field.description %}<small>{{ field.description }}</small>{% endif %}
+  <select id="{{ field.path }}" name="{{ field.path }}">
+    {% for opt in field.options %}
+      <option value="{{ opt }}"{% if opt == (field.value|string) %} selected{% endif %}>{{ opt }}</option>
+    {% endfor %}
+  </select>
+  <small class="error" data-field="{{ field.path }}">{% if errors and errors.get(field.path) %}{{ errors.get(field.path) }}{% endif %}</small>
+
+{% elif kind == "checkbox" %}
+  <label>
+    <input type="checkbox" name="{{ field.path }}"{% if field.value %} checked{% endif %}>
+    {{ field.label }}
+  </label>
+  {% if field.description %}<small>{{ field.description }}</small>{% endif %}
+  <small class="error" data-field="{{ field.path }}">{% if errors and errors.get(field.path) %}{{ errors.get(field.path) }}{% endif %}</small>
+
+{% elif kind == "number" %}
+  <label for="{{ field.path }}">{{ field.label }}</label>
+  {% if field.description %}<small>{{ field.description }}</small>{% endif %}
+  <input type="number"
+         id="{{ field.path }}"
+         name="{{ field.path }}"
+         value="{{ field.value if field.value is not none else '' }}"
+         {% if field.required %}required{% endif %}>
+  <small class="error" data-field="{{ field.path }}">{% if errors and errors.get(field.path) %}{{ errors.get(field.path) }}{% endif %}</small>
+
+{% elif kind == "textarea" %}
+  <label for="{{ field.path }}">{{ field.label }}</label>
+  {% if field.description %}<small>{{ field.description }}</small>{% endif %}
+  <textarea id="{{ field.path }}" name="{{ field.path }}"{% if field.required %} required{% endif %}>{{ field.value or '' }}</textarea>
+  <small class="error" data-field="{{ field.path }}">{% if errors and errors.get(field.path) %}{{ errors.get(field.path) }}{% endif %}</small>
+
+{% else %}
+  {# TEXT and any unknown-kind fallback. #}
+  <label for="{{ field.path }}">{{ field.label }}</label>
+  {% if field.description %}<small>{{ field.description }}</small>{% endif %}
+  <input type="text"
+         id="{{ field.path }}"
+         name="{{ field.path }}"
+         value="{{ field.value if field.value is not none else '' }}"
+         {% if field.required %}required{% endif %}>
+  <small class="error" data-field="{{ field.path }}">{% if errors and errors.get(field.path) %}{{ errors.get(field.path) }}{% endif %}</small>
+{% endif %}

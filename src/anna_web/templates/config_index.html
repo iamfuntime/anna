@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+
+{% block title %}Config — ANNA Dashboard{% endblock %}
+
+{% block content %}
+  <h1>Config</h1>
+  <p>Every top-level block in <code>anna.yaml</code>. Click a section to edit its fields.</p>
+  <div class="grid">
+    {% for section in sections %}
+      <article>
+        <header>
+          <strong><a href="/config/{{ section.name }}">{{ section.label }}</a></strong>
+        </header>
+        <small>{{ section.hint }}</small>
+      </article>
+    {% endfor %}
+  </div>
+  <p><small>Changes take effect after <code>systemctl --user restart anna</code>.</small></p>
+{% endblock %}

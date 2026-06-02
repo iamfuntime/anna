@@ -1,0 +1,65 @@
+{# Partial — one row of the .env editor.
+   Context:
+     var       — DocumentedVar or _ExtraVar; reads name, label, kind, description
+     has_value — bool, whether a value is currently set on disk
+     value     — str, the actual value (only ever non-empty for documented text vars)
+     is_extra  — bool, whether this row is a non-documented extra (default false)
+
+   The masked-input shape (data-env-input + data-env-key on the show button)
+   matches what static/app.js wires up for the reveal toggle.
+#}
+<tr id="env-row-{{ var.name }}">
+  <td>
+    <label for="env-{{ var.name }}">{{ var.label }}</label>
+    {% if var.description %}
+      <br><small>{{ var.description }}</small>
+    {% endif %}
+  </td>
+  <td>
+    <form>
+      <input type="hidden" name="key" value="{{ var.name }}">
+      {% if is_extra %}
+        <input type="hidden" name="is_extra" value="true">
+      {% endif %}
+      {% if var.kind == "text" %}
+        <input
+          type="text"
+          id="env-{{ var.name }}"
+          name="value"
+          value="{{ value }}"
+        >
+      {% else %}
+        <span class="masked-input">
+          <input
+            type="password"
+            id="env-{{ var.name }}"
+            name="value"
+            value=""
+            data-has-value="{{ 'true' if has_value else 'false' }}"
+            data-env-input="{{ var.name }}"
+          >
+          <button
+            type="button"
+            class="reveal-toggle"
+            data-env-key="{{ var.name }}"
+          >show</button>
+        </span>
+      {% endif %}
+      <button
+        type="submit"
+        hx-post="/env"
+        hx-target="closest tr"
+        hx-swap="outerHTML"
+      >save</button>
+      {% if is_extra %}
+        <button
+          type="button"
+          hx-delete="/env/{{ var.name }}"
+          hx-target="closest tr"
+          hx-swap="delete"
+          hx-confirm="Remove {{ var.name }}?"
+        >remove</button>
+      {% endif %}
+    </form>
+  </td>
+</tr>

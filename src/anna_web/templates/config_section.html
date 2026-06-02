@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+
+{% block title %}{{ section_label }} — ANNA Dashboard{% endblock %}
+
+{% block content %}
+  <h1>{{ section_label }}</h1>
+  {% if field.description %}
+    <p>{{ field.description }}</p>
+  {% endif %}
+
+  {% if toast %}
+    {% with level=toast.level, message=toast.message %}
+      {% include "_toast.html" %}
+    {% endwith %}
+  {% endif %}
+
+  <form hx-post="/config/{{ section }}"
+        hx-target="this"
+        hx-swap="outerHTML"
+        method="post"
+        action="/config/{{ section }}">
+    {% if field.kind.value == "fieldset" %}
+      {# Standard nested-model section: render each child row. #}
+      {% for child in field.children %}
+        {% with field=child, errors=errors %}
+          {% include "config_field.html" %}
+        {% endwith %}
+      {% endfor %}
+    {% elif field.kind.value == "repeated_fieldset" %}
+      {# Top-level list-of-models (identities). Render the whole row directly. #}
+      {% with field=field, errors=errors %}
+        {% include "config_field.html" %}
+      {% endwith %}
+    {% else %}
+      {# Scalar top-level (none today, but defensive). #}
+      {% with field=field, errors=errors %}
+        {% include "config_field.html" %}
+      {% endwith %}
+    {% endif %}
+
+    <button type="submit">Save</button>
+  </form>
+{% endblock %}

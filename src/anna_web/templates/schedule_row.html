@@ -1,0 +1,37 @@
+{# One <tr> for a Schedule. Used both inside schedule_list.html and as an
+   HTMX swap target for create / update. The id on the row lets HTMX find
+   and replace it; ``s`` is the Schedule passed by the parent context. #}
+<tr id="schedule-row-{{ s.id }}">
+  <td><code>{{ s.id }}</code></td>
+  <td><code>{{ s.cron }}</code></td>
+  <td>{{ s.natural_language or "" }}</td>
+  <td>{{ s.destination.transport }}:{{ s.destination.channel }}</td>
+  <td>
+    {% if s.enabled %}
+      <span class="badge badge-enabled">enabled</span>
+    {% else %}
+      <span class="badge badge-disabled">disabled</span>
+    {% endif %}
+  </td>
+  <td>
+    {% if s.state.last_status == "complete" %}
+      <span class="badge badge-ok">ok</span>
+    {% elif s.state.last_status in ("fail", "timeout") %}
+      <span class="badge badge-fail">{{ s.state.last_status }}</span>
+    {% else %}
+      <span class="muted">never</span>
+    {% endif %}
+  </td>
+  <td>{{ s.state.consecutive_failures }}</td>
+  <td>
+    <a href="/schedules/{{ s.id }}/edit" role="button" class="secondary">Edit</a>
+    <button
+      type="button"
+      class="secondary"
+      hx-delete="/schedules/{{ s.id }}"
+      hx-target="#schedule-row-{{ s.id }}"
+      hx-swap="delete"
+      hx-confirm="Delete schedule {{ s.id }}?"
+    >Delete</button>
+  </td>
+</tr>
