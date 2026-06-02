@@ -18,7 +18,10 @@ Three routes:
   re-rendered, errors mapped onto the offending inputs by dotted
   ``loc`` path.
 
-Same-origin enforcement lands in subtask 12.
+Same-origin enforcement is wired in :func:`anna_web.app.create_app`
+via :class:`anna_web.middleware.SameOriginMiddleware`; mutating
+requests without a matching ``Origin`` header are 403'd before they
+reach the handlers in this module.
 """
 
 from __future__ import annotations
@@ -30,6 +33,7 @@ from fastapi.responses import HTMLResponse, Response
 from pydantic import ValidationError
 
 from anna.config import AnnaConfig
+from anna_web import audit as web_audit
 from anna_web.schema import FieldKind, FormField, describe
 
 
@@ -148,8 +152,7 @@ async def post_config_section(request: Request, section: str) -> Response:
     handing off to
     :meth:`anna_web.config_store.ConfigStore.write_section`.
 
-    NOTE: same-origin enforcement lands in subtask 12. For now this
-    endpoint accepts POSTs without any CSRF / Origin check.
+    Same-origin enforcement runs in middleware ahead of this handler.
     """
     if section not in _allowed_sections():
         raise HTTPException(status_code=404, detail=f"unknown section: {section}")
@@ -182,6 +185,17 @@ async def post_config_section(request: Request, section: str) -> Response:
         # data-field="..."> slots key on. The first loc segment is the
         # section name; everything after is the in-section path.
         errors = _errors_by_path(section, exc)
+        # Audit the failed validation so the operator can see which
+        # section was poked and which field paths tripped. Pydantic
+        # error messages are not secrets; we surface the dotted paths
+        # only (no submitted values) so the audit row doesn't leak
+        # whatever the operator typed into the form.
+        web_audit.emit(
+            "config_validate_failed",
+            request=request,
+            section=section,
+            errors=sorted(errors.keys()),
+        )
         # Re-describe with the *attempted* values so the operator sees
         # what they submitted, not the on-disk values. The simplest
         # way to do that is to model_validate the section payload on
@@ -230,6 +244,17 @@ async def post_config_section(request: Request, section: str) -> Response:
     # filled defaults). HTMX swaps the form's outerHTML with this
     # response.
     new_field = _section_field(new_cfg, section)
+    # Audit the successful write. Only the section name lands in the
+    # payload — never the submitted values (a config section is a
+    # mix of innocuous fields and credential fragments and we have no
+    # clean per-field classifier; the audit row pairs with a
+    # config_store-side commit on the YAML to reconstruct the change
+    # if needed).
+    web_audit.emit(
+        "config_write",
+        request=request,
+        section=section,
+    )
     ctx = {
         "section": section,
         "section_label": _humanize(section),

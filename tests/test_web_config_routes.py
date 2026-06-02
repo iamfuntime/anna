@@ -250,3 +250,68 @@ def test_post_config_web_unchecked_checkbox_writes_false(
     # ruamel writes booleans as ``true``/``false`` (lowercase). The
     # web block should now show enabled: false.
     assert "enabled: false" in after
+
+
+# ---------------------------------------------------------------------------
+# Canary: config_write audit payload never contains the submitted value.
+# ---------------------------------------------------------------------------
+
+
+def test_config_write_audit_payload_never_contains_value(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Section name is allowed in the audit row; submitted values are not.
+
+    Captures every audit_event call into a list, posts a canary value
+    against a config field, and asserts the canary string never appears
+    in any captured payload. The route is allowed to log ``section=web``
+    but must not pass through ``web.host`` or any other field value.
+    """
+    from anna_web import audit as web_audit
+
+    canary = "10.0.0.1-canary-do-not-leak"
+    captured: list[dict] = []
+
+    def _capture(name: str, **kwargs: object) -> None:
+        captured.append({"name": name, **kwargs})
+
+    monkeypatch.setattr(web_audit, "audit_event", _capture)
+
+    response = client.post(
+        "/config/web",
+        data={
+            "web.enabled": "on",
+            "web.host": canary,
+            "web.port": "9000",
+            "web.target_unit": "anna.service",
+        },
+    )
+    # Pydantic's IPvAnyAddress validation isn't enforced on web.host
+    # (it's a plain str), so this should land as a successful write.
+    # If a future schema tightens the type, the audit emit still fires
+    # from the validate-failure branch — either way, no canary in the
+    # captured payload.
+    assert response.status_code in (200, 422), response.text
+
+    config_events = [e for e in captured if "config" in e["name"]]
+    assert config_events, "no config-related audit events were emitted"
+    # Section name should appear (intentional — operator-readable).
+    assert any(e.get("section") == "web" for e in config_events)
+
+    # Load-bearing assertion: walk every captured event and verify the
+    # canary string is absent everywhere.
+    def _has_canary(obj: object) -> bool:
+        if isinstance(obj, str):
+            return canary in obj
+        if isinstance(obj, dict):
+            return any(_has_canary(v) for v in obj.values()) or any(
+                _has_canary(k) for k in obj.keys()
+            )
+        if isinstance(obj, (list, tuple, set)):
+            return any(_has_canary(v) for v in obj)
+        return canary in repr(obj)
+
+    for event in captured:
+        assert not _has_canary(event), (
+            f"config write value leaked into audit payload: {event!r}"
+        )

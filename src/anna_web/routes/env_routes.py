@@ -20,10 +20,11 @@ All four endpoints pull the :class:`anna_web.env_store.EnvStore`
 singleton off ``request.app.state.env_store`` — the factory in
 :mod:`anna_web.app` constructs it once per process.
 
-Audit-event emission for ``audit.web.dashboard.secret_*`` is OUT OF
-SCOPE for this subtask. Subtask 12 wires
-:func:`anna.log.audit_event` into the route layer; the ``actor``
-placeholders below are the seam those calls will hang off.
+Audit-event emission for ``audit.web.dashboard.secret_*`` is wired
+through :mod:`anna_web.audit`. The route handlers below pass the
+``key`` and request into the emit call; the audit wrapper drops any
+value-shaped field as a belt-and-suspenders guard against future
+regressions that might accidentally forward a secret value.
 
 See ``Inbox/2026-06-02-ANNA-Web-Dashboard-Plan.md``, "Architecture →
 EnvStore — secrets handling" and "HTMX patterns" for the full design.
@@ -35,6 +36,8 @@ from dataclasses import dataclass
 
 from fastapi import APIRouter, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse, Response
+
+from anna_web import audit as web_audit
 
 router = APIRouter(prefix="/env", tags=["env"])
 
@@ -169,16 +172,16 @@ async def reveal_env(key: str, request: Request) -> Response:
     documented and extra keys — the operator clicked reveal, they get
     the value if it exists. 404 if the key is unset.
 
-    NOTE: audit emit lands in subtask 12. When it does, this is the
-    seam — emit ``audit.web.dashboard.secret_reveal`` with the key
-    name and ``actor="operator"`` (NEVER the value).
+    Emits ``audit.web.dashboard.secret_reveal`` with the key name only —
+    NEVER the value. The audit row is the load-bearing "someone read
+    out the keys at 3am" trail; volume tradeoff is accepted per the
+    plan's Open Questions §5.
     """
     env_store = request.app.state.env_store
     value = env_store.get(key)
     if value is None:
         raise HTTPException(status_code=404, detail=f"unknown env key: {key!r}")
-    # actor placeholder; audit emit lands in subtask 12.
-    _actor = "operator"  # noqa: F841
+    web_audit.emit("secret_reveal", request=request, key=key)
     return PlainTextResponse(value)
 
 
@@ -206,13 +209,13 @@ async def post_env(
     library blow-up surfaces as an actionable message rather than a
     bare traceback in the operator's browser console.
 
-    NOTE: audit emit lands in subtask 12. ``audit.web.dashboard.secret_write``
-    fires here with key + actor + NEVER the value.
+    Emits ``audit.web.dashboard.secret_write`` on success with the key
+    name only — NEVER the value. The audit wrapper additionally strips
+    any value-shaped field name as a belt-and-suspenders defense
+    against future regressions.
     """
     env_store = request.app.state.env_store
     allow_unknown = _is_extra_truthy(is_extra)
-    # actor placeholder; audit emit lands in subtask 12.
-    _actor = "operator"  # noqa: F841
 
     try:
         env_store.set(key, value, allow_unknown=allow_unknown)
@@ -257,6 +260,10 @@ async def post_env(
         is_extra=is_extra_render,
     ).body.decode("utf-8")
     toast = _render_toast(request, "success", f"Saved {key}.")
+    # Audit the write *after* the row renders successfully so a render
+    # blow-up doesn't leave a phantom audit row claiming a successful
+    # write. Key name only — the value never leaves this stack frame.
+    web_audit.emit("secret_write", request=request, key=key)
     return HTMLResponse(row_html + toast)
 
 
@@ -270,13 +277,11 @@ async def delete_env(key: str, request: Request) -> Response:
     EnvStore's ``unset_key`` is a no-op when the key is absent so we
     don't need a pre-flight existence check.
 
-    NOTE: audit emit lands in subtask 12. ``audit.web.dashboard.secret_delete``
-    fires here with key + actor.
+    Emits ``audit.web.dashboard.secret_delete`` with the key name only.
     """
     env_store = request.app.state.env_store
-    # actor placeholder; audit emit lands in subtask 12.
-    _actor = "operator"  # noqa: F841
     env_store.delete(key, allow_unknown=True)
+    web_audit.emit("secret_delete", request=request, key=key)
     return Response(status_code=204)
 
 

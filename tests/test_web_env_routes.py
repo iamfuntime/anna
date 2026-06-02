@@ -241,16 +241,64 @@ def test_delete_removes_key(client: TestClient) -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skip(reason="audit wiring lands in subtask 12")
-def test_secret_post_audit_payload_never_contains_value() -> None:
-    """Placeholder for the cross-cutting secret-redaction obligation.
+def test_set_audit_payload_never_contains_value(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cross-cutting secret-redaction obligation for POST /env.
 
-    Subtask 12 wires audit_event into POST /env, DELETE /env, and
-    GET /env/{key}/reveal. When that lands this test must assert the
-    emitted audit record contains the key and actor but never the
-    value. Leaving the stub here keeps the obligation visible in the
-    suite's skip count instead of a TODO comment nobody greps for.
+    Monkey-patches ``anna_web.audit.audit_event`` (the underlying
+    writer the wrapper hands off to) so every audit call is captured
+    into a list. The handler is invoked with a canary secret value
+    that is highly unlikely to appear in any other field; we then
+    walk every captured event and assert the canary never appears
+    in any payload value.
+
+    Belt-and-suspenders: also verify the event name is
+    ``audit.web.dashboard.secret_write`` and the ``key`` field is the
+    submitted key. If the audit emit was silently dropped the event
+    list would be empty and the second assertion catches it.
     """
+    from anna_web import audit as web_audit
+
+    canary = "xoxb-canary-do-not-leak"
+    captured: list[dict] = []
+
+    def _capture(name: str, **kwargs: object) -> None:
+        captured.append({"name": name, **kwargs})
+
+    monkeypatch.setattr(web_audit, "audit_event", _capture)
+
+    response = client.post(
+        "/env",
+        data={"key": "SLACK_BOT_TOKEN", "value": canary},
+    )
+    assert response.status_code == 200, response.text
+
+    # Belt-and-suspenders: the secret_write event fired with the key.
+    secret_writes = [e for e in captured if e["name"].endswith("secret_write")]
+    assert secret_writes, "secret_write audit event was not emitted"
+    assert secret_writes[0]["name"] == "audit.web.dashboard.secret_write"
+    assert secret_writes[0].get("key") == "SLACK_BOT_TOKEN"
+
+    # Load-bearing assertion: the canary value never appears anywhere
+    # in any captured event payload. Walk every captured dict
+    # depth-first stringifying as we go so a nested structure (e.g.
+    # an exception repr that swept up the form body) still trips.
+    def _has_canary(obj: object) -> bool:
+        if isinstance(obj, str):
+            return canary in obj
+        if isinstance(obj, dict):
+            return any(_has_canary(v) for v in obj.values()) or any(
+                _has_canary(k) for k in obj.keys()
+            )
+        if isinstance(obj, (list, tuple, set)):
+            return any(_has_canary(v) for v in obj)
+        return canary in repr(obj)
+
+    for event in captured:
+        assert not _has_canary(event), (
+            f"secret value leaked into audit payload: {event!r}"
+        )
 
 
 # ---------------------------------------------------------------------------

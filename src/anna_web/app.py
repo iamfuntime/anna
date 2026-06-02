@@ -26,8 +26,10 @@ from fastapi.templating import Jinja2Templates
 
 from anna.config import AnnaConfig, load_config
 from anna.log import get_logger
+from anna_web import audit as web_audit
 from anna_web.config_store import ConfigStore
 from anna_web.env_store import EnvStore
+from anna_web.middleware import SameOriginMiddleware
 from anna_web.restart import RestartManager
 from anna_web.routes import (
     config_routes,
@@ -60,6 +62,14 @@ def create_app(cfg: AnnaConfig) -> FastAPI:
             yield
         finally:
             get_logger("anna.web").info("anna.web.dashboard.shutdown")
+            # Pair the operational log line with an audit row so the
+            # operator's audit-log review surfaces every clean shutdown
+            # alongside the startup row emitted by __main__.
+            try:
+                web_audit.emit("shutdown", cfg=cfg)
+            except Exception:  # pragma: no cover - defensive
+                # Never let an audit emit failure poison shutdown.
+                pass
 
     app = FastAPI(
         title="ANNA Dashboard",
@@ -111,6 +121,16 @@ def create_app(cfg: AnnaConfig) -> FastAPI:
     app.include_router(schedule_routes.router)
     app.include_router(healthz_routes.router)
     app.include_router(restart_routes.router)
+
+    # Same-origin middleware: rejects mutating requests whose Origin
+    # doesn't match the dashboard's bind address. Registered last so
+    # it runs first in the request pipeline (Starlette layers middleware
+    # in reverse-registration order). The healthz endpoint is GET-only
+    # and therefore unrestricted by the middleware itself.
+    app.add_middleware(
+        SameOriginMiddleware,
+        allowed_origin=f"http://{cfg.web.host}:{cfg.web.port}",
+    )
 
     return app
 

@@ -17,6 +17,7 @@ import sys
 
 from anna.config import _resolve_config_path, load_config
 from anna.log import configure_logging, get_logger
+from anna_web import audit as web_audit
 
 
 def main() -> int:
@@ -52,6 +53,25 @@ def main() -> int:
         anna_home=str(cfg.anna_home),
         config_path=str(config_path),
     )
+
+    # Pair the operational log line with an audit row so the operator
+    # can reconstruct dashboard boots from the audit JSONL alone. The
+    # lifespan handler in app.py owns the matching shutdown emit.
+    try:
+        web_audit.emit(
+            "boot",
+            cfg=cfg,
+            host=cfg.web.host,
+            port=cfg.web.port,
+        )
+    except Exception:  # pragma: no cover - defensive
+        # An audit-write failure must not prevent the dashboard from
+        # starting; the operational log line above is still in
+        # journald. anna.log.audit_event already mirrors to the
+        # operational stream + logs a CRITICAL on disk failure, so
+        # this guard exists only for the truly unreachable path
+        # (e.g. cfg.audit_dir computed wrong).
+        pass
 
     # Import lazily so a disabled-mode start does not pay the FastAPI
     # import cost (and so tests for the disabled branch can monkey-patch

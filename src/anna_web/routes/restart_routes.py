@@ -18,12 +18,11 @@ Three routes:
 * ``HEAD /restart`` is intentionally NOT exposed; the only safe verb is
   POST plus the GET-for-rehydration above.
 
-Audit-event emission for ``audit.web.dashboard.restart_request`` is OUT
-OF SCOPE for this subtask — subtask 12 wires
-:func:`anna.log.audit_event` in. Same-origin enforcement is also out
-of scope here; subtask 12 lands a request middleware that drops any
-non-GET whose ``Origin`` header doesn't match the bind address. The
-``actor`` placeholder below is the seam.
+Audit-event emission for ``audit.web.dashboard.restart_request`` is
+wired through :mod:`anna_web.audit`; the emit fires on the success
+path with the pinned unit name + dispatch method. Same-origin
+enforcement runs in :class:`anna_web.middleware.SameOriginMiddleware`
+ahead of this handler.
 
 The route NEVER accepts a unit name from the request body. The unit is
 pinned on the :class:`anna_web.restart.RestartManager` at construction
@@ -36,6 +35,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, Response
 
+from anna_web import audit as web_audit
 from anna_web.restart import RestartResult
 
 router = APIRouter(prefix="/restart", tags=["restart"])
@@ -127,18 +127,24 @@ async def post_restart(request: Request) -> Response:
     toast inline. HTMX leaves the button enabled so the operator can
     retry.
 
-    NOTE: ``audit.web.dashboard.restart_request`` is emitted in subtask
-    12. Same-origin middleware is also subtask 12. ``actor="operator"``
-    is the placeholder both will hang off.
+    Emits ``audit.web.dashboard.restart_request`` on the success path
+    with the pinned unit name and dispatch method (``dbus`` or
+    ``subprocess``). Failures land in the operational stream via
+    :mod:`anna_web.restart`; no audit row on failure because the
+    daemon was not actually mutated.
     """
-    _actor = "operator"  # noqa: F841 — audit hook seam for subtask 12.
-
     manager = request.app.state.restart_manager
     templates = request.app.state.templates
 
     result = await manager.restart()
 
     if result.ok:
+        web_audit.emit(
+            "restart_request",
+            request=request,
+            unit=manager.target_unit,
+            method=result.method,
+        )
         return templates.TemplateResponse(
             request,
             "restart_button.html",

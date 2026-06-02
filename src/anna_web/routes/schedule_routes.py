@@ -37,6 +37,7 @@ from pydantic import ValidationError
 
 from anna.runtime.schedule_store import ScheduleValidationError
 from anna.runtime.schedule_types import Schedule, ScheduleDestination
+from anna_web import audit as web_audit
 
 router = APIRouter(prefix="/schedules", tags=["schedules"])
 
@@ -291,6 +292,11 @@ async def create_schedule(
             request, "schedule_form.html", ctx, status_code=422
         )
 
+    web_audit.emit(
+        "schedule_create",
+        request=request,
+        schedule_id=created.id,
+    )
     return templates.TemplateResponse(
         request,
         "schedule_row.html",
@@ -371,6 +377,11 @@ async def update_schedule(
             request, "schedule_form.html", ctx, status_code=422
         )
 
+    web_audit.emit(
+        "schedule_update",
+        request=request,
+        schedule_id=schedule_id,
+    )
     return templates.TemplateResponse(
         request,
         "schedule_row.html",
@@ -389,4 +400,9 @@ async def delete_schedule(request: Request, schedule_id: str) -> Response:
         # Underlying store raises a validation error for missing id;
         # map to 404 to match REST expectations.
         raise HTTPException(status_code=404, detail=str(exc)) from None
+    web_audit.emit(
+        "schedule_delete",
+        request=request,
+        schedule_id=schedule_id,
+    )
     return Response(status_code=status.HTTP_204_NO_CONTENT)
