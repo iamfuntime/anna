@@ -19,6 +19,7 @@ class CoreFile(str, Enum):
     AGENTS = "AGENTS.md"
     MEMORY = "MEMORY.md"
     IDENTITY = "IDENTITY.md"
+    CADENCE = "CADENCE.md"
 
 
 @dataclass(frozen=True)
@@ -53,6 +54,11 @@ CORE_FILES: dict[CoreFile, CoreFileSpec] = {
         name="IDENTITY.md",
         token_cap=1000,
         purpose="Who ANNA is addressing right now and the active conversational frame.",
+    ),
+    CoreFile.CADENCE: CoreFileSpec(
+        name="CADENCE.md",
+        token_cap=1000,
+        purpose="Cadence rules for buffered transports — prepended to inbound text as a `<system-reminder>` block.",
     ),
 }
 
