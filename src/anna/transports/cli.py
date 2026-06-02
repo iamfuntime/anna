@@ -43,6 +43,7 @@ from anna.transports.base import (
     InboundEvent,
     InboundHandler,
     OutboundMessage,
+    SignalHandle,
 )
 from anna.transports.cli_server import ClientSession, UnixSocketServer
 
@@ -369,6 +370,89 @@ class CLIAdapter(ChannelAdapter):
             except Exception:
                 pass
             self._unregister(session)
+
+    # ------------------------------------------------------------------
+    # Visibility hooks (Cadence-Visibility plan subtask 10)
+    # ------------------------------------------------------------------
+
+    async def start_thinking_signal(
+        self, event: InboundEvent
+    ) -> SignalHandle | None:
+        """Write a ``{"type": "thinking"}`` frame to the session's writer.
+
+        Looks the session up by ``event.conversation_key`` against
+        ``self._sessions`` (covering both the per-transport key and any
+        identity-alias key the adapter registered at session-open). If
+        no session matches (e.g. the operator closed the TUI between
+        ``_dispatch_user_message`` and the worker reaching
+        ``start_thinking_signal``), this is a no-op — we log debug and
+        return ``None`` so the worker skips the corresponding clear.
+
+        Exception-isolated: any failure is logged at warning under
+        ``visibility.cli.start_failed`` and returns ``None``. Never
+        raises into the worker.
+        """
+        session = self._sessions.get(event.conversation_key)
+        if session is None:
+            self._log.debug(
+                "visibility.cli.start_no_session",
+                conv_key=event.conversation_key,
+            )
+            return None
+
+        try:
+            await UnixSocketServer.send_frame(
+                session.writer,
+                session.write_lock,
+                {"type": "thinking"},
+            )
+        except Exception as exc:
+            self._log.warning(
+                "visibility.cli.start_failed",
+                conv_key=event.conversation_key,
+                error=str(exc),
+            )
+            return None
+
+        return SignalHandle(
+            transport="cli",
+            conv_key=event.conversation_key,
+            cli_session_key=event.conversation_key,
+        )
+
+    async def clear_thinking_signal(self, handle: SignalHandle) -> None:
+        """Write a ``{"type": "thinking_done"}`` frame to the session.
+
+        Looks the session up by ``handle.cli_session_key``. If no
+        session matches (the TUI closed between start and clear), it's a
+        no-op — log debug and return.
+
+        Exception-isolated: any failure is logged at debug under
+        ``visibility.cli.clear_failed``. Never raises.
+        """
+        session_key = handle.cli_session_key
+        if session_key is None:
+            return
+        session = self._sessions.get(session_key)
+        if session is None:
+            self._log.debug(
+                "visibility.cli.clear_no_session",
+                conv_key=session_key,
+            )
+            return
+
+        try:
+            await UnixSocketServer.send_frame(
+                session.writer,
+                session.write_lock,
+                {"type": "thinking_done"},
+            )
+        except Exception as exc:
+            self._log.debug(
+                "visibility.cli.clear_failed",
+                conv_key=session_key,
+                error=str(exc),
+            )
 
     # ------------------------------------------------------------------
     # Subscribe
