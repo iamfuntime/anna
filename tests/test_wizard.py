@@ -81,6 +81,7 @@ def _telegram_inputs(short_name: str = "Tester", detail: str = "") -> str:
             "",            # duties
             "",            # out of scope
             "",            # tone
+            "",            # Disable web dashboard? -> default no (keep enabled)
             "",            # Write config and start ANNA? -> default yes
         ]
     ) + "\n"

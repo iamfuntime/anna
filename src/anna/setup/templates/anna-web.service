@@ -1,0 +1,70 @@
+[Unit]
+# Systemd user unit for the ANNA web dashboard.
+#
+# Bundled inside the anna wheel at anna.setup.templates.anna_web_service
+# and copied into ~/.config/systemd/user/anna-web.service by the setup
+# wizard. Manual install:
+#   uv tool install anna
+#   mkdir -p ~/.config/systemd/user
+#   uv tool run --from anna python -c "from importlib.resources import files; print(files('anna.setup.templates').joinpath('anna-web.service').read_text())" > ~/.config/systemd/user/anna-web.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now anna-web
+#
+# The dashboard is a small FastAPI app served on 127.0.0.1:8765 by
+# default. It edits anna.yaml / .env / schedules.yaml on disk and offers
+# a Restart button for the main anna.service. Audit trail lives in the
+# same audit/ directory the daemon writes to.
+Description=ANNA Web Dashboard
+Documentation=https://github.com/iamfuntime/anna
+After=network-online.target
+Wants=network-online.target
+
+# Note: NOT BindsTo=anna.service. The dashboard runs independently so it
+# survives a daemon crash — the operator can still open the UI to inspect
+# the config that broke things and click Restart once the fix is in.
+
+[Service]
+# Type=simple: uvicorn stays in the foreground; systemd treats the main
+# PID as the service. The dashboard does its own asyncio loop and never
+# forks worker processes.
+Type=simple
+
+# %h expands to the operator's home directory at unit-load time. Mirrors
+# the main anna.service: ~/anna is STATE-ONLY (anna.yaml, .env, audit/,
+# schedules.yaml). No source code, no venv.
+WorkingDirectory=%h/anna
+
+# The dashboard's config load is ANNA_HOME-anchored exactly like the
+# daemon's (see commit 09b1562). Without this the round-trip ConfigStore
+# would resolve anna.yaml against the wrong root.
+Environment=ANNA_HOME=%h/anna
+
+# Load secrets straight into the dashboard process. The web app itself
+# does not directly use most of these, but config validation paths
+# (e.g. ANTHROPIC_API_KEY checks in AuthConfig) read them at import
+# time, and the same posture as anna.service keeps the two units in
+# lockstep. The leading `-` makes the file optional so a fresh install
+# starts cleanly before .env exists.
+EnvironmentFile=-%h/anna/.env
+
+# uv-tool-managed shim. uv writes this script at install time; it
+# activates the managed venv's interpreter and execs the anna_web entry
+# point. Must be an absolute path — systemd does not expand $PATH.
+ExecStart=%h/.local/bin/anna-web
+
+# Restart on any non-clean exit. Ten seconds is enough cooldown to avoid
+# log-spam under a wedged-port or bad-config failure mode without
+# leaving the dashboard offline through a transient hiccup.
+Restart=on-failure
+RestartSec=10
+
+StandardOutput=journal
+StandardError=journal
+
+# Generous ceiling for a FastAPI app with three Pydantic stores. Trips
+# well before any runaway memory leak pages the operator's box.
+MemoryMax=512M
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

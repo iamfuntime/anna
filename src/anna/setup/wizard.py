@@ -73,6 +73,17 @@ class WizardState:
     anna_duties: str = ""
     anna_out_of_scope: str = ""
     anna_tone: str = ""
+    # Phase 2.5 web dashboard install posture. Default-on per the plan;
+    # the wizard offers an opt-out prompt and ``--disable-web`` flips the
+    # default for non-interactive installs. The unit file is *always*
+    # written to ~/.config/systemd/user/ regardless — only the
+    # systemctl enable/start step and the ``web.enabled`` field in
+    # anna.yaml respond to this flag, so flipping back later is a
+    # one-line YAML edit plus ``systemctl --user enable --now anna-web``.
+    web_enabled: bool = True
+    # When ``--disable-web``/``--enable-web`` is passed on the CLI the
+    # wizard skips the interactive prompt — the flag is the answer.
+    web_prompt_resolved: bool = False
     reconfigure: bool = False
     verbose: bool = False
     answers: dict[str, str] = field(default_factory=dict)
@@ -583,6 +594,37 @@ def _seed_claude_file(state: WizardState) -> None:
     path.write_text(frontmatter + "\n".join(body_lines), encoding="utf-8")
 
 
+def step_web_dashboard(state: WizardState) -> None:
+    """Ask the operator whether to keep the web dashboard enabled.
+
+    Default-on per the Phase 2.5 plan. The prompt is "Disable web
+    dashboard? [y/N]"; default ``n`` keeps it enabled. Skipped when
+    ``--enable-web`` or ``--disable-web`` was passed on the CLI — the
+    flag is the answer and the prompt would just re-ask. Either way,
+    the unit file lands on disk in the next step so the operator can
+    flip back later by toggling ``web.enabled`` in ``anna.yaml`` and
+    running ``systemctl --user enable --now anna-web``.
+    """
+    if state.web_prompt_resolved:
+        _emit_step(
+            state,
+            step="web.enabled",
+            answer=f"{state.web_enabled} (cli flag)",
+        )
+        return
+    click.secho("\nWeb dashboard", bold=True, fg="cyan")
+    click.echo(
+        "ANNA ships a localhost-only FastAPI dashboard on 127.0.0.1:8765.\n"
+        "It edits anna.yaml / .env / schedules.yaml through forms and offers a\n"
+        "one-button restart of the main service. The auth boundary is\n"
+        "127.0.0.1 + filesystem permissions; remote access is your\n"
+        "reverse-proxy problem (Caddy / Tailscale / SSH tunnel)."
+    )
+    disable = click.confirm("Disable web dashboard?", default=False)
+    state.web_enabled = not disable
+    _emit_step(state, step="web.enabled", answer=str(state.web_enabled))
+
+
 def step_final_wiring(state: WizardState) -> dict[str, Any] | None:
     """Write config, install + start the service, and probe real readiness.
 
@@ -600,7 +642,9 @@ def step_final_wiring(state: WizardState) -> dict[str, Any] | None:
     _write_anna_yaml(state, yaml_path)
     _emit_step(state, step="wiring.env_file_written", answer=str(env_path))
     _emit_step(state, step="wiring.anna_yaml_written", answer=str(yaml_path))
-    return _install_systemd_unit(state)
+    probe = _install_systemd_unit(state)
+    _install_web_unit(state)
+    return probe
 
 
 def _confirm_plan(state: WizardState) -> bool:
@@ -622,6 +666,8 @@ def _confirm_plan(state: WizardState) -> bool:
     click.echo(f"  Config      : {state.anna_home / 'anna.yaml'}")
     click.echo(f"  Secrets     : {state.anna_home / '.env'} (chmod 600)")
     click.echo(f"  Service     : systemd user unit 'anna', enabled + started now")
+    web_state = "enabled (127.0.0.1:8765)" if state.web_enabled else "disabled (unit installed but stopped)"
+    click.echo(f"  Web dashboard: {web_state}")
     return click.confirm("\nWrite config and start ANNA?", default=True)
 
 
@@ -656,6 +702,7 @@ def _write_anna_yaml(state: WizardState, path: Path) -> None:
     telegram_enabled = "true" if state.use_telegram else "false"
     slack_admin = state.slack_admin_channel or ""
     telegram_admin = state.telegram_admin_chat_id or ""
+    web_enabled_yaml = "true" if state.web_enabled else "false"
 
     body = f"""# ============================================================
 # ANNA configuration
@@ -730,6 +777,18 @@ admin:
   slack_channel_id: "{slack_admin}"
   telegram_chat_id: "{telegram_admin}"
   startup_alert: true
+
+# Phase 2.5 web dashboard. Localhost-only FastAPI app served by the
+# anna-web.service systemd user unit. Bind 127.0.0.1 + filesystem
+# permissions on .env are the entire auth boundary; remote access is
+# the operator's reverse-proxy problem. Flip `enabled: false` and
+# `systemctl --user disable --now anna-web` to turn it off without
+# uninstalling the unit.
+web:
+  enabled: {web_enabled_yaml}
+  host: 127.0.0.1
+  port: 8765
+  target_unit: anna.service
 """
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(body, encoding="utf-8")
@@ -761,6 +820,75 @@ def _install_systemd_unit(state: WizardState) -> dict[str, Any] | None:
 
     target.write_text(rendered, encoding="utf-8")
     return _start_and_probe(state)
+
+
+def _install_web_unit(state: WizardState) -> None:
+    """Copy ``anna-web.service`` into ~/.config/systemd/user/ and enable
+    or disable it per ``state.web_enabled``.
+
+    The unit file is *always* written, regardless of the enable/disable
+    choice. Disabling just means ``web.enabled: false`` in anna.yaml and
+    ``systemctl --user disable anna-web.service`` — flipping it back on
+    later is a one-line YAML edit plus
+    ``systemctl --user enable --now anna-web.service``, no second
+    template install required.
+
+    Failures degrade with a yellow warning rather than aborting the
+    wizard; the dashboard is optional surface and the daemon is the
+    load-bearing service.
+    """
+    target_dir = Path(os.path.expanduser("~/.config/systemd/user"))
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / "anna-web.service"
+    try:
+        template_resource = resources.files("anna.setup.templates").joinpath("anna-web.service")
+        rendered = template_resource.read_text(encoding="utf-8")
+    except (FileNotFoundError, ModuleNotFoundError):
+        click.secho(
+            "Warning: could not load packaged anna-web.service template. "
+            "Copy the unit manually if you want the web dashboard online.",
+            fg="yellow",
+        )
+        return
+
+    target.write_text(rendered, encoding="utf-8")
+    _emit_step(state, step="wiring.web_unit_written", answer=str(target))
+
+    if not shutil.which("systemctl"):
+        # WSL without systemd, macOS, etc. The file is on disk; the
+        # operator wires the service themselves.
+        return
+
+    # daemon-reload picks up the freshly-written unit. Best-effort: a
+    # warning here is fine, the next step will surface a real error if
+    # systemd is actually broken.
+    subprocess.run(
+        ["systemctl", "--user", "daemon-reload"],
+        capture_output=True,
+        text=True,
+    )
+
+    if state.web_enabled:
+        result = subprocess.run(
+            ["systemctl", "--user", "enable", "--now", "anna-web.service"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            click.secho(
+                f"Warning: enable + start of anna-web.service failed: "
+                f"{(result.stderr or '').strip()}",
+                fg="yellow",
+            )
+    else:
+        # Silently fail if it's already disabled — `disable` returns
+        # nonzero on a unit that was never enabled, and that's the
+        # expected state on a fresh install with --disable-web.
+        subprocess.run(
+            ["systemctl", "--user", "disable", "anna-web.service"],
+            capture_output=True,
+            text=True,
+        )
 
 
 def _now_journal_since() -> str:
@@ -967,6 +1095,13 @@ def _print_readiness_recap(state: WizardState, probe: dict[str, Any] | None) -> 
         "  Reconfigure : anna-setup --reconfigure\n"
         "  Edit persona: anna-persona"
     )
+    if state.web_enabled:
+        click.echo("  Web dashboard: http://127.0.0.1:8765")
+    else:
+        click.echo(
+            "  Web dashboard: disabled (flip web.enabled in anna.yaml +\n"
+            "                  systemctl --user enable --now anna-web)"
+        )
     hint = _linger_hint()
     if hint:
         click.secho("\n" + hint, fg="yellow")
@@ -1023,7 +1158,27 @@ def _print_talk_to_her(state: WizardState, bot_username: str) -> None:
     show_default=True,
     help="Markdown vault root.",
 )
-def main(reconfigure: bool, persona: bool, verbose: bool, anna_home: str, vault_root: str) -> int:
+@click.option(
+    "--disable-web",
+    "web_choice",
+    flag_value="disable",
+    default=None,
+    help="Install the anna-web unit but leave it disabled (skips the interactive prompt).",
+)
+@click.option(
+    "--enable-web",
+    "web_choice",
+    flag_value="enable",
+    help="Keep the web dashboard enabled (the default; provided for clarity in scripted installs).",
+)
+def main(
+    reconfigure: bool,
+    persona: bool,
+    verbose: bool,
+    anna_home: str,
+    vault_root: str,
+    web_choice: str | None,
+) -> int:
     """Run the ANNA setup wizard."""
     # The wizard owns stdout as a human conversation, so we deliberately do not
     # call configure_logging (that wires JSON to stdout for the service). This
@@ -1036,6 +1191,12 @@ def main(reconfigure: bool, persona: bool, verbose: bool, anna_home: str, vault_
         reconfigure=reconfigure,
         verbose=verbose,
     )
+    if web_choice == "disable":
+        state.web_enabled = False
+        state.web_prompt_resolved = True
+    elif web_choice == "enable":
+        state.web_enabled = True
+        state.web_prompt_resolved = True
     state.anna_home.mkdir(parents=True, exist_ok=True)
 
     if persona:
@@ -1063,6 +1224,7 @@ def main(reconfigure: bool, persona: bool, verbose: bool, anna_home: str, vault_
         step_slack_path(state)
         step_auth_path(state)
         step_persona_bootstrap(state)
+        step_web_dashboard(state)
         probe = step_final_wiring(state)
     except click.UsageError as exc:
         click.secho(f"Setup aborted: {exc}", fg="red")

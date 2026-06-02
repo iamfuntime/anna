@@ -107,6 +107,37 @@ loginctl enable-linger "$USER"
 
 The last line keeps the unit running when the operator is not logged in.
 
+## Web Dashboard
+
+ANNA ships a localhost-only FastAPI dashboard as a separate user systemd
+unit (`anna-web.service`). It binds `http://127.0.0.1:8765` by default and
+gives the operator a form-based editor for `anna.yaml`, a masked editor
+for `.env`, full CRUD over `schedules.yaml`, and a one-button Restart of
+the main daemon. Every config write, secret write, schedule mutation, and
+restart request lands in the same `audit/` JSONL the daemon writes to,
+visible through `anna-logs --audit`.
+
+The dashboard is installed and enabled by default. The setup wizard
+prompts `Disable web dashboard? [y/N]` during interactive install; the
+default keeps it on. Scripted installs can pass `anna-setup --disable-web`
+to skip the prompt and leave the unit installed-but-stopped. Flipping back
+later is a one-line YAML edit plus a systemctl call:
+
+```bash
+# turn it off without uninstalling
+sed -i 's/^  enabled: true$/  enabled: false/' ~/anna/anna.yaml  # under `web:`
+systemctl --user disable --now anna-web.service
+
+# turn it back on
+sed -i 's/^  enabled: false$/  enabled: true/' ~/anna/anna.yaml   # under `web:`
+systemctl --user enable --now anna-web.service
+```
+
+Remote access is not built in. The bind is pinned to `127.0.0.1`; if you
+need to reach the dashboard from outside the host, front it with a reverse
+proxy (Caddy, Tailscale serve, an SSH tunnel) and let the proxy enforce
+auth. The dashboard does not ship its own login UI in v1.
+
 ## Logs
 
 Operational events go to the user journal via stdout. The recommended way to read
@@ -157,7 +188,9 @@ anna/
     setup/                   interactive wizard
     cli/                     anna-logs and anna-admin
     core_files/              SOUL.md, CLAUDE.md, AGENTS.md, MEMORY.md, IDENTITY.md
-  src/anna/setup/templates/anna.service       user unit template
+  src/anna/setup/templates/anna.service       daemon user unit template
+  src/anna/setup/templates/anna-web.service   dashboard user unit template
+  src/anna_web/                               Phase 2.5 web dashboard package
   install.sh                 curl-pipe-bash installer
   tests/                     pytest suite
 ```
