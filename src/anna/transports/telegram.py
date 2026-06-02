@@ -16,11 +16,55 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 from typing import Any
 
 from anna.config import AnnaConfig
 from anna.log import get_logger
-from anna.transports.base import ChannelAdapter, InboundEvent, InboundHandler, OutboundMessage
+from anna.transports.base import (
+    ChannelAdapter,
+    InboundEvent,
+    InboundHandler,
+    OutboundMessage,
+    SignalHandle,
+)
+
+
+async def _typing_refresher(
+    bot: Any,
+    chat_id: int,
+    stop_event: asyncio.Event,
+    max_seconds: int,
+    log: Any,
+) -> None:
+    """Refresh Telegram's ``typing`` chat-action every ~4 seconds.
+
+    Telegram clears the typing indicator ~5 seconds after the last
+    ``send_chat_action`` call, so a buffered turn needs a refresher to
+    keep the indicator alive for the duration of the SDK turn. The loop
+    exits when ``stop_event`` is set OR when its run time exceeds
+    ``max_seconds``; per-tick failures are logged at debug and do not
+    abort the loop.
+    """
+
+    start = time.monotonic()
+    while not stop_event.is_set():
+        if time.monotonic() - start > max_seconds:
+            log.warning(
+                "visibility.telegram.refresh_bound_hit",
+                chat_id=chat_id,
+                max_seconds=max_seconds,
+            )
+            return
+        try:
+            await bot.send_chat_action(chat_id=chat_id, action="typing")
+        except Exception as exc:
+            log.debug("visibility.telegram.refresh_failed", error=str(exc))
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=4.0)
+        except asyncio.TimeoutError:
+            continue
+        return
 
 
 class TelegramAdapter(ChannelAdapter):
@@ -239,3 +283,84 @@ class TelegramAdapter(ChannelAdapter):
         except Exception as exc:
             self._log.warning("channel.health_check_failed", channel="telegram", error=str(exc))
             return False
+
+    # ------------------------------------------------------------------
+    # Thinking-signal overrides (subtask 9 of cadence-visibility plan)
+    # ------------------------------------------------------------------
+
+    async def start_thinking_signal(
+        self, event: InboundEvent
+    ) -> SignalHandle | None:
+        """Spawn a typing-action refresher for the duration of the turn.
+
+        Reads ``chat_id`` from ``event.raw`` (populated by
+        :meth:`_to_inbound_event`). Exception-isolated — any failure
+        logs ``visibility.telegram.start_failed`` and returns ``None``
+        so the worker skips the corresponding clear path.
+        """
+
+        try:
+            if self._application is None:
+                return None
+            chat_id = event.raw.get("chat_id") if event.raw else None
+            if chat_id is None:
+                return None
+            stop_event = asyncio.Event()
+            max_seconds = (
+                self._config.runtime.visibility.telegram_typing_max_seconds
+            )
+            task = asyncio.create_task(
+                _typing_refresher(
+                    self._application.bot,
+                    int(chat_id),
+                    stop_event,
+                    max_seconds,
+                    self._log,
+                ),
+                name=f"telegram.typing_refresher:{event.conversation_key}",
+            )
+            return SignalHandle(
+                transport="telegram",
+                conv_key=event.conversation_key,
+                telegram_task=task,
+                telegram_stopped=stop_event,
+            )
+        except Exception as exc:
+            self._log.warning(
+                "visibility.telegram.start_failed",
+                conv_key=event.conversation_key,
+                error=str(exc),
+            )
+            return None
+
+    async def clear_thinking_signal(self, handle: SignalHandle) -> None:
+        """Stop the refresher and await its exit.
+
+        Sets the stop event, waits up to one second for clean exit, and
+        falls back to ``task.cancel()`` if the task is still alive.
+        Exception-isolated so a misbehaving cleanup never propagates
+        into the worker's ``finally`` block.
+        """
+
+        if handle.telegram_stopped is None or handle.telegram_task is None:
+            return
+        try:
+            handle.telegram_stopped.set()
+            try:
+                await asyncio.wait_for(handle.telegram_task, timeout=1.0)
+            except asyncio.TimeoutError:
+                handle.telegram_task.cancel()
+                try:
+                    await handle.telegram_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            self._log.debug(
+                "visibility.telegram.cleared",
+                conv_key=handle.conv_key,
+            )
+        except Exception as exc:
+            self._log.debug(
+                "visibility.telegram.clear_failed",
+                conv_key=handle.conv_key,
+                error=str(exc),
+            )
