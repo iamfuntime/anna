@@ -16,10 +16,17 @@ from datetime import datetime, timezone
 from typing import Awaitable, Callable
 
 from anna.config import AnnaConfig, IdentityAliasEntry
+from anna.core.identity import CoreFile, read_core_file
 from anna.log import audit_event, get_logger, sweep_audit_retention, sweep_transcript_retention, transcript_event
 from anna.runtime.schedule_store import ScheduleStore
 from anna.runtime.subagent import SubAgentRunner
 from anna.runtime.supervisor import Supervisor
+from anna.runtime.visibility import (
+    CadenceLinter,
+    VisibilityCallbacks,
+    _noop_clear,
+    _noop_start,
+)
 from anna.runtime.worker import ConversationWorker
 from anna.tools.google_clients import GoogleClients
 from anna.transports.base import ChannelAdapter, InboundEvent, OutboundMessage
@@ -107,6 +114,19 @@ class ConversationRouter:
         self._identity_index: dict[str, tuple[IdentityAliasEntry, ...]] = (
             _build_identity_index(config.identities)
         )
+        # Cadence-Visibility Hooks plan (Inbox/2026-06-02) subtask 7:
+        # instantiate the cadence linter once at router construction and
+        # share the same instance across every worker. The linter
+        # compiles its patterns at __init__ time, so a malformed config
+        # fails fast at boot rather than per-spawn. When
+        # ``runtime.visibility.response_lint`` is false the linter is
+        # ``None`` and the worker's lint pass short-circuits.
+        if self._config.runtime.visibility.response_lint:
+            self._cadence_linter: CadenceLinter | None = CadenceLinter(
+                config=self._config,
+            )
+        else:
+            self._cadence_linter = None
 
     # ------------------------------------------------------------------
     # Dispatch
@@ -198,6 +218,7 @@ class ConversationRouter:
                 google_clients=self._google_clients,
                 subagent_runner=self._subagent_runner,
                 ephemeral=event.ephemeral,
+                visibility=self._build_visibility_callbacks(event.transport),
             )
             await worker.start()
             self._workers[key] = worker
@@ -246,6 +267,68 @@ class ConversationRouter:
             )
 
         return _send
+
+    def _build_visibility_callbacks(self, transport: str) -> VisibilityCallbacks:
+        """Build the per-transport :class:`VisibilityCallbacks` bundle.
+
+        Cadence-Visibility Hooks plan (Inbox/2026-06-02) subtask 7. Each
+        newly-spawned worker is handed a bundle that wires:
+
+        * ``start`` / ``clear`` to the matching ``ChannelAdapter`` methods
+          (so the worker stays decoupled from the adapter registry and
+          the adapter owns its per-transport API state — Slack client,
+          Telegram bot, CLI session map). When
+          ``runtime.visibility.reaction_signal`` is false, both fall back
+          to the module-level no-op callables so the worker's hook path
+          becomes a cheap nothing.
+        * ``cadence_reminder_loader`` to a zero-arg closure that reads
+          ``core/CADENCE.md`` via :func:`read_core_file` on every call,
+          for buffered transports only (Slack, Telegram). CLI sees deltas
+          live so a reminder is not needed there; the loader is ``None``
+          for any other transport. ``None`` also flows when the
+          ``cadence_reminder`` config flag is disabled.
+        * ``lint`` to the shared :class:`CadenceLinter` instantiated at
+          router construction, or ``None`` when ``response_lint`` is
+          disabled.
+
+        The adapter lookup mirrors :meth:`_send_factory`. Missing-adapter
+        cases (e.g. a transport with no registered adapter) raise the
+        same ``KeyError`` ``_send_factory`` would; the router should
+        never spawn a worker for an unregistered transport.
+        """
+        visibility_cfg = self._config.runtime.visibility
+
+        if visibility_cfg.reaction_signal:
+            adapter = self._adapters[transport]
+            # Bound methods on the adapter instance — capturing them
+            # here preserves ``self`` so the worker can call them
+            # without re-threading the adapter reference.
+            start = adapter.start_thinking_signal
+            clear = adapter.clear_thinking_signal
+        else:
+            start = _noop_start
+            clear = _noop_clear
+
+        cadence_reminder_loader: Callable[[], str] | None
+        if (
+            visibility_cfg.cadence_reminder
+            and transport in ("slack", "telegram")
+        ):
+            core_dir = self._config.core_dir
+
+            def _load_cadence_reminder() -> str:
+                return read_core_file(core_dir, CoreFile.CADENCE).strip()
+
+            cadence_reminder_loader = _load_cadence_reminder
+        else:
+            cadence_reminder_loader = None
+
+        return VisibilityCallbacks(
+            start=start,
+            clear=clear,
+            lint=self._cadence_linter,
+            cadence_reminder_loader=cadence_reminder_loader,
+        )
 
     # ------------------------------------------------------------------
     # Inspection
