@@ -25,7 +25,8 @@ from anna.tools.self_edit_server import SELF_EDIT_TOOL_NAMES, SelfEditTools, bui
 from anna.tools.vault_tools import VaultTools
 from anna.tools.web_server import WEB_TOOL_NAMES, build_web_server
 from anna.tools.web_tools import WebTools
-from anna.transports.base import InboundEvent, OutboundMessage
+from anna.runtime.visibility import NULL_VISIBILITY, VisibilityCallbacks
+from anna.transports.base import InboundEvent, OutboundMessage, SignalHandle
 from anna.vault.checkpoint import list_recent_checkpoints, write_checkpoint
 
 if TYPE_CHECKING:
@@ -83,6 +84,7 @@ class ConversationWorker:
         google_clients: "GoogleClients | None" = None,
         subagent_runner: "SubAgentRunner | None" = None,
         ephemeral: bool = False,
+        visibility: VisibilityCallbacks = NULL_VISIBILITY,
     ) -> None:
         self.conversation_key = conversation_key
         self.transport = transport
@@ -93,6 +95,11 @@ class ConversationWorker:
         self._schedule_store = schedule_store
         self._google_clients = google_clients
         self._subagent_runner = subagent_runner
+        # Cadence-Visibility Hooks plan (Inbox/2026-06-02) subtask 5.
+        # Default ``NULL_VISIBILITY`` means: no reminder prepend, no
+        # thinking-signal start/clear, no lint pass. Existing unit tests
+        # and the sub-agent path are unchanged.
+        self._visibility = visibility
         # Phase 2 §5 subtask 7: when true the worker skips the checkpoint
         # write and the per-core-file eviction sweep at closeout. Set by
         # the router from the first event's ``ephemeral`` flag when the
@@ -712,59 +719,141 @@ class ConversationWorker:
         except ImportError:
             AssistantMessage = ResultMessage = TextBlock = None  # type: ignore[assignment,misc]
 
-        # Send the user message into the SDK.
-        try:
-            await self._client.query(event.text)  # type: ignore[attr-defined]
-        except Exception as exc:
-            self._log.error("worker.sdk_query_failed", error=str(exc))
-            if event.completion_future is not None and not event.completion_future.done():
-                event.completion_future.set_exception(exc)
-                return
-            await self._send(OutboundMessage(
-                conversation_key=event.conversation_key,
-                text=f"I hit an error talking to the model: {exc}",
-            ))
-            return
+        # Cadence-Visibility Hooks plan (Inbox/2026-06-02) subtask 5:
+        # for buffered transports (Slack, Telegram) prepend the
+        # ``<system-reminder>`` cadence block sourced from
+        # ``core/CADENCE.md`` via the loader on the bundle. CLI sees
+        # deltas live so the reminder is not needed there. The loader
+        # call is per-event (no caching) so the operator can edit
+        # CADENCE.md without restarting ANNA. An empty / missing file
+        # degrades gracefully to the unmodified event text.
+        query_text = event.text
+        if (
+            self.transport in ("slack", "telegram")
+            and self._visibility.cadence_reminder_loader is not None
+        ):
+            reminder = ""
+            try:
+                reminder = self._visibility.cadence_reminder_loader()
+            except Exception as exc:
+                self._log.warning(
+                    "worker.cadence_reminder.load_failed",
+                    error=str(exc),
+                )
+                reminder = ""
+            if reminder:
+                query_text = (
+                    f"<system-reminder>\n{reminder}\n</system-reminder>\n\n"
+                    f"{event.text}"
+                )
 
-        # Collect text blocks until ResultMessage.
+        # Thinking-signal start. Captured handle (possibly None) is
+        # cleared in the outer ``finally`` below so the cleanup path
+        # runs on success, exception, and cancellation alike. A start
+        # failure must not abort the SDK call — the operator simply
+        # misses the visibility cue for this turn.
+        handle: SignalHandle | None = None
+        try:
+            handle = await self._visibility.start(event)
+        except Exception as exc:
+            self._log.warning(
+                "worker.thinking_signal.start_failed",
+                error=str(exc),
+            )
+            handle = None
+
+        # Collect text blocks until ResultMessage. ``reply_chunks`` is
+        # defined outside the try/finally so the lint and send paths
+        # downstream can read it. The ``finally`` runs on every exit
+        # path (including the early ``return``s inside the SDK error
+        # handlers), so the thinking signal is cleared even when the
+        # SDK call fails or the run-loop is cancelled.
         reply_chunks: list[str] = []
         try:
-            async for msg in self._client.receive_response():  # type: ignore[attr-defined]
-                if AssistantMessage is not None and isinstance(msg, AssistantMessage):
-                    for block in msg.content:
-                        if TextBlock is not None and isinstance(block, TextBlock):
-                            reply_chunks.append(block.text)
-                            # Phase 2 §5: emit streaming deltas to the
-                            # per-event subscriber (set by the CLI adapter)
-                            # before the buffered finalize lands. Exception
-                            # isolation is mandatory: a misbehaving
-                            # subscriber must NOT abort the buffered send
-                            # that Slack and Telegram depend on.
-                            if event.stream_subscriber is not None:
-                                try:
-                                    await event.stream_subscriber(block.text)
-                                except Exception as exc:
-                                    self._log.warning(
-                                        "worker.stream_subscriber_failed",
-                                        error=str(exc),
-                                        conv_key=event.conversation_key,
-                                    )
-                if ResultMessage is not None and isinstance(msg, ResultMessage):
-                    break
-        except Exception as exc:
-            self._log.error("worker.sdk_receive_failed", error=str(exc))
-            if event.completion_future is not None and not event.completion_future.done():
-                event.completion_future.set_exception(exc)
+            # Send the user message into the SDK. NOTE: ``query_text``
+            # (not ``event.text``) carries the cadence reminder when
+            # one was loaded.
+            try:
+                await self._client.query(query_text)  # type: ignore[attr-defined]
+            except Exception as exc:
+                self._log.error("worker.sdk_query_failed", error=str(exc))
+                if event.completion_future is not None and not event.completion_future.done():
+                    event.completion_future.set_exception(exc)
+                    return
+                await self._send(OutboundMessage(
+                    conversation_key=event.conversation_key,
+                    text=f"I hit an error talking to the model: {exc}",
+                ))
                 return
-            await self._send(OutboundMessage(
-                conversation_key=event.conversation_key,
-                text=f"I hit an error reading the model response: {exc}",
-            ))
-            return
+
+            try:
+                async for msg in self._client.receive_response():  # type: ignore[attr-defined]
+                    if AssistantMessage is not None and isinstance(msg, AssistantMessage):
+                        for block in msg.content:
+                            if TextBlock is not None and isinstance(block, TextBlock):
+                                reply_chunks.append(block.text)
+                                # Phase 2 §5: emit streaming deltas to the
+                                # per-event subscriber (set by the CLI adapter)
+                                # before the buffered finalize lands. Exception
+                                # isolation is mandatory: a misbehaving
+                                # subscriber must NOT abort the buffered send
+                                # that Slack and Telegram depend on.
+                                if event.stream_subscriber is not None:
+                                    try:
+                                        await event.stream_subscriber(block.text)
+                                    except Exception as exc:
+                                        self._log.warning(
+                                            "worker.stream_subscriber_failed",
+                                            error=str(exc),
+                                            conv_key=event.conversation_key,
+                                        )
+                    if ResultMessage is not None and isinstance(msg, ResultMessage):
+                        break
+            except Exception as exc:
+                self._log.error("worker.sdk_receive_failed", error=str(exc))
+                if event.completion_future is not None and not event.completion_future.done():
+                    event.completion_future.set_exception(exc)
+                    return
+                await self._send(OutboundMessage(
+                    conversation_key=event.conversation_key,
+                    text=f"I hit an error reading the model response: {exc}",
+                ))
+                return
+        finally:
+            # ALWAYS clear, even on exception, cancellation, or early
+            # return inside the try-block above. The clear callable is
+            # itself exception-isolated — defense-in-depth keeps a
+            # misbehaving clear from leaking out of the finally.
+            if handle is not None:
+                try:
+                    await self._visibility.clear(handle)
+                except Exception as exc:
+                    self._log.warning(
+                        "worker.thinking_signal.clear_failed",
+                        error=str(exc),
+                    )
 
         reply_text = "\n".join(c for c in reply_chunks if c).strip()
         if not reply_text:
             reply_text = "(no response)"
+
+        # Cadence-Visibility Hooks subtask 5: telemetry-only lint of
+        # the final ``reply_text`` before dispatch. ``CadenceLinter.lint``
+        # swallows its own exceptions; the outer try/except is
+        # defense-in-depth so a misbehaving custom lint callable cannot
+        # block delivery.
+        if self._visibility.lint is not None:
+            try:
+                self._visibility.lint.lint(
+                    reply_text,
+                    transport=self.transport,
+                    conv_key=event.conversation_key,
+                )
+            except Exception as exc:
+                self._log.warning(
+                    "worker.cadence_lint.call_failed",
+                    error=str(exc),
+                )
 
         # Scheduler-driven (or any future caller-driven) dispatch short-circuits
         # the normal send path. The caller awaits the future and routes the

@@ -18,8 +18,9 @@ import pytest
 
 from anna.config import AnnaConfig
 from anna.runtime.supervisor import Supervisor
+from anna.runtime.visibility import NULL_VISIBILITY, VisibilityCallbacks
 from anna.runtime.worker import ConversationWorker
-from anna.transports.base import InboundEvent, OutboundMessage
+from anna.transports.base import InboundEvent, OutboundMessage, SignalHandle
 
 
 CONV_KEY = "schedule:test-job:2026-06-08"
@@ -93,7 +94,12 @@ def _patch_sdk_types(monkeypatch):
     yield
 
 
-def _make_worker(tmp_path: Path, send_target: list[OutboundMessage]) -> ConversationWorker:
+def _make_worker(
+    tmp_path: Path,
+    send_target: list[OutboundMessage],
+    *,
+    visibility: VisibilityCallbacks = NULL_VISIBILITY,
+) -> ConversationWorker:
     cfg = AnnaConfig()
     object.__setattr__(cfg, "anna_home", tmp_path / "anna_home")
     cfg.vault.path = str(tmp_path / "vault")
@@ -110,6 +116,7 @@ def _make_worker(tmp_path: Path, send_target: list[OutboundMessage]) -> Conversa
         config=cfg,
         supervisor=supervisor,
         send=_send,
+        visibility=visibility,
     )
 
 
@@ -316,3 +323,148 @@ async def test_stream_subscriber_exception_does_not_abort_buffered_finalize(
     # Buffered finalize lands on the send callback with the full reply.
     assert len(sent) == 1
     assert sent[0].text == "Alpha.\nBeta.\nGamma."
+
+
+# ---------------------------------------------------------------------------
+# Cadence-Visibility Hooks plan (Inbox/2026-06-02) subtask 5:
+# wire the three visibility hooks into ``ConversationWorker._handle``.
+# ---------------------------------------------------------------------------
+
+
+class _RecordingLinter:
+    """Minimal CadenceLinter stand-in with a recording ``lint`` method.
+
+    Matches the ``CadenceLinter.lint(text, *, transport, conv_key)`` shape
+    used by the worker. Does not raise; the worker's outer try/except is
+    exercised by ``_RaisingLinter`` below.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, str]] = []
+
+    def lint(self, text: str, *, transport: str, conv_key: str) -> None:
+        self.calls.append((text, transport, conv_key))
+
+
+@pytest.mark.asyncio
+async def test_handle_with_null_visibility_unchanged(tmp_path: Path) -> None:
+    """NULL_VISIBILITY is the worker's default; behavior matches today.
+
+    Verifies the three hooks are no-ops:
+    - The SDK ``query`` is called with ``event.text`` verbatim (no
+      ``<system-reminder>`` prepend because the loader is None).
+    - No signal start/clear is observable (the noop coroutines return
+      None and are not introspectable, but the buffered finalize still
+      lands on the send callback exactly as before).
+    - The ``lint`` field is None so no lint side-effect is observable.
+    """
+    sent: list[OutboundMessage] = []
+    worker = _make_worker(tmp_path, sent, visibility=NULL_VISIBILITY)
+    client = _FakeReplyClient(reply="Hello from ANNA.")
+    worker._client = client
+
+    await worker._handle(_make_event(future=None))
+
+    # SDK query saw the raw event text, no reminder prepend.
+    assert client.queries == ["Compose a brief."]
+    # Buffered finalize landed normally.
+    assert len(sent) == 1
+    assert sent[0].text == "Hello from ANNA."
+
+
+@pytest.mark.asyncio
+async def test_handle_fires_thinking_signal_start_and_clear_on_success(
+    tmp_path: Path,
+) -> None:
+    """A custom VisibilityCallbacks fires start and clear in order, once each."""
+    sent: list[OutboundMessage] = []
+
+    order: list[str] = []
+    captured_handle = SignalHandle(transport="slack", conv_key=CONV_KEY)
+
+    async def _start(event: InboundEvent) -> SignalHandle | None:
+        order.append("start")
+        return captured_handle
+
+    async def _clear(handle: SignalHandle | None) -> None:
+        order.append("clear")
+        # Same handle instance round-trips through the finally.
+        assert handle is captured_handle
+
+    visibility = VisibilityCallbacks(
+        start=_start,
+        clear=_clear,
+        lint=None,
+        cadence_reminder_loader=None,
+    )
+    worker = _make_worker(tmp_path, sent, visibility=visibility)
+    worker._client = _FakeReplyClient(reply="OK.")
+
+    await worker._handle(_make_event(future=None))
+
+    assert order == ["start", "clear"]
+    # Buffered finalize still lands.
+    assert len(sent) == 1
+    assert sent[0].text == "OK."
+
+
+@pytest.mark.asyncio
+async def test_handle_clears_thinking_signal_on_client_query_exception(
+    tmp_path: Path,
+) -> None:
+    """``client.query`` raises → start fires, clear still fires in finally."""
+    sent: list[OutboundMessage] = []
+
+    order: list[str] = []
+    captured_handle = SignalHandle(transport="slack", conv_key=CONV_KEY)
+
+    async def _start(event: InboundEvent) -> SignalHandle | None:
+        order.append("start")
+        return captured_handle
+
+    async def _clear(handle: SignalHandle | None) -> None:
+        order.append("clear")
+
+    visibility = VisibilityCallbacks(
+        start=_start,
+        clear=_clear,
+        lint=None,
+        cadence_reminder_loader=None,
+    )
+    worker = _make_worker(tmp_path, sent, visibility=visibility)
+    worker._client = _RaiseOnQuery(RuntimeError("model down"))
+
+    await worker._handle(_make_event(future=None))
+
+    # ``finally`` ran the clear after the early-return inside the query
+    # exception handler.
+    assert order == ["start", "clear"]
+    # The worker's error path sent a fallback message — confirms we hit
+    # the SDK exception branch, not the normal reply path.
+    assert len(sent) == 1
+    assert "error talking to the model" in sent[0].text
+
+
+@pytest.mark.asyncio
+async def test_handle_lints_reply_text_after_send(tmp_path: Path) -> None:
+    """Linter sees the final ``reply_text`` with transport and conv_key."""
+    sent: list[OutboundMessage] = []
+
+    linter = _RecordingLinter()
+    visibility = VisibilityCallbacks(
+        start=NULL_VISIBILITY.start,
+        clear=NULL_VISIBILITY.clear,
+        lint=linter,  # type: ignore[arg-type] — duck-typed stand-in
+        cadence_reminder_loader=None,
+    )
+    worker = _make_worker(tmp_path, sent, visibility=visibility)
+    worker._client = _FakeReplyClient(reply="Final reply text.")
+
+    await worker._handle(_make_event(future=None))
+
+    # One lint call with the assembled reply_text and the worker's
+    # transport + conv_key.
+    assert linter.calls == [("Final reply text.", "slack", CONV_KEY)]
+    # Send still happened — lint is telemetry-only and does not block.
+    assert len(sent) == 1
+    assert sent[0].text == "Final reply text."
