@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from anna.runtime.visibility import NULL_VISIBILITY
 from anna.transports.base import (
     ChannelAdapter,
     InboundEvent,
@@ -75,3 +76,31 @@ async def test_default_thinking_signal_methods_are_noop() -> None:
     handle = SignalHandle(transport="minimal", conv_key="minimal:test")
     clear_result = await adapter.clear_thinking_signal(handle)
     assert clear_result is None
+
+
+async def test_null_visibility_callbacks_are_awaitable_noops() -> None:
+    """``NULL_VISIBILITY.start`` and ``NULL_VISIBILITY.clear`` must be
+    awaitable coroutines that return ``None`` cleanly. This is the
+    contract the worker relies on when it is constructed without a
+    real :class:`VisibilityCallbacks` bundle (every existing unit test
+    and the sub-agent path).
+    """
+
+    event = _make_event()
+
+    start_result = await NULL_VISIBILITY.start(event)
+    assert start_result is None
+
+    handle = SignalHandle(transport="minimal", conv_key="minimal:test")
+    clear_result = await NULL_VISIBILITY.clear(handle)
+    assert clear_result is None
+
+    # Clearing a ``None`` handle is also safe — the worker only calls
+    # clear when start returned a handle, but the noop must tolerate
+    # the broader type signature regardless.
+    none_clear_result = await NULL_VISIBILITY.clear(None)
+    assert none_clear_result is None
+
+    # The remaining two fields are inert defaults on the noop bundle.
+    assert NULL_VISIBILITY.lint is None
+    assert NULL_VISIBILITY.cadence_reminder_loader is None
