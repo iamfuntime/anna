@@ -294,9 +294,21 @@ subagents:
 # ============================================================
 # identities: Phase 2 §5 cross-transport identity aliasing.
 #
-# Each entry maps one or more per-transport identifiers (Slack user ID,
-# Telegram chat ID, CLI OS username) onto a single canonical name. The
-# router rewrites matching inbound events' conv_keys to user:<canonical>
+# DO NOT UNCOMMENT. Identity aliasing across slack/telegram/cli is
+# off the table per operator decision (see ~/anna/core/MEMORY.md,
+# entry dated 2026-06-02). Each transport keeps its own conv_key.
+#
+# Failure mode: enabling this rewrites inbound conv_keys to
+# user:<canonical>, but the Slack outbound send-path in
+# src/anna/transports/slack.py does not reverse-resolve the canonical
+# key back to a Slack channel ID, so the next Slack DM crashes the
+# worker with `worker.crashed: unrecognized slack conv_key: user:seth`
+# and SIGKILLs the daemon. This happened in production on 2026-06-02.
+#
+# The schema below is retained for documentation only. Each entry would
+# map one or more per-transport identifiers (Slack user ID, Telegram
+# chat ID, CLI OS username) onto a single canonical name. The router
+# would rewrite matching inbound events' conv_keys to user:<canonical>
 # so a Slack DM, a Telegram DM, and `anna chat` from the operator all
 # land in the same worker and the same checkpoint directory. canonical
 # is restricted to a-z, 0-9, underscore (becomes part of the on-disk

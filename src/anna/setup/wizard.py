@@ -681,6 +681,19 @@ transports:
     enabled: {slack_enabled}
   telegram:
     enabled: {telegram_enabled}
+  # cli: Phase 2 §5 local CLI transport. The daemon binds a Unix-domain
+  # socket at socket_path; `anna chat` (interactive TUI) and `anna ask`
+  # (one-shot) connect to it from the same host. The socket is created
+  # mode 0600 immediately after bind, so filesystem permissions are the
+  # entire auth boundary — there is no token, no TLS, no remote case.
+  # idle_gap_minutes is the per-CLI idle close, distinct from
+  # sessions.dm_gap_hours (8h) and sessions.thread_gap_hours (1h). v1
+  # ships NDJSON framing only; the field is kept for forward-compat.
+  cli:
+    enabled: true
+    socket_path: ~/anna/anna.sock
+    idle_gap_minutes: 30
+    framing: ndjson
 
 vault:
   path: {state.vault_root}
