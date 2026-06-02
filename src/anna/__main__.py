@@ -180,6 +180,38 @@ async def _run(config: AnnaConfig) -> None:
             ),
         )
 
+    # Cadence-Visibility hooks (per Inbox/2026-06-02 plan, subtask 12).
+    # The actual wiring lives in ConversationRouter._build_visibility_callbacks
+    # — this block just emits the boot-time visibility line that mirrors
+    # anna.web.ready / anna.subagent.ready / anna.cli.ready. The "ready"
+    # branch fires when ANY of the three flags is on (the surface is at
+    # least partially live); the "disabled" branch fires only when ALL
+    # three are off so the operator sees one explicit "feature is fully
+    # turned off" line at boot.
+    if (
+        config.runtime.visibility.reaction_signal
+        or config.runtime.visibility.cadence_reminder
+        or config.runtime.visibility.response_lint
+    ):
+        log.info(
+            "anna.visibility.ready",
+            reaction_signal=config.runtime.visibility.reaction_signal,
+            cadence_reminder=config.runtime.visibility.cadence_reminder,
+            response_lint=config.runtime.visibility.response_lint,
+            slack_emoji=config.runtime.visibility.slack_emoji,
+            telegram_typing_max_seconds=config.runtime.visibility.telegram_typing_max_seconds,
+        )
+    else:
+        log.info(
+            "anna.visibility.disabled",
+            note=(
+                "runtime.visibility.{reaction_signal,cadence_reminder,"
+                "response_lint} are all false; cadence-visibility hooks "
+                "are fully off — buffered transports will resume the "
+                "pre-Phase-2 10-90s blank-pause behavior"
+            ),
+        )
+
     # Phase 2 §5 CLI transport. The adapter itself is constructed inside
     # build_enabled_adapters and started with the other listener tasks
     # below; this block just emits the boot-time visibility line that
