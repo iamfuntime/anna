@@ -1,5 +1,12 @@
 # Telegram setup for ANNA
 
+> This guide assumes ANNA is installed via the Phase 2.5 `uv tool install`
+> path: shim binaries on `~/.local/bin/`, state files under `~/anna/`,
+> systemd unit at `~/.config/systemd/user/anna.service`. If you're on a
+> pre-migration install where `~/anna/.venv/` still exists, run
+> `scripts/migrate-to-uv-tool.sh` first — see the README's
+> *Migrating from a pre-Phase-A install* section.
+
 This is the full version of the Telegram walkthrough the `anna-setup` wizard
 shows. The wizard prints only the essentials; this is the detailed reference.
 

@@ -1,5 +1,12 @@
 # Slack setup for ANNA
 
+> This guide assumes ANNA is installed via the Phase 2.5 `uv tool install`
+> path: shim binaries on `~/.local/bin/`, state files under `~/anna/`,
+> systemd unit at `~/.config/systemd/user/anna.service`. If you're on a
+> pre-migration install where `~/anna/.venv/` still exists, run
+> `scripts/migrate-to-uv-tool.sh` first — see the README's
+> *Migrating from a pre-Phase-A install* section.
+
 This is the full, screenshot-friendly version of the Slack walkthrough the
 `anna-setup` wizard shows. The wizard only prints the essentials; everything
 here is the detailed reference, including the gotchas that trip people up.
