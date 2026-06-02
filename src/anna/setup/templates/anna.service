@@ -30,6 +30,13 @@ WorkingDirectory=%h/anna
 # env var is the only link.
 Environment=ANNA_HOME=%h/anna
 
+# Load secrets (Slack/Telegram bot tokens, API keys) straight into the
+# process env. Belt-and-suspenders with config.py's explicit dotenv load:
+# this fires before the Python entry point so even import-time code sees
+# the values. The leading `-` makes the file optional — fresh installs
+# without secrets yet still start cleanly.
+EnvironmentFile=-%h/anna/.env
+
 # uv-tool-managed shim. uv writes this script at install time; it
 # activates the managed venv's interpreter and execs the entry point.
 # Must be an absolute path — systemd does not expand $PATH.

@@ -675,7 +675,20 @@ def _apply_env_overrides(data: dict[str, Any]) -> dict[str, Any]:
 def load_config(path: Path | None = None) -> AnnaConfig:
     """Read .env and anna.yaml, return a validated config object."""
     # .env first, so anna.yaml's env overrides see the right values.
-    load_dotenv(override=False)
+    # Be explicit about the dotenv path: python-dotenv's default upward
+    # search walks from this source file, which no longer lives under
+    # ~/anna/ after the uv-tool install migration. ANNA_HOME comes from
+    # the systemd unit's Environment= line and is the canonical anchor;
+    # fall back to the legacy upward search for dev/test runs that don't
+    # set it.
+    anna_home_env = os.environ.get("ANNA_HOME")
+    if anna_home_env:
+        load_dotenv(
+            dotenv_path=Path(os.path.expanduser(anna_home_env)) / ".env",
+            override=False,
+        )
+    else:
+        load_dotenv(override=False)
 
     config_path = path or _resolve_config_path()
     if config_path.is_file():
