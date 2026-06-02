@@ -715,9 +715,9 @@ class ConversationWorker:
             return
 
         try:
-            from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
+            from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock, ToolUseBlock
         except ImportError:
-            AssistantMessage = ResultMessage = TextBlock = None  # type: ignore[assignment,misc]
+            AssistantMessage = ResultMessage = TextBlock = ToolUseBlock = None  # type: ignore[assignment,misc]
 
         # Cadence-Visibility Hooks plan (Inbox/2026-06-02) subtask 5:
         # for buffered transports (Slack, Telegram) prepend the
@@ -768,7 +768,16 @@ class ConversationWorker:
         # path (including the early ``return``s inside the SDK error
         # handlers), so the thinking signal is cleared even when the
         # SDK call fails or the run-loop is cancelled.
+        #
+        # ``pending`` accumulates text since the last flush boundary so
+        # buffered transports (Slack, Telegram) receive narration as a
+        # sequence of messages keyed off the model's natural tool-use
+        # cadence instead of one consolidated end-of-turn blob. The
+        # scheduler-driven path (event.completion_future set) keeps the
+        # old behavior — scheduled jobs want one return value, not a
+        # stream.
         reply_chunks: list[str] = []
+        pending: list[str] = []
         try:
             # Send the user message into the SDK. NOTE: ``query_text``
             # (not ``event.text``) carries the cadence reminder when
@@ -792,6 +801,7 @@ class ConversationWorker:
                         for block in msg.content:
                             if TextBlock is not None and isinstance(block, TextBlock):
                                 reply_chunks.append(block.text)
+                                pending.append(block.text)
                                 # Phase 2 §5: emit streaming deltas to the
                                 # per-event subscriber (set by the CLI adapter)
                                 # before the buffered finalize lands. Exception
@@ -807,6 +817,27 @@ class ConversationWorker:
                                             error=str(exc),
                                             conv_key=event.conversation_key,
                                         )
+                            elif ToolUseBlock is not None and isinstance(block, ToolUseBlock):
+                                # Tool-use boundary: the model has stopped
+                                # narrating to invoke a tool. Flush the
+                                # pending narration as its own outbound
+                                # message so Slack/Telegram receive
+                                # cadence-aligned messages instead of one
+                                # end-of-turn blob.
+                                #
+                                # Scheduler-driven dispatch (completion_future
+                                # set) is excluded — scheduled jobs want one
+                                # consolidated return value, not a stream.
+                                # Empty/whitespace pending buffers are
+                                # skipped (no point sending blank messages).
+                                if event.completion_future is None and pending:
+                                    txt = "\n".join(c for c in pending if c).strip()
+                                    if txt:
+                                        await self._send(OutboundMessage(
+                                            conversation_key=event.conversation_key,
+                                            text=txt,
+                                        ))
+                                    pending = []
                     if ResultMessage is not None and isinstance(msg, ResultMessage):
                         break
             except Exception as exc:
@@ -863,7 +894,24 @@ class ConversationWorker:
             event.completion_future.set_result(reply_text)
             return
 
-        await self._send(OutboundMessage(
-            conversation_key=event.conversation_key,
-            text=reply_text,
-        ))
+        # Interactive path: send the trailing pending buffer (text after the
+        # last tool-use boundary, or the full reply if no tools were called).
+        # Earlier tool-use flushes already dispatched their slices of
+        # narration as separate OutboundMessages — sending the join of
+        # ``reply_chunks`` here would duplicate everything.
+        final_text = "\n".join(c for c in pending if c).strip()
+        if final_text:
+            await self._send(OutboundMessage(
+                conversation_key=event.conversation_key,
+                text=final_text,
+            ))
+        elif not reply_chunks:
+            # Edge case: the SDK returned no text at all and no tools were
+            # called — preserve the "(no response)" fallback so the
+            # operator sees SOMETHING. If reply_chunks is non-empty but
+            # final_text is empty, that means every text block was already
+            # flushed at a tool-use boundary; nothing more to send.
+            await self._send(OutboundMessage(
+                conversation_key=event.conversation_key,
+                text="(no response)",
+            ))
