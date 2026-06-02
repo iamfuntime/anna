@@ -93,6 +93,32 @@ class OutboundMessage:
     reply_to: str | None = None
 
 
+@dataclass
+class SignalHandle:
+    """Per-transport cleanup state for a thinking-signal.
+
+    Fields are deliberately union-typed because each transport carries
+    different cleanup state. None of these fields enter compare/hash —
+    handles are passed by reference. ``telegram_stopped`` is the
+    Telegram refresher's stop-flag; Slack and CLI ignore it. The
+    dataclass is intentionally not frozen so the Telegram transport can
+    swap in a freshly-created ``asyncio.Event`` reference when it
+    spawns the refresher task.
+    """
+
+    transport: str
+    conv_key: str
+    # Slack: channel + ts + emoji name. Telegram: typing task + stopped
+    # event. CLI: ref to the session. All optional so unused fields
+    # default to None for transports that ignore them.
+    slack_channel: str | None = None
+    slack_ts: str | None = None
+    slack_emoji: str | None = None
+    telegram_task: asyncio.Task[None] | None = None
+    telegram_stopped: asyncio.Event | None = None
+    cli_session_key: str | None = None
+
+
 InboundHandler = Callable[[InboundEvent], Awaitable[None]]
 
 
@@ -124,6 +150,33 @@ class ChannelAdapter(ABC):
         """Default restart: stop then start. Subclasses may override."""
         await self.stop()
         await self.start()
+
+    async def start_thinking_signal(
+        self, event: InboundEvent
+    ) -> SignalHandle | None:
+        """Post a transport-specific 'working' signal.
+
+        Default no-op. Subclasses override only if they support a
+        visible thinking-signal (Slack reactions, Telegram typing
+        action, CLI socket frame). Implementations MUST be
+        exception-safe — a failure here must not abort the SDK call.
+        Returns ``None`` when the signal cannot be posted (e.g. missing
+        metadata in ``event.raw``) so the worker can skip the
+        corresponding clear path.
+        """
+
+        return None
+
+    async def clear_thinking_signal(self, handle: SignalHandle) -> None:
+        """Remove the thinking signal.
+
+        Default no-op. Subclasses override to undo whatever
+        ``start_thinking_signal`` posted. Implementations MUST be
+        exception-safe — a failure here must not propagate into the
+        worker's ``finally`` block.
+        """
+
+        return None
 
     @classmethod
     @abstractmethod
