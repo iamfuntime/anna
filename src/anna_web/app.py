@@ -6,8 +6,9 @@ it as ``anna_web.app:app``.
 
 The scaffold wires per-process state (placeholder dict until the
 ConfigStore/EnvStore/ScheduleStore subtasks land), mounts the
-vendored static directory, registers the shutdown hook, and serves a
-hardcoded placeholder index. Real routes land in subtasks 6-12.
+vendored static directory, registers the shutdown hook, and renders
+the Jinja2 base template for the index. Real routes (config / env /
+schedules / restart / healthz) land in subtasks 7-12.
 
 See Inbox/2026-06-02-ANNA-Web-Dashboard-Plan.md for the full design.
 """
@@ -18,22 +19,16 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
 
 from anna.config import AnnaConfig, load_config
 from anna.log import get_logger
 
 _STATIC_DIR = Path(__file__).parent / "static"
-
-_PLACEHOLDER_HTML = (
-    "<!doctype html>"
-    "<html><head><title>ANNA Dashboard</title></head>"
-    "<body><h1>ANNA Dashboard</h1>"
-    "<p>ANNA Dashboard — scaffold ready. Subtasks 3-13 still in flight.</p>"
-    "</body></html>"
-)
+_TEMPLATES_DIR = Path(__file__).parent / "templates"
 
 
 def create_app(cfg: AnnaConfig) -> FastAPI:
@@ -73,17 +68,24 @@ def create_app(cfg: AnnaConfig) -> FastAPI:
         "restart_manager": None,
     }
 
-    # Vendored frontend assets (htmx + pico). Mounted unconditionally so
-    # subtask 6's base template can <link>/<script> them once it lands.
+    # Jinja2 template environment. Lives on app.state so subtask 7+
+    # route modules can pull it via request.app.state.templates without
+    # re-instantiating per request.
+    templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
+    app.state.templates = templates
+
+    # Vendored frontend assets (htmx + pico + app.css/app.js). Mounted
+    # unconditionally so the base template's <link>/<script> tags
+    # resolve.
     app.mount(
         "/static",
         StaticFiles(directory=str(_STATIC_DIR)),
         name="static",
     )
 
-    @app.get("/", response_class=HTMLResponse)
-    async def _index() -> str:
-        return _PLACEHOLDER_HTML
+    @app.get("/")
+    async def _index(request: Request) -> Response:
+        return templates.TemplateResponse(request, "index.html")
 
     return app
 

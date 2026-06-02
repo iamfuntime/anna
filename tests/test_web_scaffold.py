@@ -27,7 +27,14 @@ def test_app_importable() -> None:
 
 
 def test_app_root_serves_placeholder() -> None:
-    """GET / returns the scaffold placeholder HTML."""
+    """GET / returns the Jinja2-rendered index page.
+
+    Subtask 6 swapped the inline placeholder string for an
+    ``index.html`` template that extends ``base.html``. The body now
+    advertises that the dashboard is live and points at the (still
+    unrouted) nav targets — assert on the new copy so the test
+    actually pins what ships.
+    """
     from anna_web.app import app
 
     client = TestClient(app)
@@ -35,7 +42,7 @@ def test_app_root_serves_placeholder() -> None:
 
     assert response.status_code == 200
     assert "ANNA Dashboard" in response.text
-    assert "scaffold ready" in response.text
+    assert "ANNA Dashboard is live" in response.text
 
 
 def test_static_mount() -> None:

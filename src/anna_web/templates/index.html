@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+
+{% block title %}ANNA Dashboard{% endblock %}
+
+{% block content %}
+  <h1>ANNA Dashboard</h1>
+  <p>ANNA Dashboard is live. Use the nav above to edit config, secrets, and schedules.</p>
+  <ul>
+    <li><strong>Config</strong> — form-based editor for every section of <code>anna.yaml</code>.</li>
+    <li><strong>Secrets</strong> — masked editor for <code>.env</code> with a per-key reveal toggle.</li>
+    <li><strong>Schedules</strong> — list, create, edit, and delete entries in <code>schedules.yaml</code>.</li>
+  </ul>
+  <p><small>Routes for these nav targets land in later subtasks of the Phase 2.5 web dashboard buildout.</small></p>
+{% endblock %}

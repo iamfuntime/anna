@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{% block title %}ANNA Dashboard{% endblock %}</title>
+    <link rel="stylesheet" href="/static/pico.min.css">
+    <link rel="stylesheet" href="/static/app.css">
+    <script src="/static/htmx.min.js" defer></script>
+    <script src="/static/app.js" defer></script>
+  </head>
+  <body>
+    <nav class="container-fluid">
+      <ul>
+        <li><a href="/"><strong>ANNA Dashboard</strong></a></li>
+      </ul>
+      <ul>
+        <li><a href="/config">Config</a></li>
+        <li><a href="/env">Secrets</a></li>
+        <li><a href="/schedules">Schedules</a></li>
+      </ul>
+    </nav>
+    <main class="container">
+      {% block content %}{% endblock %}
+    </main>
+    <div id="toast" class="toast"></div>
+  </body>
+</html>
