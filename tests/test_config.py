@@ -7,7 +7,13 @@ from pathlib import Path
 import pytest
 import yaml
 
-from anna.config import AnnaConfig, IdentityAliasEntry, RuntimeVisibilityConfig, load_config
+from anna.config import (
+    AnnaConfig,
+    IdentityAliasEntry,
+    RuntimeVisibilityConfig,
+    WebDashboardConfig,
+    load_config,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -267,6 +273,63 @@ def test_runtime_visibility_rejects_bad_regex() -> None:
     with pytest.raises(ValueError) as excinfo:
         RuntimeVisibilityConfig(lint_patterns=["(unclosed"])
     assert "lint_patterns" in str(excinfo.value)
+
+
+def test_web_dashboard_defaults_when_block_omitted() -> None:
+    """A config with no web: block uses WebDashboardConfig defaults."""
+    raw = {"auth": {"mode": "max"}}
+    cfg = AnnaConfig.model_validate(raw)
+    assert isinstance(cfg.web, WebDashboardConfig)
+    assert cfg.web.enabled is True
+    assert cfg.web.host == "127.0.0.1"
+    assert cfg.web.port == 8765
+    assert cfg.web.target_unit == "anna.service"
+
+
+def test_web_dashboard_direct_instantiation_defaults() -> None:
+    """WebDashboardConfig() with no args matches the documented defaults."""
+    wd = WebDashboardConfig()
+    assert wd.enabled is True
+    assert wd.host == "127.0.0.1"
+    assert wd.port == 8765
+    assert wd.target_unit == "anna.service"
+
+
+def test_web_dashboard_disabled_persists() -> None:
+    raw = {"web": {"enabled": False}}
+    cfg = AnnaConfig.model_validate(raw)
+    assert cfg.web.enabled is False
+
+
+def test_web_dashboard_port_validation() -> None:
+    for bad in (0, -1, 65536, 100000):
+        with pytest.raises(Exception):
+            AnnaConfig.model_validate({"web": {"port": bad}})
+
+
+def test_web_dashboard_custom_values_persist() -> None:
+    raw = {
+        "web": {
+            "enabled": True,
+            "host": "0.0.0.0",
+            "port": 9000,
+            "target_unit": "anna-test.service",
+        }
+    }
+    cfg = AnnaConfig.model_validate(raw)
+    assert cfg.web.host == "0.0.0.0"
+    assert cfg.web.port == 9000
+    assert cfg.web.target_unit == "anna-test.service"
+
+
+def test_example_yaml_includes_web_block() -> None:
+    """Confirms anna.yaml.example's web: block round-trips through the model."""
+    raw = yaml.safe_load(EXAMPLE_PATH.read_text(encoding="utf-8"))
+    cfg = AnnaConfig.model_validate(raw)
+    assert cfg.web.enabled is True
+    assert cfg.web.host == "127.0.0.1"
+    assert cfg.web.port == 8765
+    assert cfg.web.target_unit == "anna.service"
 
 
 def test_anna_config_identities_round_trips_through_model_dump() -> None:

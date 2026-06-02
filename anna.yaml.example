@@ -322,6 +322,30 @@ subagents:
     - mcp__anna_web__vault_download
 
 # ============================================================
+# web: Phase 2.5 dashboard.
+#
+# Localhost-only FastAPI app for editing anna.yaml, .env, and
+# schedules without dropping to a terminal. Runs as its own user
+# systemd unit (anna-web.service) so it survives an anna.service
+# crash and lets the operator inspect what happened. Default-on;
+# the wizard offers an opt-out at install time and
+# `anna-setup --disable-web` flips this non-interactively.
+#
+# host is bound to 127.0.0.1 by design — remote access is the
+# operator's reverse-proxy problem (Caddy, Tailscale, SSH tunnel).
+# Port 8765 sits clear of the common 3000/5000/8000/8080 dev range.
+# target_unit is the systemd user unit the in-dashboard Restart
+# button acts on; pinned here at config time, never accepted from
+# a request body, so there is no path for a crafted POST to
+# restart an arbitrary unit.
+# ============================================================
+web:
+  enabled: true
+  host: 127.0.0.1
+  port: 8765
+  target_unit: anna.service
+
+# ============================================================
 # identities: Phase 2 §5 cross-transport identity aliasing.
 #
 # DO NOT UNCOMMENT. Identity aliasing across slack/telegram/cli is

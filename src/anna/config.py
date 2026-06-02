@@ -502,6 +502,53 @@ class SchedulerConfig(BaseModel):
         return Path(os.path.expanduser(self.state_path))
 
 
+class WebDashboardConfig(BaseModel):
+    """Phase 2.5 localhost-only FastAPI dashboard.
+
+    A separate user systemd unit (``anna-web.service``) running a small
+    FastAPI app that gives the operator form-based editors for
+    ``anna.yaml``, ``.env``, and ``schedules.yaml`` plus a one-button
+    restart of the main daemon. The dashboard runs out-of-process and
+    never mutates the running daemon's in-memory state; edits land on
+    disk and the operator presses Restart.
+
+    The auth boundary is ``127.0.0.1`` + filesystem permissions on
+    ``~/anna/.env`` — the same posture the CLI transport's
+    Unix-socket adapter takes. Remote access is the operator's
+    reverse-proxy problem (Caddy, Tailscale, SSH tunnel); ANNA does
+    not ship a login UI in v1.
+
+    * ``enabled`` — default-on. The wizard offers an opt-out prompt
+      and ``anna-setup --disable-web`` flips this without an
+      interactive session.
+    * ``host`` — bind address. Default ``127.0.0.1`` keeps the port
+      off the network. Operators who front the dashboard with a
+      reverse proxy on the same box can leave this as-is and proxy
+      to localhost.
+    * ``port`` — TCP port. 8765 was picked to sit well clear of the
+      common dev-server range (3000/5000/8000/8080).
+    * ``target_unit`` — the systemd user unit the Restart button
+      acts on. Pinned at config time, never accepted from a request
+      body, so there is no path for a crafted POST to restart an
+      arbitrary unit.
+
+    See Inbox/2026-06-02-ANNA-Web-Dashboard-Plan.md for the full
+    design.
+    """
+
+    enabled: bool = True
+    host: str = "127.0.0.1"
+    port: int = 8765
+    target_unit: str = "anna.service"
+
+    @field_validator("port")
+    @classmethod
+    def _port_in_range(cls, v: int) -> int:
+        if v < 1 or v > 65535:
+            raise ValueError("web.port must be between 1 and 65535")
+        return v
+
+
 class IdentityAliasEntry(BaseModel):
     """Phase 2 §5 identity alias.
 
@@ -558,6 +605,7 @@ class AnnaConfig(BaseModel):
     google: GoogleConfig = Field(default_factory=GoogleConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
     subagents: SubagentsConfig = Field(default_factory=SubagentsConfig)
+    web: WebDashboardConfig = Field(default_factory=WebDashboardConfig)
     identities: list[IdentityAliasEntry] = Field(default_factory=list)
 
     # Derived runtime paths. Not in the YAML file. ANNA_HOME from .env wins,

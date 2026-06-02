@@ -65,6 +65,19 @@ dependencies = [
     # `anna ask` is plain stdin/stdout but lives in the same dependency
     # so both CLI entrypoints share install footprint.
     "prompt_toolkit>=3.0",
+    # Phase 2.5 web dashboard: localhost-only FastAPI app for editing
+    # anna.yaml / .env / schedules, served by uvicorn on its own user
+    # systemd unit (anna-web.service). jinja2 renders the HTMX-driven
+    # templates. ruamel.yaml round-trips anna.yaml so form writes
+    # preserve operator comments verbatim instead of clobbering them
+    # with pyyaml's reformat. dbus-next drives the in-dashboard
+    # "Restart anna.service" button via the operator's user dbus
+    # socket; subprocess fallback to systemctl is the safety net.
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "jinja2>=3.1",
+    "ruamel.yaml>=0.18",
+    "dbus-next>=0.2.3",
 ]
 
 [project.optional-dependencies]
