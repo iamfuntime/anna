@@ -19,7 +19,13 @@ from typing import Any
 
 from anna.config import AnnaConfig
 from anna.log import get_logger
-from anna.transports.base import ChannelAdapter, InboundEvent, InboundHandler, OutboundMessage
+from anna.transports.base import (
+    ChannelAdapter,
+    InboundEvent,
+    InboundHandler,
+    OutboundMessage,
+    SignalHandle,
+)
 from anna.transports.slack_thread_state import ThreadParticipation
 
 
@@ -277,6 +283,99 @@ class SlackAdapter(ChannelAdapter):
             return f"slack:ch:{channel_id}:{event_ts}:oneshot"
         # Fallback: treat top-level channel messages as one-shot.
         return f"slack:ch:{channel_id}:{event_ts}:oneshot"
+
+    # ------------------------------------------------------------------
+    # Visibility hooks — Slack reactions as a "thinking" signal
+    # ------------------------------------------------------------------
+
+    async def start_thinking_signal(
+        self, event: InboundEvent
+    ) -> SignalHandle | None:
+        """Post a Slack reaction on the inbound message as a "working" signal.
+
+        Reads ``channel`` and ``ts`` straight off ``event.raw`` — the
+        full Slack event dict is stashed there by
+        :meth:`_to_inbound_event`. Both DM (``channel_type == "im"``)
+        and channel-thread shapes carry ``channel`` and ``ts`` directly
+        so the same call shape covers every conv_key variant.
+
+        Emoji name is sourced from
+        ``config.runtime.visibility.slack_emoji`` so the operator can
+        swap it without code edits. Failures (network drop, 429,
+        missing emoji on workspace) log a warning and return ``None``;
+        the SDK turn continues uninterrupted.
+        """
+
+        channel = event.raw.get("channel") if event.raw else None
+        ts = event.raw.get("ts") if event.raw else None
+        if not channel or not ts:
+            self._log.debug(
+                "visibility.slack.reaction_skipped",
+                conv_key=event.conversation_key,
+                reason="missing_channel_or_ts",
+            )
+            return None
+
+        emoji = self._config.runtime.visibility.slack_emoji or "thinking_face"
+
+        try:
+            await self._client.reactions_add(
+                channel=channel, timestamp=ts, name=emoji
+            )
+        except Exception as exc:
+            self._log.warning(
+                "visibility.slack.reaction_add_failed",
+                conv_key=event.conversation_key,
+                channel=channel,
+                ts=ts,
+                emoji=emoji,
+                error=str(exc),
+            )
+            return None
+
+        return SignalHandle(
+            transport="slack",
+            conv_key=event.conversation_key,
+            slack_channel=channel,
+            slack_ts=ts,
+            slack_emoji=emoji,
+        )
+
+    async def clear_thinking_signal(self, handle: SignalHandle) -> None:
+        """Remove the Slack reaction posted by ``start_thinking_signal``.
+
+        Exception-isolated: Slack returns ``reaction_not_found`` if the
+        reaction was already cleared (e.g. by an operator removing it
+        manually), and a network error here would otherwise propagate
+        into the worker's ``finally`` block. Both fail at debug level —
+        a dangling reaction is harmless, slightly ugly.
+        """
+
+        channel = handle.slack_channel
+        ts = handle.slack_ts
+        emoji = handle.slack_emoji
+        if not channel or not ts or not emoji:
+            self._log.debug(
+                "visibility.slack.reaction_clear_skipped",
+                conv_key=handle.conv_key,
+                reason="missing_handle_fields",
+            )
+            return None
+
+        try:
+            await self._client.reactions_remove(
+                channel=channel, timestamp=ts, name=emoji
+            )
+        except Exception as exc:
+            self._log.debug(
+                "visibility.slack.reaction_remove_failed",
+                conv_key=handle.conv_key,
+                channel=channel,
+                ts=ts,
+                emoji=emoji,
+                error=str(exc),
+            )
+        return None
 
     # ------------------------------------------------------------------
     # Health
