@@ -1,0 +1,120 @@
+{#
+  Restart-button partial (subtask 10).
+
+  Two states keyed off the `state` context variable:
+
+  * `idle`       — the default. Renders the confirm-then-POST form.
+                   `/restart` POST returns this partial in the
+                   `restarting` state on success or the same idle
+                   state plus an error toast on failure.
+
+  * `restarting` — optimistic UI rendered immediately after the
+                   restart dispatches. Embeds a small inline poller
+                   that pings `/healthz` (subtask 11) every 2s and
+                   swaps the partial back to idle after three
+                   consecutive `anna_running: true` responses. The
+                   inline-JS choice over pure-HTMX is documented in
+                   the route module's docstring — `/healthz` returns
+                   JSON, not HTML, and counting "good response
+                   streaks" client-side is cleaner than coercing
+                   HTMX swap semantics to do it.
+
+  Both states render inside the same outermost wrapper so HTMX's
+  `hx-target="this"` / `hx-swap="outerHTML"` on the form replaces the
+  entire partial atomically.
+
+  Template context keys:
+    state                  — "idle" | "restarting"
+    unit                   — the systemd unit name (display only)
+    method                 — "dbus" | "subprocess" | None (restarting only)
+    job_id                 — systemd job object path or None (restarting only)
+    error                  — error string when a restart failed (idle + error toast)
+    last_restart           — datetime or None (idle, post-restart)
+    last_restart_relative  — "5s ago" style string or None
+    toast                  — {"level": "success"|"error", "message": str} or None
+#}
+{% if state == "restarting" %}
+<div class="restart-status"
+     data-restart-partial="restarting"
+     data-good-count="0"
+     data-unit="{{ unit }}">
+  <article aria-busy="true" role="status">
+    Restarting {{ unit }} via {{ method }}&hellip;
+    {% if job_id %}<small>job {{ job_id }}</small>{% endif %}
+  </article>
+  {% if toast %}
+    <article class="toast toast-{{ toast.level }}" role="status">{{ toast.message }}</article>
+  {% endif %}
+  <script>
+    (function () {
+      // Find the partial we were just swapped into. document.currentScript
+      // is the most robust selector for partials that may render multiple
+      // times on the page (we don't, today, but it's cheap insurance).
+      var script = document.currentScript;
+      var root = script && script.parentElement;
+      if (!root) { return; }
+
+      var THRESHOLD = 3;
+      var INTERVAL_MS = 2000;
+      var pollTimer = null;
+
+      function swapBackToIdle() {
+        // Ask the server for the freshly-rendered idle partial. Using
+        // htmx.ajax keeps the swap consistent with how the form's
+        // hx-swap="outerHTML" would behave (target = the partial root).
+        if (window.htmx) {
+          window.htmx.ajax('GET', '/restart', {target: root, swap: 'outerHTML'});
+        } else {
+          // No HTMX (e.g. test environment without the script). Fall
+          // back to a full reload so the operator at least sees fresh
+          // state.
+          window.location.reload();
+        }
+      }
+
+      function tick() {
+        fetch('/healthz', {headers: {'Accept': 'application/json'}})
+          .then(function (r) { return r.ok ? r.json() : null; })
+          .then(function (j) {
+            var running = j && (j.anna_running === true);
+            var current = parseInt(root.getAttribute('data-good-count') || '0', 10);
+            var next = running ? current + 1 : 0;
+            root.setAttribute('data-good-count', String(next));
+            if (next >= THRESHOLD) {
+              clearInterval(pollTimer);
+              swapBackToIdle();
+            }
+          })
+          .catch(function () {
+            // Reset the streak on any network error; the daemon is
+            // probably mid-restart and /healthz hasn't come back yet.
+            root.setAttribute('data-good-count', '0');
+          });
+      }
+
+      pollTimer = setInterval(tick, INTERVAL_MS);
+      // Kick off an immediate first probe so the operator doesn't wait
+      // a full 2s for the first datapoint when the restart is quick.
+      tick();
+    })();
+  </script>
+</div>
+{% else %}
+<form class="restart-form"
+      data-restart-partial="idle"
+      hx-post="/restart"
+      hx-target="this"
+      hx-swap="outerHTML"
+      hx-confirm="Restart {{ unit }}? Active workers will be drained.">
+  <button type="submit" class="restart-button contrast">Restart {{ unit }}</button>
+  {% if last_restart_relative %}
+    <small class="restart-last">Last restart: {{ last_restart_relative }}</small>
+  {% endif %}
+  {% if error %}
+    <small class="restart-error" role="alert">{{ error }}</small>
+  {% endif %}
+  {% if toast %}
+    <article class="toast toast-{{ toast.level }}" role="status">{{ toast.message }}</article>
+  {% endif %}
+</form>
+{% endif %}

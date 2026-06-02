@@ -28,7 +28,14 @@ from anna.config import AnnaConfig, load_config
 from anna.log import get_logger
 from anna_web.config_store import ConfigStore
 from anna_web.env_store import EnvStore
-from anna_web.routes import config_routes, env_routes, schedule_routes
+from anna_web.restart import RestartManager
+from anna_web.routes import (
+    config_routes,
+    env_routes,
+    healthz_routes,
+    restart_routes,
+    schedule_routes,
+)
 from anna_web.schedule_store_adapter import ScheduleStoreAdapter
 
 _STATIC_DIR = Path(__file__).parent / "static"
@@ -71,11 +78,13 @@ def create_app(cfg: AnnaConfig) -> FastAPI:
     app.state.env_store = env_store
     schedule_store = ScheduleStoreAdapter(anna_home=cfg.anna_home, config=cfg)
     app.state.schedule_store = schedule_store
+    restart_manager = RestartManager(target_unit=cfg.web.target_unit)
+    app.state.restart_manager = restart_manager
     app.state.stores = {
         "config_store": config_store,
         "env_store": env_store,
         "schedule_store": schedule_store,
-        "restart_manager": None,
+        "restart_manager": restart_manager,
     }
 
     # Jinja2 template environment. Lives on app.state so subtask 7+
@@ -100,6 +109,8 @@ def create_app(cfg: AnnaConfig) -> FastAPI:
     app.include_router(config_routes.router)
     app.include_router(env_routes.router)
     app.include_router(schedule_routes.router)
+    app.include_router(healthz_routes.router)
+    app.include_router(restart_routes.router)
 
     return app
 
