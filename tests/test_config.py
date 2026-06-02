@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from anna.config import AnnaConfig, IdentityAliasEntry, load_config
+from anna.config import AnnaConfig, IdentityAliasEntry, RuntimeVisibilityConfig, load_config
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -247,6 +247,26 @@ def test_anna_config_rejects_duplicate_canonical() -> None:
     # The error message mentions the offending canonical name (each
     # duplicated value is named in the validator's ValueError).
     assert "seth" in str(excinfo.value)
+
+
+def test_runtime_visibility_defaults() -> None:
+    """RuntimeVisibilityConfig defaults parse and lint_patterns has 5 seeds."""
+    cfg = AnnaConfig.model_validate({"auth": {"mode": "max"}})
+    vis = cfg.runtime.visibility
+    assert isinstance(vis, RuntimeVisibilityConfig)
+    assert vis.reaction_signal is True
+    assert vis.cadence_reminder is True
+    assert vis.response_lint is True
+    assert vis.slack_emoji == "thinking_face"
+    assert vis.telegram_typing_max_seconds == 180
+    assert len(vis.lint_patterns) == 5
+
+
+def test_runtime_visibility_rejects_bad_regex() -> None:
+    """A malformed lint_patterns entry raises at validation, not at first match."""
+    with pytest.raises(ValueError) as excinfo:
+        RuntimeVisibilityConfig(lint_patterns=["(unclosed"])
+    assert "lint_patterns" in str(excinfo.value)
 
 
 def test_anna_config_identities_round_trips_through_model_dump() -> None:

@@ -27,6 +27,36 @@ runtime:
   #   plan               read-only planning mode, no writes
   #   default            interactive prompts (do not use in a service)
   permission_mode: bypassPermissions
+  # ----------------------------------------------------------
+  # Cadence-visibility hooks (Inbox/2026-06-02 plan).
+  #
+  # Three independently-toggleable surfaces that give the operator
+  # feedback while ANNA is mid-turn on buffered transports:
+  #   reaction_signal   per-transport "thinking" signal (Slack
+  #                     reaction, Telegram typing action, CLI frame)
+  #                     posted before client.query() and cleared on
+  #                     ResultMessage.
+  #   cadence_reminder  small <system-reminder> block sourced from
+  #                     core/CADENCE.md, prepended to inbound text on
+  #                     Slack and Telegram only.
+  #   response_lint     telemetry-only regex scan of the final
+  #                     reply_text. Emits structured warnings on
+  #                     match; never blocks delivery.
+  # Defaults are on. lint_patterns ships with five seed regexes for
+  # known bad-cadence phrases; bad regex fails fast at boot.
+  # ----------------------------------------------------------
+  # visibility:
+  #   reaction_signal: true
+  #   cadence_reminder: true
+  #   response_lint: true
+  #   slack_emoji: thinking_face
+  #   telegram_typing_max_seconds: 180
+  #   lint_patterns:
+  #     - "kicking off .{0,40}\\bin the background\\b"
+  #     - "\\bon it\\b\\s*[—-]\\s*\\w+ing\\b"
+  #     - "^Synthesizing:"
+  #     - "^Let me \\w+\\s+[—-]\\s+"
+  #     - "backgrounded so\\b"
 
 # ============================================================
 # Transports

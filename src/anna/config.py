@@ -16,6 +16,7 @@ tradeoff.
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Any, Literal
 
@@ -33,6 +34,75 @@ class AuthConfig(BaseModel):
     mode: Literal["max", "api_key"] = "max"
 
 
+class RuntimeVisibilityConfig(BaseModel):
+    """Cadence-visibility hooks (per Inbox/2026-06-02 plan).
+
+    Three independently-toggleable surfaces that give the operator feedback
+    while ANNA is mid-turn on buffered transports:
+
+    * ``reaction_signal`` — per-transport "thinking" signal posted before
+      ``client.query()`` and cleared on ``ResultMessage`` (Slack reaction,
+      Telegram typing action, CLI frame).
+    * ``cadence_reminder`` — small ``<system-reminder>`` block sourced from
+      ``core/CADENCE.md`` and prepended to the inbound text on Slack and
+      Telegram only (CLI sees deltas live, no reminder needed).
+    * ``response_lint`` — telemetry-only regex scan of the final
+      ``reply_text`` for known bad-cadence phrases. Emits structured
+      warnings; never blocks delivery.
+
+    Defaults are on — the primary pain (10-90s blank pauses on buffered
+    transports) is real and the operator wants the fix live. Each flag can
+    be flipped independently in ``anna.yaml`` without restarting the
+    others.
+    """
+
+    reaction_signal: bool = True
+    cadence_reminder: bool = True
+    response_lint: bool = True
+
+    # Slack-specific knobs. Custom emojis may not exist on every workspace;
+    # if reactions.add fails the worker logs a warning and the SDK turn
+    # continues uninterrupted.
+    slack_emoji: str = "thinking_face"
+
+    # Telegram refresher bound. Beyond this many seconds the refresher
+    # stops and lets the typing indicator naturally expire — better to
+    # show "stopped typing" than to spam send_chat_action indefinitely on
+    # a runaway SDK call.
+    telegram_typing_max_seconds: int = 180
+
+    # Telemetry-only lint patterns. Regex strings compiled at config-load
+    # time so a broken pattern fails fast at boot, not at first match.
+    lint_patterns: list[str] = Field(
+        default_factory=lambda: [
+            r"kicking off .{0,40}\bin the background\b",
+            r"\bon it\b\s*[—-]\s*\w+ing\b",
+            r"^Synthesizing:",
+            r"^Let me \w+\s+[—-]\s+",
+            r"backgrounded so\b",
+        ]
+    )
+
+    @field_validator("lint_patterns")
+    @classmethod
+    def _compile_patterns(cls, v: list[str]) -> list[str]:
+        """Compile every pattern at config-load so a broken regex fails fast.
+
+        We do not retain the compiled objects on the model (the linter
+        recompiles at runtime with its own flags), but compiling here
+        catches a malformed pattern at boot instead of at first lint call.
+        """
+        for pat in v:
+            try:
+                re.compile(pat)
+            except re.error as exc:
+                raise ValueError(
+                    f"runtime.visibility.lint_patterns: invalid regex "
+                    f"{pat!r}: {exc}"
+                ) from exc
+        return v
+
+
 class RuntimeConfig(BaseModel):
     """SDK runtime options applied to every conversation worker.
 
@@ -47,6 +117,7 @@ class RuntimeConfig(BaseModel):
     permission_mode: Literal[
         "default", "acceptEdits", "bypassPermissions", "plan"
     ] = "bypassPermissions"
+    visibility: RuntimeVisibilityConfig = Field(default_factory=RuntimeVisibilityConfig)
 
 
 class SlackTransportConfig(BaseModel):
