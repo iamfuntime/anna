@@ -34,9 +34,12 @@ RestartSec=10
 # cgroup and the SDK subprocess dies concurrently, forcing closeout to
 # fall back to a placeholder summary. TimeoutStopSec bounds how long
 # systemd waits before SIGKILLing the rest of the cgroup if the main
-# process has not exited.
+# process has not exited. 180s aligns with §3's sub-agent default timeout
+# (300s) divided across worst-case parallelism — closeout has to drain
+# any in-flight sub-agent work plus query the SDK for summaries. Earlier
+# 60s value SIGKILL'd the cgroup mid-closeout on 2026-06-02.
 KillMode=mixed
-TimeoutStopSec=60
+TimeoutStopSec=180
 
 # Forward stdout and stderr to the user journal. ANNA emits structured
 # JSON to stdout; journald stores it. The anna-logs wrapper reads it back
