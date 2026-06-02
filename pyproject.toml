@@ -81,6 +81,7 @@ anna-logs = "anna.cli.logs:main"
 anna-admin = "anna.cli.admin:main"
 anna-setup = "anna.setup.wizard:main"
 anna-persona = "anna.setup.wizard:persona_entrypoint"
+anna-web = "anna_web.__main__:main"
 
 [project.urls]
 Homepage = "https://github.com/iamfuntime/anna"
@@ -88,16 +89,21 @@ Repository = "https://github.com/iamfuntime/anna"
 Issues = "https://github.com/iamfuntime/anna/issues"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/anna"]
+packages = ["src/anna", "src/anna_web"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/anna/setup/templates/anna.service" = "anna/setup/templates/anna.service"
 
 [tool.hatch.build.targets.sdist]
 include = [
     "src/anna",
+    "src/anna_web",
     "README.md",
     "anna.yaml.example",
     ".env.example",
-    "systemd",
     "install.sh",
+    "Makefile",
+    "scripts",
     "tests",
 ]
 

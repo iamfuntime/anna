@@ -32,6 +32,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
+from importlib import resources
 from pathlib import Path
 from typing import Any
 
@@ -741,18 +742,24 @@ def _install_systemd_unit(state: WizardState) -> dict[str, Any] | None:
     """
     target_dir = Path(os.path.expanduser("~/.config/systemd/user"))
     target_dir.mkdir(parents=True, exist_ok=True)
-    src = Path(__file__).resolve().parents[3] / "systemd" / "anna.service"
+    # Bundled template — see src/anna/setup/templates/anna.service. Read via
+    # importlib.resources so the lookup works both from a `pip install -e .`
+    # editable checkout and from a `uv tool install`-managed venv. Same
+    # pattern anna.core.identity uses for anna.core_files (identity.py:84-89).
     target = target_dir / "anna.service"
-    if not src.is_file():
+    try:
+        template_resource = resources.files("anna.setup.templates").joinpath("anna.service")
+        rendered = template_resource.read_text(encoding="utf-8")
+    except (FileNotFoundError, ModuleNotFoundError):
         click.secho(
-            f"Warning: could not find packaged anna.service at {src}. "
-            f"Copy the unit manually and enable it with "
-            f"`systemctl --user enable --now anna`.",
+            "Warning: could not load packaged anna.service template. "
+            "Copy the unit manually and enable it with "
+            "`systemctl --user enable --now anna`.",
             fg="yellow",
         )
         return None
 
-    shutil.copy2(src, target)
+    target.write_text(rendered, encoding="utf-8")
     return _start_and_probe(state)
 
 

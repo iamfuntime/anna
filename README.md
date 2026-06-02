@@ -20,42 +20,86 @@ want the why behind any of the choices in this repository. The plan covers:
 
 ## Installation
 
-The intended path is the one-line installer:
+The one-line installer:
 
 ```bash
 curl -fsSL https://anna.funtime.dev/install.sh | bash
 ```
 
-The script clones this repository, creates a venv, runs `pip install -e .`, and hands
-off to the setup wizard. The wizard is a calm, guided interview: it collects credentials,
-writes `.env` at `chmod 600` and `anna.yaml`, seeds ANNA's core identity files, installs
-and starts the systemd user unit, then waits and reports honest per-transport readiness
-(Slack/Telegram connected, or where to look if not). Press Enter to accept defaults; pass
-`--verbose` to see the full channel walkthroughs inline.
+The script verifies `uv` is installed, clones the source tree to a
+transient cache (`~/.cache/anna-source/`), runs `uv tool install` to
+drop shim binaries into `~/.local/bin/`, and hands off to the
+interactive setup wizard. The wizard collects credentials, writes
+`.env` at `chmod 600` and `anna.yaml` under `~/anna/`, seeds ANNA's
+core identity files, installs and starts the systemd user unit, then
+waits and reports per-transport readiness. Press Enter to accept
+defaults; pass `--verbose` to the wizard for inline channel walkthroughs.
 
-The channel walkthroughs are summarized in the wizard; the full step-by-step guides
-(with the gotchas) live in [`docs/slack-setup.md`](docs/slack-setup.md) and
-[`docs/telegram-setup.md`](docs/telegram-setup.md).
-
-### Manual install
+After install:
 
 ```bash
-git clone https://github.com/iamfuntime/anna ~/anna
-cd ~/anna
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e .
+anna --version                # works from anywhere
+anna-logs --follow            # tail operational events
+systemctl --user status anna  # supervisor state
+```
+
+If `~/.local/bin` isn't on your `$PATH`, the installer warns and prints
+the rc-file snippet to add it. Open a new shell after editing the rc.
+
+Prerequisites: `uv`, `git`, `curl`, Python 3.11+. Install `uv` with:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+### Manual install (no curl-pipe-bash)
+
+```bash
+git clone https://github.com/iamfuntime/anna ~/.cache/anna-source
+uv tool install ~/.cache/anna-source
 anna-setup
+```
+
+### Migrating from a pre-Phase-A install
+
+If you installed ANNA before this migration, you have a `~/anna/.venv/`
+directory and a systemd unit pointing at it. Run the migration once:
+
+```bash
+cd ~/git/anna   # or wherever your source checkout lives
+bash scripts/migrate-to-uv-tool.sh
+```
+
+The script stops the daemon, installs the new `uv tool` shape, verifies
+the new daemon comes up healthy, then deletes the old venv. State files
+(`anna.yaml`, `.env`, `core/`, `audit/`, `transcripts/`,
+`schedules.yaml`) are never touched.
+
+### Dev workflow
+
+Editing source, then propagating to the running daemon:
+
+```bash
+cd ~/git/anna
+edit src/anna/...
+git commit -am "..."
+make dev-restart    # uv tool install . --reinstall && systemctl --user restart anna
 ```
 
 ## Systemd
 
-The wizard installs `systemd/anna.service` to `~/.config/systemd/user/anna.service` and
-runs `systemctl --user enable --now anna`. To do it by hand:
+The setup wizard installs `anna.service` (bundled inside the wheel at
+`anna.setup.templates`) to `~/.config/systemd/user/anna.service` and
+runs `systemctl --user enable --now anna`. The unit's `ExecStart=`
+points at `%h/.local/bin/anna` (the uv-managed shim) and sets
+`Environment=ANNA_HOME=%h/anna`. To install manually:
 
 ```bash
 mkdir -p ~/.config/systemd/user
-cp systemd/anna.service ~/.config/systemd/user/
+uv tool run --from anna python -c \
+  "from importlib.resources import files; \
+   print(files('anna.setup.templates').joinpath('anna.service').read_text())" \
+  > ~/.config/systemd/user/anna.service
 systemctl --user daemon-reload
 systemctl --user enable --now anna
 loginctl enable-linger "$USER"
@@ -113,7 +157,7 @@ anna/
     setup/                   interactive wizard
     cli/                     anna-logs and anna-admin
     core_files/              SOUL.md, CLAUDE.md, AGENTS.md, MEMORY.md, IDENTITY.md
-  systemd/anna.service       user unit template
+  src/anna/setup/templates/anna.service       user unit template
   install.sh                 curl-pipe-bash installer
   tests/                     pytest suite
 ```

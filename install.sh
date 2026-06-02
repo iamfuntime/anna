@@ -1,98 +1,148 @@
 #!/usr/bin/env bash
 #
-# install.sh: ANNA one-line installer.
-#
-# Intended invocation, run by the operator from their terminal:
+# install.sh: ANNA one-line installer (Linux, Phase A).
 #
 #   curl -fsSL https://anna.funtime.dev/install.sh | bash
 #
-# The script checks prerequisites, clones the repository to $ANNA_HOME
-# (default ~/anna), creates a venv, installs the package in editable
-# mode, and hands off to the interactive setup wizard.
-#
-# This file is a TEMPLATE the operator runs. Do not execute it during
-# repository scaffolding; it requires network access and writes to the
-# operator's home directory.
+# Installs ANNA via `uv tool install` into a managed venv under
+# ~/.local/share/uv/tools/anna/, with shim binaries dropped into
+# ~/.local/bin/. ~/anna/ becomes state-only — no source, no venv.
 #
 set -euo pipefail
 
 ANNA_HOME="${ANNA_HOME:-$HOME/anna}"
 REPO_URL="${ANNA_REPO_URL:-https://github.com/iamfuntime/anna}"
-PYTHON_BIN="${PYTHON_BIN:-python3}"
+ANNA_SOURCE_DIR="${ANNA_SOURCE_DIR:-}"      # set by Makefile dev loop
 
 # Colored banners help the operator track progress when running this
 # through curl-pipe-bash where the terminal scrolls quickly.
-say() { printf '\033[1;36m[anna]\033[0m %s\n' "$*"; }
+say()  { printf '\033[1;36m[anna]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[anna]\033[0m %s\n' "$*" >&2; }
-die() { printf '\033[1;31m[anna]\033[0m %s\n' "$*" >&2; exit 1; }
+die()  { printf '\033[1;31m[anna]\033[0m %s\n' "$*" >&2; exit 1; }
 
 check_prereq() {
-    local name="$1"
-    local cmd="$2"
-    local hint="$3"
+    local name="$1" cmd="$2" hint="$3"
     command -v "$cmd" >/dev/null 2>&1 && return 0
     warn "missing prerequisite: $name"
     [ -n "$hint" ] && warn "  install it with: $hint"
     die "install $name and re-run this script."
 }
 
-check_python_version() {
-    local version
-    version=$("$PYTHON_BIN" -c 'import sys; print("{}.{}".format(*sys.version_info[:2]))')
-    case "$version" in
-        3.11|3.12|3.13|3.14|3.15)
-            say "python $version detected"
+check_uv() {
+    # uv is the only Python toolchain the new install model uses. We don't
+    # auto-bootstrap it because the upstream installer wants its own
+    # informed consent (PATH edits, ~/.local/share writes). Direct the
+    # operator to the canonical one-liner and bail.
+    if ! command -v uv >/dev/null 2>&1; then
+        warn "uv is not installed."
+        warn "  install it with:"
+        warn "    curl -LsSf https://astral.sh/uv/install.sh | sh"
+        die "install uv and re-run this script."
+    fi
+    say "uv $(uv --version | awk '{print $2}') detected"
+}
+
+check_collision() {
+    # Refuse to run on top of a pre-Phase-A install — the operator must
+    # explicitly run the migration script so they understand the new
+    # layout (~/anna/.venv goes away, binaries move to ~/.local/bin).
+    if [ -d "$HOME/anna/.venv" ]; then
+        die "found existing venv at ~/anna/.venv (legacy install layout). Run scripts/migrate-to-uv-tool.sh from a source checkout to migrate, or delete ~/anna/.venv/ manually if you've already migrated."
+    fi
+}
+
+warn_path() {
+    # The uv tool install drops binaries into ~/.local/bin; many distros
+    # don't have that on PATH by default. We can't fix the operator's rc
+    # file from inside a curl-pipe-bash, so print the exact line they
+    # need to add and continue — `exec` at the end falls back to the
+    # absolute path so the wizard still launches.
+    case ":$PATH:" in
+        *":$HOME/.local/bin:"*)
+            say "~/.local/bin is on \$PATH"
             ;;
         *)
-            warn "ANNA requires Python 3.11 or newer, found $version."
-            die "install a newer Python (your package manager, pyenv, or python.org) and re-run."
+            warn "~/.local/bin is NOT on \$PATH."
+            warn "After install, the anna binary will live at ~/.local/bin/anna."
+            warn "Add this to your shell rc to find it:"
+            case "$SHELL" in
+                */fish) warn "  fish_add_path ~/.local/bin" ;;
+                */zsh)  warn "  echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.zshrc" ;;
+                */bash) warn "  echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.bashrc" ;;
+                *)      warn "  add ~/.local/bin to PATH in your shell startup file" ;;
+            esac
+            warn "Then open a new shell, or 'source' the rc file."
             ;;
     esac
 }
 
+resolve_source_dir() {
+    # Three-way: explicit env var, dev checkout under ~/git/anna,
+    # else clone to a transient cache. The Makefile's dev-restart loop
+    # sets ANNA_SOURCE_DIR; curl-pipe-bash takes the cache branch.
+    if [ -n "$ANNA_SOURCE_DIR" ] && [ -d "$ANNA_SOURCE_DIR" ]; then
+        say "using source dir from \$ANNA_SOURCE_DIR: $ANNA_SOURCE_DIR"
+        echo "$ANNA_SOURCE_DIR"
+        return
+    fi
+    if [ -d "$HOME/git/anna/.git" ]; then
+        say "using local dev checkout: $HOME/git/anna"
+        echo "$HOME/git/anna"
+        return
+    fi
+    local cache="$HOME/.cache/anna-source"
+    if [ -d "$cache/.git" ]; then
+        say "updating cached source clone at $cache"
+        git -C "$cache" fetch --quiet --prune
+        git -C "$cache" reset --hard --quiet origin/main
+    else
+        say "fresh install: cloning $REPO_URL into $cache"
+        rm -rf "$cache"
+        git clone --quiet "$REPO_URL" "$cache"
+    fi
+    echo "$cache"
+}
+
 main() {
     say "checking prerequisites"
-    check_prereq "git" "git" "apt install git  /  brew install git"
-    check_prereq "curl" "curl" "apt install curl  /  brew install curl"
-    check_prereq "python3" "$PYTHON_BIN" "apt install python3 python3-venv  /  brew install python"
-    check_python_version
+    check_prereq "git"   "git"   "apt install git"
+    check_prereq "curl"  "curl"  "apt install curl"
+    check_uv
+    check_collision
+    warn_path
 
-    if [ -d "$ANNA_HOME/.git" ]; then
-        say "updating existing install at $ANNA_HOME"
-        # Fast-forward only; never rewrite the operator's history. Runtime
-        # artifacts (.env, anna.yaml, core/, vault/, audit/, transcripts/) are
-        # gitignored at the repo root, so a pull won't touch them. If the
-        # operator hand-edited a *tracked* file the ff fails — warn and keep
-        # going with the current checkout rather than aborting the install.
-        git -C "$ANNA_HOME" pull --ff-only || \
-            warn "couldn't fast-forward (local edits to tracked files?). Continuing with the current checkout; inspect with: git -C $ANNA_HOME status"
-    else
-        say "fresh install: cloning $REPO_URL into $ANNA_HOME"
-        git clone "$REPO_URL" "$ANNA_HOME"
+    say "preparing source tree"
+    local src
+    src="$(resolve_source_dir)"
+
+    say "installing anna via uv tool install"
+    # --reinstall makes the call idempotent on existing installs.
+    uv tool install --reinstall "$src"
+
+    # Verify the shim is reachable from a fresh-env shell, not just the
+    # current one. Operator might have just been told PATH is wrong.
+    if ! env -i HOME="$HOME" PATH="$HOME/.local/bin:$PATH" "$HOME/.local/bin/anna" --help >/dev/null 2>&1; then
+        die "anna binary did not install correctly to ~/.local/bin/anna. Inspect with: uv tool list"
     fi
+    say "anna binary installed at ~/.local/bin/anna"
 
-    say "creating virtualenv at $ANNA_HOME/.venv"
-    "$PYTHON_BIN" -m venv "$ANNA_HOME/.venv"
-
-    # shellcheck disable=SC1091
-    source "$ANNA_HOME/.venv/bin/activate"
-
-    say "installing dependencies (this may take a minute)"
-    pip install --upgrade pip >/dev/null
-    pip install -e "$ANNA_HOME"
-
-    # Seed the markdown vault before the wizard so the operator's first
-    # boot of ANNA finds Conversations/, Identity/, agents/, skills/ etc.
-    # already in place. The script is idempotent: re-running install.sh
-    # never overwrites operator content.
-    if [ -x "$ANNA_HOME/scripts/seed_vault.sh" ]; then
+    # Seed the markdown vault. Now invoked from the transient clone, not
+    # from $ANNA_HOME — the new install model means $ANNA_HOME is
+    # state-only and has no scripts/ directory.
+    if [ -x "$src/scripts/seed_vault.sh" ]; then
         say "seeding markdown vault"
-        ANNA_HOME="$ANNA_HOME" bash "$ANNA_HOME/scripts/seed_vault.sh" || \
+        ANNA_HOME="$ANNA_HOME" bash "$src/scripts/seed_vault.sh" || \
             warn "vault seed step failed; continuing — re-run scripts/seed_vault.sh manually if needed"
     fi
 
     say "handing off to the setup wizard"
-    exec anna-setup
+    # exec into the shim so this script's bash process is replaced. If
+    # PATH doesn't include ~/.local/bin yet, fall back to the absolute path.
+    if command -v anna-setup >/dev/null 2>&1; then
+        exec anna-setup
+    else
+        exec "$HOME/.local/bin/anna-setup"
+    fi
 }
 
 main "$@"

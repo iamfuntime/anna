@@ -1,0 +1,56 @@
+[Unit]
+# Systemd user unit for ANNA.
+#
+# Bundled inside the anna wheel at anna.setup.templates.anna_service and
+# copied into ~/.config/systemd/user/anna.service by the setup wizard.
+# Manual install:
+#   uv tool install anna
+#   mkdir -p ~/.config/systemd/user
+#   uv tool run --from anna python -c "from importlib.resources import files; print(files('anna.setup.templates').joinpath('anna.service').read_text())" > ~/.config/systemd/user/anna.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now anna
+#   loginctl enable-linger $USER
+Description=ANNA: Adaptive Neural Network Assistant
+Documentation=https://github.com/iamfuntime/anna
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Type=simple: the process stays in the foreground, systemd treats the
+# main PID as the service. ANNA does its own asyncio loop and never forks.
+Type=simple
+
+# %h expands to the operator's home directory at unit-load time.
+# ~/anna is now STATE-ONLY: anna.yaml, .env, audit/, transcripts/, core/.
+# No source code, no venv.
+WorkingDirectory=%h/anna
+
+# ANNA's runtime resolves $ANNA_HOME for every path lookup. The binary
+# being launched from ~/.local/bin/ has no relationship to ~/anna/; the
+# env var is the only link.
+Environment=ANNA_HOME=%h/anna
+
+# uv-tool-managed shim. uv writes this script at install time; it
+# activates the managed venv's interpreter and execs the entry point.
+# Must be an absolute path — systemd does not expand $PATH.
+ExecStart=%h/.local/bin/anna
+
+# Restart on any non-clean exit. SIGTERM during shutdown is treated as
+# clean; the supervisor handles graceful drain of the worker pool.
+Restart=on-failure
+RestartSec=10
+
+# KillMode=mixed: SIGTERM goes only to the main PID; child processes
+# survive long enough for the closeout path in ConversationRouter.shutdown()
+# to query the Claude SDK subprocess for each worker's checkpoint summary.
+KillMode=mixed
+TimeoutStopSec=180
+
+StandardOutput=journal
+StandardError=journal
+
+MemoryMax=2G
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target
