@@ -17,6 +17,7 @@ import pytest
 from anna.config import AnnaConfig
 from anna.runtime.voice import (
     TranscriptionError,
+    TTSError,
     VoiceProcessor,
 )
 
@@ -325,3 +326,164 @@ def test_mark_voice_inbound_caches_and_expires(tmp_path: Path) -> None:
     assert proc._recent_voice_active("telegram:dm:42") is True
     # A different conv_key is unaffected.
     assert proc._recent_voice_active("slack:dm:U1") is False
+
+
+# ---------------------------------------------------------------------------
+# Subtask 7: maybe_synthesize_outbound
+# ---------------------------------------------------------------------------
+
+
+class _MockTTSProvider:
+    """A scriptable TTS provider.
+
+    ``result`` is returned by ``synthesize`` (bytes) or raised if it is an
+    Exception. ``calls`` records the kwargs of each synthesize call.
+    """
+
+    name = "mock-tts"
+    output_mime_type = "audio/ogg"
+    output_extension = ".ogg"
+
+    def __init__(self, result: object) -> None:
+        self._result = result
+        self.calls: list[dict[str, object]] = []
+
+    async def synthesize(self, *, text: str, voice_id: str | None = None) -> bytes:
+        self.calls.append({"text": text, "voice_id": voice_id})
+        if isinstance(self._result, Exception):
+            raise self._result
+        assert isinstance(self._result, bytes)
+        return self._result
+
+
+def _outbound_config(tmp_path: Path, **outbound_overrides: object) -> AnnaConfig:
+    raw: dict[str, object] = {"voice": {"outbound": dict(outbound_overrides)}}
+    cfg = AnnaConfig.model_validate(raw)
+    return cfg.model_copy(update={"anna_home": tmp_path})
+
+
+async def test_synthesize_outbound_happy_path(tmp_path: Path) -> None:
+    provider = _MockTTSProvider(b"OggS-audio-bytes")
+    proc = VoiceProcessor(
+        config=_outbound_config(tmp_path, voice_id="alloy"),
+        inbound_provider=None,
+        outbound_provider=provider,
+    )
+    proc.mark_voice_inbound(conv_key="telegram:dm:42")
+
+    result = await proc.maybe_synthesize_outbound(
+        text="here is your reply",
+        conv_key="telegram:dm:42",
+        transport="telegram",
+    )
+
+    assert result is not None
+    audio, mime, ext = result
+    assert audio == b"OggS-audio-bytes"
+    assert mime == "audio/ogg"
+    assert ext == ".ogg"
+    assert provider.calls == [{"text": "here is your reply", "voice_id": "alloy"}]
+    events = _read_audit_events(tmp_path)
+    outbound = [e for e in events if e["event"] == "audit.voice.outbound"]
+    assert len(outbound) == 1
+    assert outbound[0]["status"] == "ok"
+    assert outbound[0]["provider"] == "mock-tts"
+    assert outbound[0]["text_chars"] == len("here is your reply")
+    assert outbound[0]["audio_bytes"] == len(b"OggS-audio-bytes")
+    assert outbound[0]["transport"] == "telegram"
+
+
+async def test_synthesize_outbound_disabled_returns_none(tmp_path: Path) -> None:
+    provider = _MockTTSProvider(b"unused")
+    proc = VoiceProcessor(
+        config=_outbound_config(tmp_path, enabled=False),
+        inbound_provider=None,
+        outbound_provider=provider,
+    )
+    proc.mark_voice_inbound(conv_key="telegram:dm:42")
+
+    result = await proc.maybe_synthesize_outbound(
+        text="hello", conv_key="telegram:dm:42", transport="telegram"
+    )
+
+    assert result is None
+    assert provider.calls == []
+
+
+async def test_synthesize_outbound_transport_not_in_allowlist(tmp_path: Path) -> None:
+    provider = _MockTTSProvider(b"unused")
+    proc = VoiceProcessor(
+        config=_outbound_config(tmp_path, transports=["telegram"]),
+        inbound_provider=None,
+        outbound_provider=provider,
+    )
+    proc.mark_voice_inbound(conv_key="slack:dm:U1")
+
+    result = await proc.maybe_synthesize_outbound(
+        text="hello", conv_key="slack:dm:U1", transport="slack"
+    )
+
+    assert result is None
+    assert provider.calls == []
+
+
+async def test_synthesize_outbound_text_too_long(tmp_path: Path) -> None:
+    provider = _MockTTSProvider(b"unused")
+    proc = VoiceProcessor(
+        config=_outbound_config(tmp_path, max_synthesis_chars=10),
+        inbound_provider=None,
+        outbound_provider=provider,
+    )
+    proc.mark_voice_inbound(conv_key="telegram:dm:42")
+
+    result = await proc.maybe_synthesize_outbound(
+        text="this text is definitely longer than ten chars",
+        conv_key="telegram:dm:42",
+        transport="telegram",
+    )
+
+    assert result is None
+    assert provider.calls == []
+
+
+async def test_synthesize_outbound_no_recent_voice_inbound(tmp_path: Path) -> None:
+    provider = _MockTTSProvider(b"unused")
+    proc = VoiceProcessor(
+        config=_outbound_config(tmp_path),
+        inbound_provider=None,
+        outbound_provider=provider,
+    )
+    # No mark_voice_inbound call -> cache miss.
+
+    result = await proc.maybe_synthesize_outbound(
+        text="hello", conv_key="telegram:dm:42", transport="telegram"
+    )
+
+    assert result is None
+    assert provider.calls == []
+
+
+async def test_synthesize_outbound_tts_failure_returns_none_and_audits(
+    tmp_path: Path,
+) -> None:
+    provider = _MockTTSProvider(TTSError("openai-tts got HTTP 500"))
+    proc = VoiceProcessor(
+        config=_outbound_config(tmp_path),
+        inbound_provider=None,
+        outbound_provider=provider,
+    )
+    proc.mark_voice_inbound(conv_key="telegram:dm:42")
+
+    # Must not raise — outbound failure degrades to text.
+    result = await proc.maybe_synthesize_outbound(
+        text="hello", conv_key="telegram:dm:42", transport="telegram"
+    )
+
+    assert result is None
+    assert len(provider.calls) == 1
+    events = _read_audit_events(tmp_path)
+    outbound = [e for e in events if e["event"] == "audit.voice.outbound"]
+    assert len(outbound) == 1
+    assert outbound[0]["status"] == "fail"
+    assert "500" in str(outbound[0]["error"])
+    assert outbound[0]["transport"] == "telegram"

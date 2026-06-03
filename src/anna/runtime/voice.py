@@ -15,9 +15,10 @@ Three pieces live here:
   explicitly named in the config block; there is no plugin discovery.
 * The concrete providers. :class:`WhisperOpenAIProvider` is a real
   httpx wrapper over OpenAI ``/v1/audio/transcriptions``;
+  :class:`OpenAITTSProvider` is the matching httpx wrapper over OpenAI
+  ``/v1/audio/speech`` (Opus-in-OGG output);
   :class:`FasterWhisperLocalProvider` (gated by the ``voice-local``
-  extras) and :class:`OpenAITTSProvider` (full impl lands in Pass 3)
-  are stubs for now.
+  extras) is a stub for now.
 * :class:`VoiceProcessor`, the process-wide orchestrator constructed
   once in ``__main__.py`` and handed to every adapter that might process
   voice. It owns the size/duration gates, the retry loop, the audit
@@ -45,6 +46,7 @@ if TYPE_CHECKING:  # pragma: no cover - import-only for typing
 
 
 _OPENAI_TRANSCRIBE_ENDPOINT = "https://api.openai.com/v1/audio/transcriptions"
+_OPENAI_SPEECH_ENDPOINT = "https://api.openai.com/v1/audio/speech"
 
 
 # ---------------------------------------------------------------------------
@@ -266,17 +268,46 @@ class FasterWhisperLocalProvider:
 class OpenAITTSProvider:
     """OpenAI text-to-speech over ``/v1/audio/speech``.
 
-    Stub for Pass 1; the full implementation lands in Pass 3. Output is
-    Opus-in-OGG so Telegram's ``send_voice`` accepts the bytes directly.
+    A thin httpx wrapper around the OpenAI audio-speech endpoint, mirroring
+    the :class:`WhisperOpenAIProvider` httpx/error style. Output is
+    Opus-in-OGG (``response_format="opus"``) so Telegram's ``send_voice``
+    accepts the bytes directly and Slack can upload them as an ``.ogg``
+    attachment.
+
+    The API key is read from the env var named in the config
+    (``voice.outbound.api_key_env``, default ``OPENAI_API_KEY``) at
+    construction time. The provider never sets its own wall-clock timeout —
+    the :class:`VoiceProcessor` owns the ``asyncio.wait_for`` bound. Any
+    transport error or non-2xx response raises :class:`TTSError`.
     """
 
     name = "openai-tts"
     output_mime_type = "audio/ogg"
     output_extension = ".ogg"
 
-    def __init__(self, *, api_key: str, model: str) -> None:
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        model: str,
+        client: httpx.AsyncClient | None = None,
+    ) -> None:
         self._api_key = api_key
         self._model = model
+        self._log = get_logger("anna.voice.tts")
+        self._client = client
+        self._owns_client = client is None
+
+    async def _get_client(self) -> httpx.AsyncClient:
+        if self._client is None:
+            self._client = httpx.AsyncClient()
+            self._owns_client = True
+        return self._client
+
+    async def aclose(self) -> None:
+        if self._client is not None and self._owns_client:
+            await self._client.aclose()
+            self._client = None
 
     async def synthesize(
         self,
@@ -284,9 +315,35 @@ class OpenAITTSProvider:
         text: str,
         voice_id: str | None = None,
     ) -> bytes:
-        raise NotImplementedError(
-            "OpenAITTSProvider.synthesize lands in Pass 3 of the voice buildout"
-        )
+        client = await self._get_client()
+        payload: dict[str, str] = {
+            "model": self._model,
+            "voice": voice_id or "alloy",
+            "input": text,
+            # Opus-in-OGG: Telegram send_voice wants OGG/Opus; Slack uploads
+            # the same bytes as an .ogg attachment.
+            "response_format": "opus",
+        }
+        try:
+            resp = await client.post(
+                _OPENAI_SPEECH_ENDPOINT,
+                headers={"Authorization": f"Bearer {self._api_key}"},
+                json=payload,
+            )
+        except httpx.TimeoutException as exc:
+            raise TTSError(f"openai-tts synthesize timed out: {exc}") from exc
+        except httpx.HTTPError as exc:
+            raise TTSError(f"openai-tts synthesize transport error: {exc}") from exc
+
+        if resp.status_code >= 400:
+            raise TTSError(
+                f"openai-tts got HTTP {resp.status_code}: {resp.text[:200]}"
+            )
+
+        audio = resp.content
+        if not audio:
+            raise TTSError("openai-tts returned an empty audio body")
+        return audio
 
 
 # ---------------------------------------------------------------------------
@@ -589,13 +646,64 @@ class VoiceProcessor:
         * the most-recent inbound on this conv_key was voice
           (within recent_voice_window_seconds)
 
-        Returns None otherwise. The adapter is responsible for the
-        actual upload/send.
+        Returns None otherwise (the adapter falls back to a text-only
+        send). The adapter is responsible for the actual upload/send.
 
-        Stub for Pass 1: always returns None. The decision logic and the
-        synthesize call land in Pass 3.
+        On :class:`TTSError`, emits ``audit.voice.outbound`` with
+        ``status="fail"`` and returns ``None`` — outbound failure must
+        degrade to text, never raise.
         """
-        return None
+        cfg = self._config.voice.outbound
+
+        # Decision gates — any miss returns None for a clean text-only send.
+        if not cfg.enabled:
+            return None
+        if self._outbound is None:
+            return None
+        if transport not in cfg.transports:
+            return None
+        if len(text) > cfg.max_synthesis_chars:
+            return None
+        if not self._recent_voice_active(conv_key):
+            return None
+
+        provider = self._outbound
+        started = time.monotonic()
+        try:
+            audio = await asyncio.wait_for(
+                provider.synthesize(
+                    text=text,
+                    voice_id=cfg.voice_id,
+                ),
+                timeout=cfg.timeout_seconds,
+            )
+        except (TTSError, TimeoutError, asyncio.TimeoutError) as exc:
+            latency = time.monotonic() - started
+            self._audit(
+                "audit.voice.outbound",
+                conv_key=conv_key,
+                level="WARNING",
+                provider=provider.name,
+                status="fail",
+                error=str(exc) or "timeout",
+                latency_seconds=round(latency, 3),
+                text_chars=len(text),
+                transport=transport,
+            )
+            return None
+
+        latency = time.monotonic() - started
+        self._audit(
+            "audit.voice.outbound",
+            conv_key=conv_key,
+            provider=provider.name,
+            status="ok",
+            latency_seconds=round(latency, 3),
+            text_chars=len(text),
+            audio_bytes=len(audio),
+            transport=transport,
+        )
+        return (audio, provider.output_mime_type, provider.output_extension)
 
 
 # ---------------------------------------------------------------------------

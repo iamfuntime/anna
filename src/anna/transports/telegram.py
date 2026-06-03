@@ -162,6 +162,16 @@ class TelegramAdapter(ChannelAdapter):
         if self._application is None:
             raise RuntimeError("Telegram adapter not started")
         chat_id, topic_id = self._chat_and_topic_for(message.conversation_key)
+
+        # Phase 2.5 outbound voice: attempt a voice reply first when the
+        # recent inbound on this conv_key was voice and outbound is enabled
+        # for Telegram. On success, suppress the text message when
+        # voice_only is set; otherwise send both. On any voice failure, fall
+        # through cleanly to the normal text send below.
+        if await self._maybe_send_voice(message=message, chat_id=chat_id, topic_id=topic_id):
+            if self._config.voice.outbound.voice_only:
+                return
+
         try:
             kwargs: dict[str, Any] = {"chat_id": chat_id, "text": message.text}
             if topic_id is not None:
@@ -183,6 +193,67 @@ class TelegramAdapter(ChannelAdapter):
                 error=str(exc),
             )
             raise
+
+    async def _maybe_send_voice(
+        self,
+        *,
+        message: OutboundMessage,
+        chat_id: int,
+        topic_id: int | None,
+    ) -> bool:
+        """Synthesize + send an OGG voice note for this reply.
+
+        Returns ``True`` when a voice note was sent (so the caller can
+        suppress the text when ``voice_only``), ``False`` otherwise. No-op
+        returning ``False`` when no VoiceProcessor is wired or
+        :meth:`VoiceProcessor.maybe_synthesize_outbound` declines (outbound
+        disabled, Telegram not in the allowlist, text too long, no recent
+        voice inbound, or TTS failure). A ``send_voice`` failure also returns
+        ``False`` so :meth:`send` falls through to the normal text send.
+        """
+        if self._voice is None:
+            return False
+        try:
+            synth = await self._voice.maybe_synthesize_outbound(
+                text=message.text,
+                conv_key=message.conversation_key,
+                transport="telegram",
+            )
+        except Exception as exc:
+            self._log.warning(
+                "voice.outbound.synth_failed",
+                channel="telegram",
+                conv_key=message.conversation_key,
+                error=str(exc),
+            )
+            return False
+        if synth is None:
+            return False
+        audio_bytes, _mime_type, _extension = synth
+
+        kwargs: dict[str, Any] = {"chat_id": chat_id, "voice": audio_bytes}
+        if topic_id is not None:
+            kwargs["message_thread_id"] = topic_id
+        if message.reply_to:
+            kwargs["reply_to_message_id"] = int(message.reply_to)
+        try:
+            await self._application.bot.send_voice(**kwargs)
+            self._log.debug(
+                "voice.outbound.sent",
+                channel="telegram",
+                conv_key=message.conversation_key,
+                audio_bytes=len(audio_bytes),
+            )
+            return True
+        except Exception as exc:
+            # Deliberate ordering: voice first, fall back to text on failure.
+            self._log.warning(
+                "voice.outbound.send_failed",
+                channel="telegram",
+                conv_key=message.conversation_key,
+                error=str(exc),
+            )
+            return False
 
     def _chat_and_topic_for(self, conv_key: str) -> tuple[int, int | None]:
         parts = conv_key.split(":")

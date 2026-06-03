@@ -154,6 +154,73 @@ class SlackAdapter(ChannelAdapter):
                 thread_ts=thread_ts,
             )
 
+        # Phase 2.5 outbound voice: Slack always posts the text above
+        # (Slack desktop's voice-note UX is poor), and additionally uploads
+        # the synthesized audio when the recent inbound on this conv_key was
+        # voice and outbound is enabled for Slack. The text already landed,
+        # so an upload failure just logs.
+        await self._maybe_upload_voice(message=message, channel=channel, thread_ts=thread_ts)
+
+    async def _maybe_upload_voice(
+        self,
+        *,
+        message: OutboundMessage,
+        channel: str,
+        thread_ts: str | None,
+    ) -> None:
+        """Synthesize + upload an OGG voice note alongside the posted text.
+
+        No-op when no VoiceProcessor is wired or
+        :meth:`VoiceProcessor.maybe_synthesize_outbound` declines (outbound
+        disabled, Slack not in the allowlist, text too long, no recent voice
+        inbound, or TTS failure). The text post already happened in
+        :meth:`send`, so any upload failure degrades to text-only and only
+        logs.
+        """
+        if self._voice is None:
+            return
+        try:
+            synth = await self._voice.maybe_synthesize_outbound(
+                text=message.text,
+                conv_key=message.conversation_key,
+                transport="slack",
+            )
+        except Exception as exc:
+            self._log.warning(
+                "voice.outbound.synth_failed",
+                channel="slack",
+                conv_key=message.conversation_key,
+                error=str(exc),
+            )
+            return
+        if synth is None:
+            return
+        audio_bytes, _mime_type, extension = synth
+
+        upload_kwargs: dict[str, Any] = {
+            "channel": channel,
+            "content": audio_bytes,
+            "filename": f"voice{extension}",
+        }
+        if thread_ts:
+            upload_kwargs["thread_ts"] = thread_ts
+        try:
+            await self._client.files_upload_v2(**upload_kwargs)
+            self._log.debug(
+                "voice.outbound.uploaded",
+                channel="slack",
+                conv_key=message.conversation_key,
+                audio_bytes=len(audio_bytes),
+            )
+        except Exception as exc:
+            # Text already posted in send(); the audio is a best-effort add.
+            self._log.warning(
+                "voice.outbound.upload_failed",
+                channel="slack",
+                conv_key=message.conversation_key,
+                error=str(exc),
+            )
+
     def _channel_and_thread_for(self, conv_key: str) -> tuple[str, str | None]:
         """Recover the Slack channel and thread_ts from a conversation_key.
 
