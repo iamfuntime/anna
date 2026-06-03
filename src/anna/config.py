@@ -474,6 +474,20 @@ class SubagentsConfig(BaseModel):
             "mcp__anna_web__vault_download",
         ]
     )
+    extra_dirs: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Additional absolute directories mounted into every "
+            "sub-agent's ``add_dirs`` so file ops (Read/Write/Edit/Glob/"
+            "Grep) can reach beyond the ANNA vault. The sub-agent cwd "
+            "stays the ANNA vault; these are extra reachable roots. Use "
+            "to grant access to the collaborative Brain vault (detection "
+            "templates, query libraries, example reports, Inbox output). "
+            "Paths are ``~``-expanded at spawn time. Empty by default — "
+            "keeps the depth-protection surface minimal unless a "
+            "deployment opts in."
+        ),
+    )
 
 
 class SchedulerConfig(BaseModel):

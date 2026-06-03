@@ -477,6 +477,7 @@ class SubAgentRunner:
         task: str,
         context: dict[str, Any] | None,
         vault_root: Path,
+        extra_dirs: list[str] | None = None,
     ) -> str:
         """Splice the persona, skills, delegation framing, task, and optional context.
 
@@ -511,15 +512,28 @@ class SubAgentRunner:
         """
         import yaml
 
+        extra_dirs = [str(Path(d).expanduser()) for d in (extra_dirs or [])]
+        reach_line = (
+            f"Your file ops (Read, Write, Edit, Glob, Grep) can reach the "
+            f"ANNA vault ({vault_root})"
+        )
+        if extra_dirs:
+            reach_line += (
+                " and these additional mounted roots: "
+                + ", ".join(extra_dirs)
+                + " (e.g. the collaborative Brain vault — read detection "
+                "templates, query libraries, and example reports there, "
+                "and write outputs to its Inbox when the task asks)"
+            )
+        reach_line += "."
         delegation_block = (
             "You are running as a one-shot sub-agent spawned by ANNA. You "
             "do not have the delegate tool; you cannot spawn further "
             "sub-agents. You have web_search, web_fetch, and "
-            "vault_download for outside-the-vault work, plus the file "
-            "ops (Read, Write, Edit, Glob, Grep) scoped to the ANNA "
-            "vault. Your reply is returned to the parent agent as a "
-            "single tool result; write the final answer as one message.\n"
-            f"Vault root: {vault_root}."
+            "vault_download for outside-the-vault work. "
+            + reach_line
+            + " Your reply is returned to the parent agent as a single "
+            "tool result; write the final answer as one message."
         )
 
         sections: list[str] = [persona.rstrip()]
@@ -611,10 +625,17 @@ class SubAgentRunner:
             mcp_servers=mcp_servers,
             allowed_tools=list(self._config.subagents.allowed_tools),
             cwd=str(vault_root),
-            # Empty add_dirs — sub-agents do not see core/. Persona +
-            # skills are the entire identity surface; ANNA's identity
-            # files stay invisible.
-            add_dirs=[],
+            # add_dirs grants extra reachable roots beyond the cwd
+            # (ANNA vault). Driven by ``subagents.extra_dirs`` config —
+            # typically the collaborative Brain vault so sub-agents can
+            # read detection templates / query libraries / example
+            # reports and write reports into Brain/Inbox directly. Still
+            # never mounts core/: ANNA's identity files stay invisible
+            # because core/ is not under any configured extra_dir.
+            add_dirs=[
+                str(Path(d).expanduser())
+                for d in self._config.subagents.extra_dirs
+            ],
         )
 
     # ------------------------------------------------------------------
@@ -811,6 +832,7 @@ class SubAgentRunner:
                 task=task,
                 context=context,
                 vault_root=vault_root,
+                extra_dirs=list(self._config.subagents.extra_dirs),
             )
 
             # Step 5: build options.

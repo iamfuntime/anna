@@ -427,14 +427,57 @@ def test_build_subagent_options_cwd_is_vault_root(tmp_path: Path) -> None:
     assert options.cwd == str(runner._config.vault.resolved_path)  # noqa: SLF001
 
 
-def test_build_subagent_options_add_dirs_empty(tmp_path: Path) -> None:
-    """Sub-agents must not see core/ — add_dirs is hard-coded empty."""
+def test_build_subagent_options_add_dirs_empty_by_default(tmp_path: Path) -> None:
+    """add_dirs is empty when subagents.extra_dirs is unset (the default).
+
+    Sub-agents do not see core/ because no configured extra_dir points at
+    it; with no extra_dirs at all, the only reachable root is the cwd
+    (ANNA vault).
+    """
     runner = _make_runner_with_tools(tmp_path, tools_enabled=True)
     options = runner._build_subagent_options(  # noqa: SLF001
         system_prompt="system",
         conv_key="subagent:slug:abc",
     )
     assert options.add_dirs == []
+
+
+def test_build_subagent_options_add_dirs_from_config(tmp_path: Path) -> None:
+    """subagents.extra_dirs flows into add_dirs, ~-expanded, in order."""
+    raw: dict = {
+        "tools": {"enabled": True},
+        "subagents": {"extra_dirs": ["~/Obsidian/Brain", str(tmp_path / "extra")]},
+    }
+    cfg = AnnaConfig.model_validate(raw)
+    cfg = cfg.model_copy(update={"anna_home": tmp_path})
+    cfg.vault.path = str(tmp_path / "vault")
+    supervisor = Supervisor(config=cfg)
+    runner = SubAgentRunner(
+        config=cfg,
+        supervisor=supervisor,
+        agents_registry=SubAgentRegistry(
+            supervisor=supervisor,
+            agents_dir=tmp_path / "agents",
+            audit_dir=tmp_path / "audit",
+            fsync_on_write=False,
+        ),
+        skills_registry=SkillRegistry(
+            supervisor=supervisor,
+            skills_dir=tmp_path / "skills",
+            audit_dir=tmp_path / "audit",
+            fsync_on_write=False,
+        ),
+    )
+    options = runner._build_subagent_options(  # noqa: SLF001
+        system_prompt="system",
+        conv_key="subagent:slug:abc",
+    )
+    assert options.add_dirs == [
+        str(Path("~/Obsidian/Brain").expanduser()),
+        str(tmp_path / "extra"),
+    ]
+    # No '~' should survive into the mounted paths.
+    assert all("~" not in d for d in options.add_dirs)
 
 
 def test_build_system_prompt_is_pure(tmp_path: Path) -> None:
