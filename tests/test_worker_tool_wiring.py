@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from anna.agents.registry import SubAgentRegistry
-from anna.config import AnnaConfig, GoogleAccountConfig
+from anna.config import AnnaConfig, GoogleAccountConfig, McpServerSpec
 from anna.runtime.subagent import SubAgentRunner
 from anna.runtime.supervisor import Supervisor
 from anna.runtime.worker import (
@@ -259,3 +259,110 @@ def test_build_options_allowed_tools_includes_delegate_when_enabled(
         assert name in options.allowed_tools, name
     # Belt-and-suspenders: the canonical name is present.
     assert "mcp__anna_delegate__delegate" in options.allowed_tools
+
+
+# ---------------------------------------------------------------------------
+# CLAUDE_CONFIG_DIR isolation + custom MCP registry allowlist
+# ---------------------------------------------------------------------------
+
+
+def test_build_options_sets_claude_config_dir_env_and_setting_sources(
+    tmp_path: Path,
+) -> None:
+    """env points the spawned CLI at the isolated runtime dir; settings stay off."""
+    worker = _make_worker(tmp_path)
+    options = worker._build_options()
+    assert options.env["CLAUDE_CONFIG_DIR"] == str(
+        worker._config.claude_runtime_dir
+    )
+    assert options.setting_sources == []
+
+
+def test_build_options_mounts_anna_mcp_servers_from_registry(tmp_path: Path) -> None:
+    """An allowlisted stdio registry server mounts on ANNA's main loop."""
+    worker = _make_worker(tmp_path)
+    worker._config.subagents.mcp_registry["security-detections"] = McpServerSpec(
+        kind="stdio",
+        command="npx",
+        args=["-y", "security-detections-mcp"],
+    )
+    worker._config.subagents.anna_mcp_servers = ["security-detections"]
+    options = worker._build_options()
+
+    assert "security-detections" in options.mcp_servers
+    server = options.mcp_servers["security-detections"]
+    assert server == {
+        "type": "stdio",
+        "command": "npx",
+        "args": ["-y", "security-detections-mcp"],
+    }
+    # The server-namespace wildcard lands in allowed_tools.
+    assert "mcp__security-detections__*" in options.allowed_tools
+
+
+def test_build_options_drops_unknown_anna_mcp_server(tmp_path: Path) -> None:
+    """An unknown anna_mcp_servers name is dropped without crashing."""
+    worker = _make_worker(tmp_path)
+    worker._config.subagents.anna_mcp_servers = ["does-not-exist"]
+    options = worker._build_options()
+    assert "does-not-exist" not in options.mcp_servers
+    # Builtins still mounted; the unknown name contributed nothing.
+    assert "anna_self_edit" in options.mcp_servers
+    assert not any(
+        t.startswith("mcp__does-not-exist__") for t in options.allowed_tools
+    )
+
+
+def test_build_options_custom_server_tool_names_are_deduped(tmp_path: Path) -> None:
+    """Listing the same registry server twice yields no duplicate tool names."""
+    worker = _make_worker(tmp_path)
+    worker._config.subagents.mcp_registry["security-detections"] = McpServerSpec(
+        kind="stdio",
+        command="npx",
+        args=["-y", "security-detections-mcp"],
+    )
+    # Same name twice: the spec resolves twice, so build_mcp_servers emits the
+    # server-namespace wildcard twice. The merge must first-seen-dedupe it.
+    worker._config.subagents.anna_mcp_servers = [
+        "security-detections",
+        "security-detections",
+    ]
+    options = worker._build_options()
+
+    wildcard = "mcp__security-detections__*"
+    assert options.allowed_tools.count(wildcard) == 1
+    # The server itself is mounted exactly once (dict keys collapse).
+    assert "security-detections" in options.mcp_servers
+
+
+def test_build_options_custom_server_does_not_clobber_builtin(tmp_path: Path) -> None:
+    """A registry entry colliding with a builtin name must not overwrite it."""
+    worker = _make_worker(tmp_path)
+    # Register a stdio server under a builtin's key.
+    worker._config.subagents.mcp_registry["anna_web"] = McpServerSpec(
+        kind="stdio",
+        command="npx",
+        args=["-y", "rogue-server"],
+    )
+    worker._config.subagents.anna_mcp_servers = ["anna_web"]
+    options = worker._build_options()
+
+    # The builtin anna_web (sdk shape) wins; the rogue stdio spec is dropped.
+    server = options.mcp_servers["anna_web"]
+    assert isinstance(server, dict)
+    assert server.get("type") == "sdk"
+    # The colliding registry server contributed no wildcard tool name.
+    assert "mcp__anna_web__*" not in options.allowed_tools
+
+
+def test_build_options_no_external_servers_by_default(tmp_path: Path) -> None:
+    """Empty anna_mcp_servers => only builtins mount, no external servers."""
+    worker = _make_worker(tmp_path)
+    assert worker._config.subagents.anna_mcp_servers == []
+    options = worker._build_options()
+    # Builtins present; no stdio/http shapes leaked in.
+    assert "anna_self_edit" in options.mcp_servers
+    assert "anna_web" in options.mcp_servers
+    for server in options.mcp_servers.values():
+        assert server.get("type") != "stdio"
+        assert server.get("type") != "http"

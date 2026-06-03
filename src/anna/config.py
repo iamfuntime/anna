@@ -658,6 +658,15 @@ class SubagentsConfig(BaseModel):
             "+ logged at resolution, never invented."
         ),
     )
+    anna_mcp_servers: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Registry names ANNA's main loop mounts for herself. Unknown "
+            "names dropped + logged at resolution, never invented. List "
+            "external (stdio/http) servers only; builtins mount via their "
+            "own toggles."
+        ),
+    )
     agents: dict[str, AgentGrants] = Field(
         default_factory=dict,
         description=(
@@ -1026,6 +1035,16 @@ class AnnaConfig(BaseModel):
     def state_dir(self) -> Path:
         """Runtime state files (clean-shutdown sentinel, etc.)."""
         return self.anna_home / "state"
+
+    @property
+    def claude_runtime_dir(self) -> Path:
+        """Isolated CLAUDE_CONFIG_DIR for ANNA's spawned CLI subprocesses.
+
+        Relocates host Claude Code discovery (CLAUDE.md / skills / plugins /
+        local MCP under ~/.claude) off the operator's dir. Seeded with only a
+        symlink to the real .credentials.json so max-mode auth survives.
+        """
+        return self.anna_home / ".claude-runtime"
 
     @property
     def google_state_dir(self) -> Path:

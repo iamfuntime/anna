@@ -392,10 +392,14 @@ subagents:
   #   http     external MCP server over HTTP. Needs url; headers optional.
   # tool_names pins an external server's tool surface to named tools; left
   # empty, the resolver contributes the mcp__<name>__* wildcard instead.
-  # mcp_registry:
-  #   web:
-  #     kind: builtin
-  #     builtin_name: anna_web
+  # POLICY (operator-only). Example: a security-detections stdio server is
+  # blessed here so both ANNA's main loop (via anna_mcp_servers below) and
+  # any granting sub-agent (via agents.<slug>.mcp_servers) can mount it.
+  mcp_registry:
+    security-detections:
+      kind: stdio
+      command: npx
+      args: ["-y", "security-detections-mcp"]
   #   playwright:
   #     kind: stdio
   #     command: npx
@@ -407,16 +411,25 @@ subagents:
   #       Authorization: Bearer ${DETECTIONS_TOKEN}
   #     tool_names: ["search_rules", "get_rule"]
   #
+  # anna_mcp_servers: the subset of mcp_registry names ANNA's OWN main loop
+  # mounts for herself (distinct from per-agent grants below). List external
+  # (stdio/http) registry servers only — builtins like anna_web mount via
+  # their own toggles (tools.enabled). Unknown names are dropped + logged at
+  # resolution, never invented.
+  anna_mcp_servers: [security-detections]
+  #
   # agents: per-slug grants. Each value may reference dir_pool /
   # mcp_registry names ONLY. write_dirs and mcp_servers are name lists;
   # allowed_tools / permission_mode are optional overrides.
-  # agents:
+  agents:
+    threat-researcher:
+      mcp_servers: [security-detections]
   #   code-writer:
   #     write_dirs: [git]
-  #     mcp_servers: [web]
+  #     mcp_servers: [security-detections]
   #   brain-writer:
   #     write_dirs: [brain]
-  #     mcp_servers: [web, detections]
+  #     mcp_servers: [security-detections]
   #     permission_mode: acceptEdits
   #
   # The same grant shape can live in a persona file's frontmatter, where

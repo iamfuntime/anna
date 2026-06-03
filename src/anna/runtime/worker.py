@@ -51,6 +51,21 @@ _WEB_PREFIX = "mcp__anna_web__"
 _DELEGATE_PREFIX = "mcp__anna_delegate__"
 
 
+def _tool_belongs_to_servers(tool_name: str, server_names: set[str]) -> bool:
+    """True if ``tool_name`` is namespaced to one of ``server_names``.
+
+    Registry tool names follow the SDK ``mcp__<server>__<tool>`` (or the
+    server-namespace wildcard ``mcp__<server>__*``) convention. We parse the
+    server segment so tool-name additions for a server we skipped (e.g. a
+    builtin-colliding registry entry) are not silently allowlisted.
+    """
+    if not tool_name.startswith("mcp__"):
+        return False
+    rest = tool_name[len("mcp__") :]
+    server, _, _ = rest.partition("__")
+    return server in server_names
+
+
 def _allowed_tool_names(
     *,
     include_google: bool,
@@ -407,6 +422,57 @@ class ConversationWorker:
                 mcp_servers["anna_delegate"] = delegate_server
                 include_delegate = True
 
+        # Resolve the operator's explicit main-loop MCP allowlist. The
+        # registry (subagents.mcp_registry) is the same operator-blessed POLICY
+        # pool sub-agents resolve against; subagents.anna_mcp_servers names the
+        # subset ANNA herself mounts. We reuse the sub-agent conversion path
+        # (build_mcp_servers) so external stdio/http specs and tool-name
+        # additions are produced identically, and the forbidden-builtin guard
+        # is shared — no special-casing here. Local import mirrors how
+        # subagent.py pulls build_mcp_servers in to avoid an import cycle.
+        from anna.runtime.grants import build_mcp_servers
+
+        custom_specs: list[tuple[str, Any]] = []
+        for name in self._config.subagents.anna_mcp_servers:
+            spec = self._config.subagents.mcp_registry.get(name)
+            if spec is None:
+                self._log.warning("worker.mcp_registry.unknown", dropped_name=name)
+                continue
+            custom_specs.append((name, spec))
+
+        # allowed_tools may need extending with the custom servers' tool names,
+        # so capture the builtin list into a local first.
+        allowed_tools = _allowed_tool_names(
+            include_google=include_google,
+            include_web=include_web,
+            include_delegate=include_delegate,
+        )
+        if custom_specs:
+            custom_servers, custom_tool_names = build_mcp_servers(
+                self._config, custom_specs, self.conversation_key
+            )
+            # Merge without clobbering builtins: a registry entry whose key
+            # collides with an already-mounted builtin (e.g. "anna_web") must
+            # not silently replace it. Skip colliding names and only extend the
+            # tool-name allowlist for the entries we actually add.
+            added_servers: set[str] = set()
+            for name, server in custom_servers.items():
+                if name in mcp_servers:
+                    self._log.warning(
+                        "worker.mcp_registry.builtin_collision", name=name
+                    )
+                    continue
+                mcp_servers[name] = server
+                added_servers.add(name)
+            # Dedupe with first-seen order so the option set is deterministic,
+            # matching subagent.py _build_subagent_options. Only tool names that
+            # belong to a server we actually mounted are eligible.
+            for tool_name in custom_tool_names:
+                if not _tool_belongs_to_servers(tool_name, added_servers):
+                    continue
+                if tool_name not in allowed_tools:
+                    allowed_tools.append(tool_name)
+
         # Ensure the vault root exists before the SDK process tries to cd
         # into it; otherwise the first tool call fails with ENOENT.
         try:
@@ -417,12 +483,21 @@ class ConversationWorker:
         return ClaudeAgentOptions(
             system_prompt=system_prompt,
             # setting_sources=[] disables inheriting the operator's user /
-            # project / local Claude Code settings (CLAUDE.md, agents/, MCP
-            # servers, skills). Without this, ANNA pulls in the entire host
-            # Claude Code environment and starts responding as if she were
-            # the operator's primary agent. She must speak strictly from her
-            # own ~/anna/core files.
+            # project / local Claude Code *settings.json* (the permission and
+            # hook layer). It does NOT, on its own, stop the bundled CLI from
+            # discovering host CLAUDE.md / agents / skills / plugins / local
+            # MCP — that discovery is keyed off CLAUDE_CONFIG_DIR, which we
+            # relocate via env below. Both together keep ANNA speaking strictly
+            # from her own ~/anna/core files instead of impersonating the
+            # operator's primary agent.
             setting_sources=[],
+            # Relocate the bundled CLI's host discovery off the operator's
+            # ~/.claude. CLAUDE_CONFIG_DIR is what the CLI walks for memory
+            # (CLAUDE.md), skills, plugins, and local MCP; pointing it at the
+            # isolated runtime dir (seeded with only a .credentials.json
+            # symlink for max-mode auth) stops ANNA inheriting the operator's
+            # entire Claude Code environment.
+            env={"CLAUDE_CONFIG_DIR": str(self._config.claude_runtime_dir)},
             # ANNA runs as a headless systemd service with no operator at a
             # terminal to approve tool calls. The default permission_mode is
             # interactive prompting, which means every tool call hangs forever
@@ -437,12 +512,9 @@ class ConversationWorker:
             # when tools.enabled.
             mcp_servers=mcp_servers,
             # Allow the default filesystem tools, the self-edit MCP tools,
-            # and (when wired) the google, web, and delegate MCP tools.
-            allowed_tools=_allowed_tool_names(
-                include_google=include_google,
-                include_web=include_web,
-                include_delegate=include_delegate,
-            ),
+            # the google/web/delegate MCP tools (when wired), and any
+            # operator-allowlisted custom registry servers (resolved above).
+            allowed_tools=allowed_tools,
             # Vault root is the natural cwd: vault paths become relative
             # (Conversations/foo.md instead of long absolutes).
             cwd=str(vault_root),

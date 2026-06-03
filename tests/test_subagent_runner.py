@@ -458,6 +458,19 @@ def test_build_subagent_options_setting_sources_empty(tmp_path: Path) -> None:
     assert options.setting_sources == []
 
 
+def test_build_subagent_options_sets_claude_config_dir_env(tmp_path: Path) -> None:
+    """Sub-agents get the same isolated CLAUDE_CONFIG_DIR as the main loop."""
+    runner = _make_runner_with_tools(tmp_path, tools_enabled=True)
+    options = runner._build_subagent_options(  # noqa: SLF001
+        system_prompt="system",
+        conv_key="subagent:slug:abc",
+    )
+    assert options.env["CLAUDE_CONFIG_DIR"] == str(
+        runner._config.claude_runtime_dir  # noqa: SLF001
+    )
+    assert options.setting_sources == []
+
+
 def test_build_subagent_options_cwd_is_vault_root(tmp_path: Path) -> None:
     runner = _make_runner_with_tools(tmp_path, tools_enabled=True)
     options = runner._build_subagent_options(  # noqa: SLF001

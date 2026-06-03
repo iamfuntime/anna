@@ -33,6 +33,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from anna.agents.registry import SubAgentRegistry
+from anna.auth import ensure_isolated_config_dir
 from anna.config import AnnaConfig, load_config
 from anna.log import configure_logging, get_logger
 from anna.runtime.alerter import AdminAlerter
@@ -76,6 +77,30 @@ async def _run(config: AnnaConfig) -> None:
     log.info("anna.boot", version="0.1.0", auth_mode=config.auth.mode)
 
     supervisor = Supervisor(config=config)
+
+    # Isolate the spawned CLI subprocesses' CLAUDE_CONFIG_DIR before any worker
+    # spins up. The bundled Claude CLI discovers host CLAUDE.md / skills /
+    # plugins / local MCP from CLAUDE_CONFIG_DIR (defaults to $HOME/.claude);
+    # the daemon inherits the operator's HOME, so without this every worker
+    # leaks the operator's entire Claude Code environment. The helper seeds the
+    # isolated dir with only a symlink to the real .credentials.json so
+    # max-mode auth survives.
+    runtime_dir = ensure_isolated_config_dir(
+        config.claude_runtime_dir, config.auth.mode
+    )
+    log.info(
+        "anna.claude_runtime.ready",
+        dir=str(runtime_dir),
+        credentials_linked=(runtime_dir / ".credentials.json").is_symlink(),
+    )
+
+    # Defensive cwd-walk scan. Even with CLAUDE_CONFIG_DIR relocated, the CLI
+    # still walks the cwd (vault root) and its parents for a stray .claude/
+    # dir, a CLAUDE.md (other than ANNA's own core/CLAUDE.md), or a .mcp.json.
+    # Any of those would be discovered and leak in. We log a WARNING per
+    # finding rather than fail boot — the operator decides whether to remove
+    # them.
+    _scan_for_stray_claude_artifacts(config, log)
 
     # Phase 2 scheduler: build the store and load any persisted schedules
     # before the router so workers see a populated store from the first
@@ -392,6 +417,58 @@ async def _run(config: AnnaConfig) -> None:
         log.warning("anna.shutdown.sentinel_write_failed", error=str(exc))
 
     log.info("anna.shutdown.complete")
+
+
+def _scan_for_stray_claude_artifacts(config: AnnaConfig, log: Any) -> None:
+    """Warn on cwd-walk-discoverable Claude artifacts near the vault root.
+
+    The CLI's cwd is the vault root (see worker._build_options). The bundled
+    CLI walks the cwd and its ancestors looking for a ``.claude/`` dir, a
+    ``CLAUDE.md``, or a ``.mcp.json`` — all of which it would discover and
+    fold into a worker session even with CLAUDE_CONFIG_DIR relocated. ANNA's
+    own ``core/CLAUDE.md`` is the one legitimate CLAUDE.md and is excluded.
+
+    This is telemetry only: each finding is a WARNING and boot continues. The
+    operator decides whether to relocate or remove the artifact.
+    """
+    vault_root = config.vault.resolved_path
+    core_claude_md = (config.core_dir / "CLAUDE.md").resolve()
+
+    # The cwd-walk set: the vault root plus each ancestor up to (and
+    # including) the filesystem root.
+    scan_dirs: list[Path] = []
+    cur = vault_root
+    while True:
+        scan_dirs.append(cur)
+        if cur.parent == cur:
+            break
+        cur = cur.parent
+
+    seen: set[Path] = set()
+    for d in scan_dirs:
+        for name in (".claude", "CLAUDE.md", ".mcp.json"):
+            candidate = d / name
+            try:
+                if not candidate.exists():
+                    continue
+                resolved = candidate.resolve()
+            except OSError:
+                continue
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            if name == "CLAUDE.md" and resolved == core_claude_md:
+                # ANNA's own identity file — expected, not a leak.
+                continue
+            log.warning(
+                "anna.claude_runtime.stray_artifact",
+                path=str(candidate),
+                artifact=name,
+                note=(
+                    "cwd-walk discoverable by the bundled CLI; may leak host "
+                    "Claude Code context into worker sessions"
+                ),
+            )
 
 
 async def _send_startup_alert(

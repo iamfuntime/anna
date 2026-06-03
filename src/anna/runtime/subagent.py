@@ -755,9 +755,12 @@ class SubAgentRunner:
         return ClaudeAgentOptions(
             system_prompt=system_prompt,
             # No setting_sources for sub-agents — they live entirely off
-            # their persona file plus skills. No host Claude Code env
-            # leaks in.
+            # their persona file plus skills. setting_sources=[] gates the
+            # host settings.json; CLAUDE_CONFIG_DIR (below) relocates the
+            # CLI's memory/skills/plugins/local-MCP discovery off the
+            # operator's ~/.claude so no host Claude Code env leaks in.
             setting_sources=[],
+            env={"CLAUDE_CONFIG_DIR": str(self._config.claude_runtime_dir)},
             permission_mode=permission_mode,
             # Resolved MCP servers only. Never anna_self_edit, anna_google,
             # or anna_delegate — build_mcp_servers enforces that.
