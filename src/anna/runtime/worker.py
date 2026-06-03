@@ -22,11 +22,16 @@ from anna.skills.registry import SkillRegistry
 from anna.tools.delegate_server import DELEGATE_TOOL_NAMES, build_delegate_server
 from anna.tools.google_server import GOOGLE_TOOL_NAMES, GoogleTools, build_google_server
 from anna.tools.self_edit_server import SELF_EDIT_TOOL_NAMES, SelfEditTools, build_self_edit_server
+from anna.tools.slack_alerts_server import (
+    SLACK_ALERTS_TOOL_NAMES,
+    SlackAlertTools,
+    build_slack_alerts_server,
+)
 from anna.tools.vault_tools import VaultTools
 from anna.tools.web_server import WEB_TOOL_NAMES, build_web_server
 from anna.tools.web_tools import WebTools
 from anna.runtime.visibility import NULL_VISIBILITY, VisibilityCallbacks
-from anna.transports.base import InboundEvent, OutboundMessage, SignalHandle
+from anna.transports.base import ChannelAdapter, InboundEvent, OutboundMessage, SignalHandle
 from anna.vault.checkpoint import list_recent_checkpoints, write_checkpoint
 from anna.vault.transcript_resume import (
     latest_checkpoint_mtime,
@@ -46,6 +51,7 @@ if TYPE_CHECKING:
 # prefixed with ``mcp__anna_self_edit__`` per the SDK convention.
 _DEFAULT_FS_TOOLS: tuple[str, ...] = ("Read", "Write", "Edit", "Glob", "Grep")
 _SELF_EDIT_PREFIX = "mcp__anna_self_edit__"
+_SLACK_ALERTS_PREFIX = "mcp__anna_slack_alerts__"
 _GOOGLE_PREFIX = "mcp__anna_google__"
 _WEB_PREFIX = "mcp__anna_web__"
 _DELEGATE_PREFIX = "mcp__anna_delegate__"
@@ -72,9 +78,11 @@ def _allowed_tool_names(
     include_web: bool,
     include_delegate: bool = False,
 ) -> list[str]:
-    names = list(_DEFAULT_FS_TOOLS) + [
-        f"{_SELF_EDIT_PREFIX}{name}" for name in SELF_EDIT_TOOL_NAMES
-    ]
+    names = (
+        list(_DEFAULT_FS_TOOLS)
+        + [f"{_SELF_EDIT_PREFIX}{name}" for name in SELF_EDIT_TOOL_NAMES]
+        + [f"{_SLACK_ALERTS_PREFIX}{name}" for name in SLACK_ALERTS_TOOL_NAMES]
+    )
     if include_google:
         names.extend(f"{_GOOGLE_PREFIX}{name}" for name in GOOGLE_TOOL_NAMES)
     if include_web:
@@ -100,6 +108,7 @@ class ConversationWorker:
         supervisor: "Supervisor",
         send: SendCallback,
         on_idle_close: IdleCloseCallback | None = None,
+        adapters: dict[str, ChannelAdapter] | None = None,
         schedule_store: "ScheduleStore | None" = None,
         google_clients: "GoogleClients | None" = None,
         subagent_runner: "SubAgentRunner | None" = None,
@@ -112,6 +121,11 @@ class ConversationWorker:
         self._supervisor = supervisor
         self._send = send
         self._on_idle_close = on_idle_close
+        # Live transport adapters (same dict the router/alerter hold). Used by
+        # the anna_slack_alerts MCP server to post through ANNA's own Slack
+        # adapter. Defaults to an empty dict for standalone unit tests; the
+        # slack_post tool returns an error string when "slack" is absent.
+        self._adapters: dict[str, ChannelAdapter] = adapters or {}
         self._schedule_store = schedule_store
         self._google_clients = google_clients
         self._subagent_runner = subagent_runner
@@ -333,6 +347,9 @@ class ConversationWorker:
             schedule_store=self._schedule_store,
         )
 
+    def _build_slack_alert_tools(self) -> SlackAlertTools:
+        return SlackAlertTools(self._config, self._adapters)
+
     def _build_options(self) -> Any:
         """Construct the ClaudeAgentOptions for this worker.
 
@@ -371,7 +388,21 @@ class ConversationWorker:
         # planned fast-follow migrates this main-session construction onto
         # the same registry so the operator can curate ANNA's own server
         # surface in anna.yaml. No behavior change here yet.
-        mcp_servers: dict[str, Any] = {"anna_self_edit": self_edit_server}
+        # Build the Slack-alerts MCP server (slack_post). Mounted
+        # unconditionally — it posts through ANNA's own Slack adapter so it
+        # works in headless/scheduled runs. When the Slack transport is not
+        # connected the tool returns an error string rather than failing the
+        # mount, so there is no toggle.
+        slack_alert_tools = self._build_slack_alert_tools()
+        slack_alerts_server = build_slack_alerts_server(
+            tools=slack_alert_tools,
+            conv_key=self.conversation_key,
+        )
+
+        mcp_servers: dict[str, Any] = {
+            "anna_self_edit": self_edit_server,
+            "anna_slack_alerts": slack_alerts_server,
+        }
         include_google = False
         if self._google_clients is not None and self._config.google.enabled:
             google_tools = GoogleTools(

@@ -202,6 +202,19 @@ admin:
   startup_alert: true
 
 # ============================================================
+# Reports
+#
+# Default Slack channel the slack_post tool (anna_slack_alerts MCP server)
+# posts to when no channel_id is passed — e.g. the channel threat-report /
+# digest cards land in. Posts ride ANNA's own Slack adapter, so this works
+# in headless/scheduled runs. An explicit channel_id argument always wins.
+# Env-var equivalent: ANNA_REPORTS_SLACK_CHANNEL_ID.
+# ============================================================
+reports:
+  # Slack channel ID (e.g. C0123ABC) the bot is a member of.
+  slack_channel_id: ""
+
+# ============================================================
 # Scheduler (Phase 2)
 #
 # Fires scheduled prompts through the worker pool. Schedules persist

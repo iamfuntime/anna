@@ -21,6 +21,7 @@ from anna.runtime.worker import (
     _DELEGATE_PREFIX,
     _GOOGLE_PREFIX,
     _SELF_EDIT_PREFIX,
+    _SLACK_ALERTS_PREFIX,
     _WEB_PREFIX,
     ConversationWorker,
 )
@@ -28,6 +29,7 @@ from anna.skills.registry import SkillRegistry
 from anna.tools.delegate_server import DELEGATE_TOOL_NAMES
 from anna.tools.google_server import GOOGLE_TOOL_NAMES
 from anna.tools.self_edit_server import SELF_EDIT_TOOL_NAMES
+from anna.tools.slack_alerts_server import SLACK_ALERTS_TOOL_NAMES
 from anna.tools.web_server import WEB_TOOL_NAMES
 
 
@@ -40,6 +42,7 @@ def _make_worker(
     with_google: bool = False,
     with_subagent_runner: bool = False,
     subagents_enabled: bool = True,
+    adapters: dict | None = None,
 ) -> ConversationWorker:
     cfg = AnnaConfig()
     object.__setattr__(cfg, "anna_home", tmp_path / "anna_home")
@@ -93,6 +96,7 @@ def _make_worker(
         config=cfg,
         supervisor=supervisor,
         send=_noop_send,
+        adapters=adapters,
         google_clients=google_clients,
         subagent_runner=subagent_runner,
     )
@@ -107,6 +111,7 @@ def test_build_options_includes_default_fs_self_edit_and_web_tools(tmp_path: Pat
     expected = (
         list(_DEFAULT_FS_TOOLS)
         + [f"{_SELF_EDIT_PREFIX}{name}" for name in SELF_EDIT_TOOL_NAMES]
+        + [f"{_SLACK_ALERTS_PREFIX}{name}" for name in SLACK_ALERTS_TOOL_NAMES]
         + [f"{_WEB_PREFIX}{name}" for name in WEB_TOOL_NAMES]
     )
     assert sorted(options.allowed_tools) == sorted(expected)
@@ -120,6 +125,7 @@ def test_build_options_mounts_google_server_when_enabled(tmp_path: Path) -> None
     expected = (
         list(_DEFAULT_FS_TOOLS)
         + [f"{_SELF_EDIT_PREFIX}{name}" for name in SELF_EDIT_TOOL_NAMES]
+        + [f"{_SLACK_ALERTS_PREFIX}{name}" for name in SLACK_ALERTS_TOOL_NAMES]
         + [f"{_GOOGLE_PREFIX}{name}" for name in GOOGLE_TOOL_NAMES]
         + [f"{_WEB_PREFIX}{name}" for name in WEB_TOOL_NAMES]
     )
@@ -167,6 +173,44 @@ def test_build_options_mounts_self_edit_mcp_server(tmp_path: Path) -> None:
     # The SDK returns a dict-shaped McpSdkServerConfig for in-process servers.
     assert isinstance(server, dict)
     assert server.get("type") == "sdk"
+
+
+def test_build_options_mounts_slack_alerts_mcp_server(tmp_path: Path) -> None:
+    worker = _make_worker(tmp_path)
+    options = worker._build_options()
+    assert "anna_slack_alerts" in options.mcp_servers
+    server = options.mcp_servers["anna_slack_alerts"]
+    assert isinstance(server, dict)
+    assert server.get("type") == "sdk"
+    # The slack_post tool is always allowlisted.
+    assert "mcp__anna_slack_alerts__slack_post" in options.allowed_tools
+
+
+def test_build_slack_alert_tools_reaches_live_adapter(tmp_path: Path) -> None:
+    """The router→worker→tool handoff: SlackAlertTools built by the worker must
+    see the same live adapter the worker was constructed with, so slack_post
+    posts through ANNA's own Slack connection rather than an empty map."""
+
+    class _StubSlackAdapter:
+        async def start(self): ...
+        async def stop(self): ...
+        async def send(self, message): ...
+        def subscribe(self, handler): ...
+        async def health_check(self) -> bool:
+            return True
+
+        @classmethod
+        def conversation_key_for(cls, event):
+            return ""
+
+    stub = _StubSlackAdapter()
+    worker = _make_worker(tmp_path, adapters={"slack": stub})
+
+    tools = worker._build_slack_alert_tools()
+    # The tool bundle holds the worker's live adapter map, and "slack" resolves
+    # to the exact adapter instance — not a copy or an empty fallback.
+    assert tools.adapters is worker._adapters
+    assert tools.adapters.get("slack") is stub
 
 
 def test_build_options_sets_cwd_to_vault_and_add_dirs_to_core(tmp_path: Path) -> None:

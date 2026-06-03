@@ -16,6 +16,11 @@ from anna.tools.self_edit_server import (
     SelfEditTools,
     build_self_edit_server,
 )
+from anna.tools.slack_alerts_server import (
+    SLACK_ALERTS_TOOL_NAMES,
+    SlackAlertTools,
+    build_slack_alerts_server,
+)
 from anna.tools.vault_tools import VaultTools
 from anna.tools.web_server import WEB_TOOL_NAMES, build_web_server
 from anna.tools.web_tools import WebTools
@@ -24,6 +29,9 @@ __all__ = [
     "SELF_EDIT_TOOL_NAMES",
     "SelfEditTools",
     "build_self_edit_server",
+    "SLACK_ALERTS_TOOL_NAMES",
+    "SlackAlertTools",
+    "build_slack_alerts_server",
     "WEB_TOOL_NAMES",
     "WebTools",
     "VaultTools",

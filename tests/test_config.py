@@ -150,6 +150,60 @@ def test_example_yaml_includes_tools_block() -> None:
     assert cfg.tools.web_fetch.playwright_fallback is False
 
 
+def test_reports_defaults_when_block_omitted() -> None:
+    """A config with no reports: block uses ReportsConfig defaults."""
+    raw = {"auth": {"mode": "max"}}
+    cfg = AnnaConfig.model_validate(raw)
+    assert cfg.reports.slack_channel_id == ""
+
+
+def test_reports_slack_channel_persists() -> None:
+    raw = {"reports": {"slack_channel_id": "C0REPORTS"}}
+    cfg = AnnaConfig.model_validate(raw)
+    assert cfg.reports.slack_channel_id == "C0REPORTS"
+
+
+def test_example_yaml_includes_reports_block() -> None:
+    """Confirms anna.yaml.example's reports: block round-trips through the model."""
+    raw = yaml.safe_load(EXAMPLE_PATH.read_text(encoding="utf-8"))
+    cfg = AnnaConfig.model_validate(raw)
+    assert cfg.reports.slack_channel_id == ""
+
+
+def test_reports_env_override_applies_when_unset() -> None:
+    from anna.config import _apply_env_overrides
+
+    import os
+
+    prev = os.environ.get("ANNA_REPORTS_SLACK_CHANNEL_ID")
+    os.environ["ANNA_REPORTS_SLACK_CHANNEL_ID"] = "C_FROM_ENV"
+    try:
+        data = _apply_env_overrides({})
+        assert data["reports"]["slack_channel_id"] == "C_FROM_ENV"
+    finally:
+        if prev is None:
+            del os.environ["ANNA_REPORTS_SLACK_CHANNEL_ID"]
+        else:
+            os.environ["ANNA_REPORTS_SLACK_CHANNEL_ID"] = prev
+
+
+def test_reports_env_override_does_not_clobber_yaml_value() -> None:
+    from anna.config import _apply_env_overrides
+
+    import os
+
+    prev = os.environ.get("ANNA_REPORTS_SLACK_CHANNEL_ID")
+    os.environ["ANNA_REPORTS_SLACK_CHANNEL_ID"] = "C_FROM_ENV"
+    try:
+        data = _apply_env_overrides({"reports": {"slack_channel_id": "C_FROM_YAML"}})
+        assert data["reports"]["slack_channel_id"] == "C_FROM_YAML"
+    finally:
+        if prev is None:
+            del os.environ["ANNA_REPORTS_SLACK_CHANNEL_ID"]
+        else:
+            os.environ["ANNA_REPORTS_SLACK_CHANNEL_ID"] = prev
+
+
 def test_subagents_defaults_when_block_omitted() -> None:
     """A config with no subagents: block uses SubagentsConfig defaults."""
     raw = {"auth": {"mode": "max"}}

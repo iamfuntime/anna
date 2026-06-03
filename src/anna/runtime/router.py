@@ -269,6 +269,7 @@ class ConversationRouter:
                 supervisor=self._supervisor,
                 send=self._send_factory(event.transport),
                 on_idle_close=self._idle_close_callback,
+                adapters=self._adapters,
                 schedule_store=self._schedule_store,
                 google_clients=self._google_clients,
                 subagent_runner=self._subagent_runner,

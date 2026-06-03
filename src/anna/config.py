@@ -310,6 +310,24 @@ class AdminConfig(BaseModel):
     startup_alert: bool = True
 
 
+class ReportsConfig(BaseModel):
+    """Destination for ANNA's outbound report/digest cards.
+
+    The ``slack_post`` MCP tool (``anna_slack_alerts`` server) posts through
+    ANNA's own Slack adapter — the same path :class:`AdminAlerter` uses — so
+    it works in headless/scheduled runs. When the tool is called without an
+    explicit ``channel_id``, it falls back to ``slack_channel_id`` here. The
+    feed-aggregator / threat-report skill points this at the channel the
+    cards should land in. Left blank by default; an explicit ``channel_id``
+    argument always wins over this fallback.
+
+    Env-var override: ``ANNA_REPORTS_SLACK_CHANNEL_ID`` (only applied when
+    the YAML value is unset).
+    """
+
+    slack_channel_id: str = ""
+
+
 class GoogleAccountConfig(BaseModel):
     """A single Google account ANNA can read mail and calendar from.
 
@@ -974,6 +992,7 @@ class AnnaConfig(BaseModel):
     sessions: SessionsConfig = Field(default_factory=SessionsConfig)
     checkpoint: CheckpointConfig = Field(default_factory=CheckpointConfig)
     admin: AdminConfig = Field(default_factory=AdminConfig)
+    reports: ReportsConfig = Field(default_factory=ReportsConfig)
     scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
     google: GoogleConfig = Field(default_factory=GoogleConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
@@ -1112,6 +1131,14 @@ def _apply_env_overrides(data: dict[str, Any]) -> dict[str, Any]:
             admin["slack_channel_id"] = admin_slack
         if admin_tg and not admin.get("telegram_chat_id"):
             admin["telegram_chat_id"] = admin_tg
+
+    # Reports destination falls back to .env so the operator can keep the
+    # threat-report channel ID out of anna.yaml if they prefer.
+    reports_slack = os.environ.get("ANNA_REPORTS_SLACK_CHANNEL_ID")
+    if reports_slack:
+        reports = data.setdefault("reports", {})
+        if not reports.get("slack_channel_id"):
+            reports["slack_channel_id"] = reports_slack
 
     return data
 
