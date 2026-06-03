@@ -21,6 +21,7 @@ literally; tokens are recorded as their last four characters only.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -38,6 +39,7 @@ from typing import Any
 
 import click
 import structlog
+from dotenv import set_key
 
 from anna.core.identity import ensure_core_files
 from anna.log import audit_event
@@ -87,6 +89,11 @@ class WizardState:
     reconfigure: bool = False
     verbose: bool = False
     answers: dict[str, str] = field(default_factory=dict)
+    # Pre-interview snapshot of each step's prior answer, keyed by the same
+    # ``step`` string passed to ``_emit_step``. Populated only under a broader
+    # ``--reconfigure`` (see ``_preload_existing_into_state``) so audit events
+    # can record honest before/after diffs (``audit.setup.step_changed``).
+    priors: dict[str, str] = field(default_factory=dict)
 
 
 def _silence_console_logging() -> None:
@@ -147,6 +154,12 @@ def _emit_step(
     """
     audit_dir = state.anna_home / "audit"
     audit_dir.mkdir(parents=True, exist_ok=True)
+
+    # Under a broader reconfigure, auto-resolve the prior answer from the
+    # pre-interview snapshot when the caller didn't pass one explicitly, so the
+    # event honestly records step_changed vs step_completed.
+    if prior is None and step in state.priors:
+        prior = state.priors[step]
 
     if is_secret:
         recorded_answer: Any = {"last4": _last4(answer)}
@@ -671,23 +684,207 @@ def _confirm_plan(state: WizardState) -> bool:
     return click.confirm("\nWrite config and start ANNA?", default=True)
 
 
-def _write_env_file(state: WizardState, path: Path) -> None:
-    lines: list[str] = []
-    lines.append(f"ANNA_HOME={state.anna_home}")
-    lines.append(f"ANNA_VAULT_ROOT={state.vault_root}")
-    lines.append(f"ANNA_AUTH_MODE={state.auth_mode}")
-    if state.auth_mode == "api_key":
-        lines.append(f"ANTHROPIC_API_KEY={state.anthropic_api_key}")
-    if state.use_slack:
-        lines.append(f"SLACK_BOT_TOKEN={state.slack_bot_token}")
-        lines.append(f"SLACK_APP_TOKEN={state.slack_app_token}")
-    if state.use_telegram:
-        lines.append(f"TELEGRAM_BOT_TOKEN={state.telegram_bot_token}")
-        lines.append(f"ANNA_TELEGRAM_ALLOWED_USERS={state.telegram_admin_chat_id}")
+def _env_pairs(state: WizardState) -> list[tuple[str, str]]:
+    """The ordered (key, value) pairs the wizard owns in ``.env``.
 
+    Single source of truth for both the fresh-install full-overwrite path
+    and the reconfigure per-key update path so the two never drift on which
+    variables the wizard is responsible for.
+    """
+    pairs: list[tuple[str, str]] = [
+        ("ANNA_HOME", str(state.anna_home)),
+        ("ANNA_VAULT_ROOT", str(state.vault_root)),
+        ("ANNA_AUTH_MODE", state.auth_mode),
+    ]
+    if state.auth_mode == "api_key":
+        pairs.append(("ANTHROPIC_API_KEY", state.anthropic_api_key))
+    if state.use_slack:
+        pairs.append(("SLACK_BOT_TOKEN", state.slack_bot_token))
+        pairs.append(("SLACK_APP_TOKEN", state.slack_app_token))
+    if state.use_telegram:
+        pairs.append(("TELEGRAM_BOT_TOKEN", state.telegram_bot_token))
+        pairs.append(("ANNA_TELEGRAM_ALLOWED_USERS", state.telegram_admin_chat_id))
+    return pairs
+
+
+def _write_env_file(state: WizardState, path: Path) -> None:
+    """Persist the wizard-owned ``.env`` variables.
+
+    Fresh install (``reconfigure=False``): build the file from the fixed key
+    list and overwrite wholesale — there is nothing to preserve yet.
+
+    Reconfigure (``reconfigure=True``): update each wizard-owned key in place
+    via :func:`dotenv.set_key` so operator-added variables the wizard does not
+    own (``BRAVE_SEARCH_API_KEY`` and friends) survive untouched. We drive
+    ``set_key`` directly against the live ``.env`` rather than going through
+    :class:`anna_web.env_store.EnvStore`, whose documented-key allow-list is
+    parsed from ``.env.example`` at a repo-relative path that may not exist in
+    a wheel-installed package layout.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
+    pairs = _env_pairs(state)
+
+    if state.reconfigure and path.exists():
+        for key, value in pairs:
+            set_key(str(path), key, value, quote_mode="never")
+        os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)  # 0600
+        return
+
+    lines = [f"{key}={value}" for key, value in pairs]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)  # 0600
+
+
+def _reconfigure_anna_yaml(state: WizardState, path: Path) -> None:
+    """Update anna.yaml in place, one section at a time, preserving the rest.
+
+    Routes every section the wizard owns through
+    :meth:`anna_web.config_store.ConfigStore.write_section`, which reloads the
+    on-disk round-trip document, replaces a single top-level section, validates
+    the whole document against :class:`AnnaConfig`, and writes atomically. Any
+    section the wizard does not touch (``scheduler``, ``google``, ``tools``,
+    ``subagents``, ``identities``, operator hand-edits) is left exactly as the
+    operator last saved it — comments and key ordering included.
+
+    If the existing anna.yaml already fails ``AnnaConfig`` validation, the very
+    first ``write_section`` raises a pydantic ``ValidationError``. We surface
+    that as a clean :class:`click.ClickException` so the operator sees an
+    actionable message ("your existing anna.yaml failed validation") rather than
+    a raw traceback. The old blind-overwrite behavior silently replaced such a
+    file; failing loud is the safer regression.
+    """
+    from pydantic import ValidationError
+
+    from anna_web.config_store import ConfigStore
+
+    store = ConfigStore(anna_home=state.anna_home)
+
+    # Only the sections the wizard collects answers for. Everything else in the
+    # document is deliberately left untouched.
+    #
+    # CRITICAL: write_section replaces each top-level section WHOLESALE
+    # (config_store.py: ``doc[section] = payload`` — no field-level merge). So
+    # every payload below is built by reading the EXISTING section and overlaying
+    # ONLY the fields the wizard owns. A partial payload would drop required
+    # sub-sections the operator never sees in the interview — e.g. transports.cli
+    # (CLITransportConfig is required, no default), which would fail AnnaConfig
+    # validation and abort an otherwise-valid reconfigure, and silently reset any
+    # operator-tuned cli.socket_path / idle_gap_minutes / framing along the way.
+    sections: list[tuple[str, dict[str, Any]]] = [
+        ("auth", _auth_payload(state, store)),
+        ("transports", _transports_payload(state, store)),
+        ("vault", _vault_payload(state, store)),
+        ("admin", _admin_payload(state, store)),
+        ("web", _web_payload(state, store)),
+    ]
+
+    try:
+        for section, payload in sections:
+            asyncio.run(store.write_section(section, payload))
+    except ValidationError as exc:
+        raise click.ClickException(
+            f"Your existing anna.yaml at {path} failed validation, so the "
+            f"reconfigure was aborted before any change was written. Fix the "
+            f"file by hand (or move it aside to regenerate from scratch) and "
+            f"re-run anna-setup.\n\nDetails:\n{exc}"
+        ) from exc
+
+
+def _auth_payload(state: WizardState, store: "Any") -> dict[str, Any]:
+    """Build the ``auth`` section payload for a reconfigure write.
+
+    Reads the existing auth block and overlays only ``mode`` (the one field the
+    wizard owns), preserving any other auth keys the operator may have set.
+    Falls back to ``AuthConfig`` defaults on a first-time / missing section.
+    """
+    from anna.config import AuthConfig
+
+    try:
+        payload = store.load_validated().auth.model_dump()
+    except Exception:
+        payload = AuthConfig().model_dump()
+    payload["mode"] = state.auth_mode
+    return payload
+
+
+def _transports_payload(state: WizardState, store: "Any") -> dict[str, Any]:
+    """Build the ``transports`` section payload for a reconfigure write.
+
+    Reads the existing transports block and overlays ONLY ``slack.enabled`` and
+    ``telegram.enabled`` — the two toggles the wizard owns. The nested sub-dicts
+    are mutated in place so sibling keys survive: most importantly the required
+    ``cli`` block (CLITransportConfig has no default, so dropping it would fail
+    validation), plus any other operator-tuned cli fields (socket_path,
+    idle_gap_minutes, framing). Falls back to ``TransportsConfig`` defaults on a
+    first-time / missing section.
+    """
+    from anna.config import TransportsConfig
+
+    try:
+        payload = store.load_validated().transports.model_dump()
+    except Exception:
+        payload = TransportsConfig().model_dump()
+    # Overlay only the fields the wizard owns; mutate nested dicts in place so
+    # siblings (cli, and telegram's other fields) are left intact.
+    payload.setdefault("slack", {})["enabled"] = state.use_slack
+    payload.setdefault("telegram", {})["enabled"] = state.use_telegram
+    return payload
+
+
+def _vault_payload(state: WizardState, store: "Any") -> dict[str, Any]:
+    """Build the ``vault`` section payload for a reconfigure write.
+
+    Reads the existing vault block and overlays only ``path`` (the field the
+    wizard owns). Falls back to ``VaultConfig`` defaults on a first-time /
+    missing section.
+    """
+    from anna.config import VaultConfig
+
+    try:
+        payload = store.load_validated().vault.model_dump()
+    except Exception:
+        payload = VaultConfig().model_dump()
+    payload["path"] = str(state.vault_root)
+    return payload
+
+
+def _admin_payload(state: WizardState, store: "Any") -> dict[str, Any]:
+    """Build the ``admin`` section payload for a reconfigure write.
+
+    Reads the existing admin block and overlays only the two alert destinations
+    the wizard collects (``slack_channel_id`` and ``telegram_chat_id``). The
+    operator's existing ``startup_alert`` value is preserved verbatim — the
+    wizard does not collect it, so it must not be forced to a fixed value. Falls
+    back to ``AdminConfig`` defaults on a first-time / missing section.
+    """
+    from anna.config import AdminConfig
+
+    try:
+        payload = store.load_validated().admin.model_dump()
+    except Exception:
+        payload = AdminConfig().model_dump()
+    payload["slack_channel_id"] = state.slack_admin_channel or ""
+    payload["telegram_chat_id"] = state.telegram_admin_chat_id or ""
+    return payload
+
+
+def _web_payload(state: WizardState, store: "Any") -> dict[str, Any]:
+    """Build the ``web`` section payload for a reconfigure write.
+
+    Reads the existing web block so all non-``enabled`` fields (host, port,
+    target_unit, any operator tuning) are preserved, then overlays the new
+    ``enabled`` value. When the existing config has no web block yet (first
+    enable on a pre-2.5 install), fall back to ``WebDashboardConfig`` defaults.
+    """
+    from anna.config import WebDashboardConfig
+
+    try:
+        existing = store.load_validated().web
+        payload = existing.model_dump()
+    except Exception:
+        payload = WebDashboardConfig().model_dump()
+    payload["enabled"] = state.web_enabled
+    return payload
 
 
 def _write_anna_yaml(state: WizardState, path: Path) -> None:
@@ -697,7 +894,16 @@ def _write_anna_yaml(state: WizardState, path: Path) -> None:
     next to it. Only the keys the wizard collects are substituted; everything
     else is left at the documented defaults so the operator can tune later
     by hand-editing.
+
+    On a reconfigure of an existing install we never re-render from this static
+    template — that is the clobbering bug. We route through
+    :func:`_reconfigure_anna_yaml` instead, which edits sections in place and
+    preserves untouched ones. The template path below is fresh-install only.
     """
+    if state.reconfigure and path.exists():
+        _reconfigure_anna_yaml(state, path)
+        return
+
     slack_enabled = "true" if state.use_slack else "false"
     telegram_enabled = "true" if state.use_telegram else "false"
     slack_admin = state.slack_admin_channel or ""
@@ -1131,6 +1337,113 @@ def _print_talk_to_her(state: WizardState, bot_username: str) -> None:
         click.echo("  Slack    : DM the app, or @-mention it in a channel.")
 
 
+def _reconfigure_web_only(state: WizardState) -> int:
+    """Additive ``--enable-web`` / ``--disable-web`` against an existing install.
+
+    The operative intent is just the web toggle: flip ``web.enabled`` and add a
+    ``web`` block if the config predates Phase 2.5, preserving every other
+    section verbatim. We deliberately do NOT touch ``.env`` here — the web
+    toggle is anna.yaml-only, and the bug this branch fixes is exactly the blind
+    ``.env`` overwrite that dropped operator-added keys.
+
+    Modeled on the ``--persona`` early-return in :func:`main`: it emits the same
+    lifecycle start/complete audit events and returns an exit code directly.
+    """
+    from pydantic import ValidationError
+
+    from anna_web.config_store import ConfigStore
+
+    _emit_lifecycle(
+        state,
+        event="setup.start",
+        anna_home=str(state.anna_home),
+        reconfigure=True,
+        mode="web_toggle",
+    )
+
+    store = ConfigStore(anna_home=state.anna_home)
+    yaml_path = store.path
+    if not yaml_path.exists():
+        raise click.UsageError(
+            f"No existing anna.yaml at {yaml_path}. Run anna-setup without "
+            f"--reconfigure first to create the initial config."
+        )
+
+    try:
+        payload = _web_payload(state, store)
+        asyncio.run(store.write_section("web", payload))
+    except ValidationError as exc:
+        raise click.ClickException(
+            f"Your existing anna.yaml at {yaml_path} failed validation, so the "
+            f"web toggle was not written. Fix the file by hand and re-run.\n\n"
+            f"Details:\n{exc}"
+        ) from exc
+
+    _emit_step(state, step="web.enabled", answer=f"{state.web_enabled} (cli flag)")
+    _emit_lifecycle(state, event="setup.complete")
+
+    verb = "enabled" if state.web_enabled else "disabled"
+    click.secho(
+        f"Web dashboard {verb} in anna.yaml. Apply it with:\n"
+        f"  systemctl --user {'enable --now' if state.web_enabled else 'disable --now'} anna-web",
+        fg="green",
+    )
+    return 0
+
+
+def _preload_existing_into_state(state: WizardState) -> None:
+    """Load existing anna.yaml / .env values into WizardState before the interview.
+
+    Under a broader ``--reconfigure`` each ``click.prompt(default=...)`` should
+    show the operator's current value so they edit rather than re-enter (and so
+    leaving a field blank does not silently reset it). Best-effort: a config
+    that won't validate falls through to a fresh interview rather than aborting,
+    since the per-section write later will surface the real validation error.
+    """
+    from anna_web.config_store import ConfigStore
+
+    store = ConfigStore(anna_home=state.anna_home)
+    if not store.path.exists():
+        return
+    try:
+        cfg = store.load_validated()
+    except Exception:
+        return
+
+    state.vault_root = Path(os.path.expanduser(str(cfg.vault.path)))
+    state.use_slack = cfg.transports.slack.enabled
+    state.use_telegram = cfg.transports.telegram.enabled
+    state.auth_mode = cfg.auth.mode
+    state.slack_admin_channel = cfg.admin.slack_channel_id or ""
+    state.telegram_admin_chat_id = cfg.admin.telegram_chat_id or ""
+    if not state.web_prompt_resolved:
+        state.web_enabled = cfg.web.enabled
+
+    # Secrets live in .env, not anna.yaml. Pull the admin/allowed-user id from
+    # there too so the telegram default is the live value.
+    env_path = state.anna_home / ".env"
+    if env_path.exists():
+        from dotenv import dotenv_values
+
+        env = dotenv_values(str(env_path))
+        allowed = env.get("ANNA_TELEGRAM_ALLOWED_USERS")
+        if allowed:
+            state.telegram_admin_chat_id = allowed
+
+    # Snapshot the loaded values keyed by the step strings the step_* functions
+    # emit, so _emit_step records honest step_changed/step_completed diffs.
+    state.priors.update(
+        {
+            "storage.vault_root": str(state.vault_root),
+            "channels.selected": f"slack={state.use_slack},telegram={state.use_telegram}",
+            "auth.mode": state.auth_mode,
+            "slack.admin_channel": state.slack_admin_channel,
+            "telegram.admin_chat_id": state.telegram_admin_chat_id,
+            "web.enabled": str(state.web_enabled),
+        }
+    )
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -1214,7 +1527,22 @@ def main(
         _emit_lifecycle(state, event="setup.persona_only.complete")
         return 0
 
+    # Web-toggle-only reconfigure. When --reconfigure is paired with an
+    # explicit --enable-web/--disable-web on an already-configured install, the
+    # operative intent is purely the web block: add/flip web.enabled and
+    # preserve everything else (no full interview, no .env rewrite). This is the
+    # exact `anna-setup --reconfigure --enable-web` invocation the clobbering
+    # bug regressed. A bare --reconfigure (no web flag) falls through to the
+    # broader interview path below.
+    if reconfigure and state.web_prompt_resolved:
+        return _reconfigure_web_only(state)
+
     _emit_lifecycle(state, event="setup.start", anna_home=str(state.anna_home), reconfigure=reconfigure)
+
+    # Broader reconfigure: seed WizardState from the existing config so each
+    # prompt's default shows the current value (operator edits, not re-enters).
+    if reconfigure:
+        _preload_existing_into_state(state)
 
     click.secho("Welcome — let's get ANNA set up. This takes a couple of minutes.", bold=True, fg="cyan")
     try:
