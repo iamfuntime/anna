@@ -31,7 +31,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from anna.config import AnnaConfig
 from anna.log import audit_event, get_logger
@@ -40,6 +40,16 @@ if TYPE_CHECKING:
     from anna.agents.registry import SubAgentRegistry
     from anna.runtime.supervisor import Supervisor
     from anna.skills.registry import SkillRegistry
+
+
+# Callback the runner invokes when a *background* delegation completes. It
+# receives the originating conversation's transport + conv_key and the
+# already-formatted completion text (reply + YAML trailer) and is
+# responsible for delivering that text back into the originating
+# conversation as a NEW inbound turn so the harness re-invokes ANNA. The
+# router supplies this at boot via :meth:`SubAgentRunner.set_delivery`.
+# Signature: ``(transport, conv_key, text) -> Awaitable[None]``.
+BackgroundDeliveryCallback = Callable[[str, str, str], Awaitable[None]]
 
 
 @dataclass(frozen=True)
@@ -157,6 +167,254 @@ class SubAgentRunner:
         self._semaphore = asyncio.Semaphore(config.subagents.max_concurrent)
         self._audit_dir: Path = config.audit_dir
         self._fsync: bool = config.logging.audit.fsync_on_write
+        # Background-delegation state. ``_delivery`` is the callback the
+        # router installs at boot so a completed background job can route
+        # its result back into the originating conversation as a new
+        # inbound turn. ``_background_jobs`` tracks in-flight detached
+        # tasks so :meth:`drain_background_jobs` (called from
+        # ``ConversationRouter.shutdown``) can await them on SIGTERM
+        # rather than leaving them orphaned.
+        self._delivery: BackgroundDeliveryCallback | None = None
+        self._background_jobs: set[asyncio.Task[None]] = set()
+
+    # ------------------------------------------------------------------
+    # Background delegation (async / detached)
+    # ------------------------------------------------------------------
+
+    def set_delivery(self, delivery: BackgroundDeliveryCallback) -> None:
+        """Install the completion-delivery callback for background jobs.
+
+        Called once at boot from :meth:`ConversationRouter.__init__` after
+        both the runner and the router exist (the router cannot be passed
+        into the runner's constructor without an import cycle, and the
+        runner is constructed before the router). The callback delivers a
+        finished background delegation's formatted text back into the
+        originating conversation as a new inbound turn.
+        """
+        self._delivery = delivery
+
+    def start_background(
+        self,
+        *,
+        agent_slug: str,
+        task: str,
+        parent_conv_key: str,
+        parent_transport: str,
+        context: dict[str, Any] | None = None,
+        timeout_seconds: int | None = None,
+    ) -> str:
+        """Fire a delegation detached and return a job id immediately.
+
+        Unlike :meth:`delegate`, this does not block the caller on the
+        sub-agent run. It schedules :meth:`_run_background` as a tracked
+        asyncio task and returns a freshly-minted ``job_id`` right away.
+        When the sub-agent finishes (success OR failure), the task formats
+        the outcome and hands it to the installed delivery callback, which
+        injects it back into ``parent_conv_key`` as a new inbound turn so
+        ANNA is re-invoked to read and act on it.
+
+        The job still flows through :meth:`delegate`, so it respects the
+        process-wide concurrency semaphore exactly as a synchronous call
+        does — a background job that cannot acquire a slot waits (and may
+        ultimately fail with ``concurrency_timeout``), and the delivered
+        turn carries that failure.
+
+        Args:
+            agent_slug: Persona slug.
+            task: Free-text task body.
+            parent_conv_key: Originating conversation key; the completion
+                turn is delivered here.
+            parent_transport: Originating transport (``slack``,
+                ``telegram``, ``cli``, ...). Threaded through so the
+                synthetic delivery event resolves the right send adapter
+                even if the originating worker idled out in the meantime.
+            context: Optional structured context dict.
+            timeout_seconds: Per-call wall-clock cap; None → config
+                default.
+
+        Returns:
+            The ``job_id`` (a uuid4 hex string) the caller surfaces to
+            ANNA immediately.
+        """
+        job_id = uuid.uuid4().hex
+        self._audit(
+            "audit.subagent.background_start",
+            parent_conv=parent_conv_key,
+            slug=agent_slug,
+            job_id=job_id,
+            task=task[:500],
+        )
+        task_obj = asyncio.create_task(
+            self._run_background(
+                job_id=job_id,
+                agent_slug=agent_slug,
+                task=task,
+                parent_conv_key=parent_conv_key,
+                parent_transport=parent_transport,
+                context=context,
+                timeout_seconds=timeout_seconds,
+            ),
+            name=f"subagent.background.{agent_slug}.{job_id}",
+        )
+        self._background_jobs.add(task_obj)
+        task_obj.add_done_callback(self._background_jobs.discard)
+        return job_id
+
+    async def _run_background(
+        self,
+        *,
+        job_id: str,
+        agent_slug: str,
+        task: str,
+        parent_conv_key: str,
+        parent_transport: str,
+        context: dict[str, Any] | None,
+        timeout_seconds: int | None,
+    ) -> None:
+        """Run a detached delegation and deliver its outcome back upstream.
+
+        Both the success and failure branches format a self-contained
+        message (the sub-agent reply or a failure line, plus the job_id /
+        agent_slug header and the standard YAML trailer) and hand it to
+        the delivery callback. Cancellation (SIGTERM drain) is allowed to
+        propagate so the drain can complete promptly; the audit
+        background_complete event is still emitted for the terminal
+        success/failure paths.
+        """
+        # Local import avoids a module-level cycle (delegate_server imports
+        # from this module).
+        from anna.tools.delegate_server import (
+            format_background_failure,
+            format_background_success,
+        )
+
+        try:
+            result = await self.delegate(
+                agent_slug=agent_slug,
+                task=task,
+                parent_conv_key=parent_conv_key,
+                context=context,
+                timeout_seconds=timeout_seconds,
+            )
+        except SubAgentError as exc:
+            text = format_background_failure(
+                job_id=job_id,
+                agent_slug=agent_slug,
+                kind=exc.kind,
+                detail=str(exc),
+            )
+            self._audit(
+                "audit.subagent.background_complete",
+                parent_conv=parent_conv_key,
+                level="WARNING",
+                slug=agent_slug,
+                job_id=job_id,
+                status=exc.kind,
+            )
+            await self._deliver(parent_transport, parent_conv_key, text, job_id)
+            return
+        except Exception as exc:  # noqa: BLE001
+            # A RAW exception from any step that runs after semaphore
+            # acquisition but is NOT wrapped as a SubAgentError (skill
+            # load, system-prompt build, options build, spawn audit,
+            # transcript write). Without this branch the task would die
+            # silently: no failure turn delivered, no background_complete
+            # audit. Mirror the SubAgentError branch so the operator
+            # always learns the job failed, just with status="error" and
+            # a message making clear it was unexpected.
+            status = type(exc).__name__ or "error"
+            text = format_background_failure(
+                job_id=job_id,
+                agent_slug=agent_slug,
+                kind="error",
+                detail=f"unexpected error: {exc!r}",
+            )
+            self._audit(
+                "audit.subagent.background_complete",
+                parent_conv=parent_conv_key,
+                level="WARNING",
+                slug=agent_slug,
+                job_id=job_id,
+                status=status,
+            )
+            await self._deliver(parent_transport, parent_conv_key, text, job_id)
+            return
+
+        text = format_background_success(
+            job_id=job_id,
+            agent_slug=agent_slug,
+            result=result,
+        )
+        self._audit(
+            "audit.subagent.background_complete",
+            parent_conv=parent_conv_key,
+            slug=agent_slug,
+            job_id=job_id,
+            status=result.status,
+            duration_ms=result.duration_ms,
+            output_length=len(result.text),
+        )
+        await self._deliver(parent_transport, parent_conv_key, text, job_id)
+
+    async def _deliver(
+        self,
+        transport: str,
+        conv_key: str,
+        text: str,
+        job_id: str,
+    ) -> None:
+        """Hand a completed job's text to the delivery callback, if set.
+
+        Delivery failures are logged but never raised — a background job
+        that cannot reach the router must not crash the runner's task or
+        wedge the drain. Best-effort by design, mirroring the alerter and
+        send-path error handling elsewhere in the runtime.
+        """
+        if self._delivery is None:
+            self._log.warning(
+                "subagent.background.no_delivery",
+                job_id=job_id,
+                conv_key=conv_key,
+            )
+            return
+        try:
+            await self._delivery(transport, conv_key, text)
+        except Exception as exc:  # noqa: BLE001
+            self._log.error(
+                "subagent.background.delivery_failed",
+                job_id=job_id,
+                conv_key=conv_key,
+                error=str(exc),
+            )
+
+    async def drain_background_jobs(self, timeout: float = 10.0) -> None:
+        """Await in-flight background jobs so SIGTERM does not orphan them.
+
+        Called from :meth:`ConversationRouter.shutdown` before the worker
+        registry is torn down. Waits up to ``timeout`` seconds for every
+        tracked job to finish delivering its result; jobs that have not
+        landed by then are cancelled so the loop teardown does not hang.
+        """
+        jobs = list(self._background_jobs)
+        if not jobs:
+            return
+        self._log.info("subagent.background.drain.start", inflight=len(jobs))
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*jobs, return_exceptions=True),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            self._log.warning(
+                "subagent.background.drain.timeout",
+                inflight=len(self._background_jobs),
+            )
+            for job in list(self._background_jobs):
+                job.cancel()
+            # Give cancellation a beat to settle.
+            await asyncio.gather(*self._background_jobs, return_exceptions=True)
+        self._background_jobs.clear()
+        self._log.info("subagent.background.drain.complete")
 
     # ------------------------------------------------------------------
     # Persona + skills loading (subtask 3)
@@ -742,6 +1000,7 @@ class SubAgentRunner:
 
 
 __all__ = [
+    "BackgroundDeliveryCallback",
     "DelegateResult",
     "SubAgentError",
     "SubAgentRunner",

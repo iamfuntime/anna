@@ -135,6 +135,18 @@ class ConversationRouter:
         else:
             self._cadence_linter = None
 
+        # Background-delegation completion delivery. The runner fires a
+        # detached sub-agent and, on completion, needs to route the result
+        # back into the originating conversation as a NEW inbound turn so
+        # ANNA is re-invoked to read and act on it. The runner cannot be
+        # handed the router in its constructor (it is built first, and a
+        # back-reference would be an import cycle), so we install the
+        # delivery callback here once both objects exist.
+        if self._subagent_runner is not None:
+            self._subagent_runner.set_delivery(
+                self.deliver_background_completion
+            )
+
     # ------------------------------------------------------------------
     # Dispatch
     # ------------------------------------------------------------------
@@ -175,6 +187,42 @@ class ConversationRouter:
             transport=event.transport,
         )
         await worker.submit(event)
+
+    async def deliver_background_completion(
+        self,
+        transport: str,
+        conv_key: str,
+        text: str,
+    ) -> None:
+        """Inject a finished background delegation as a new inbound turn.
+
+        Installed on the :class:`SubAgentRunner` at construction. When a
+        detached delegation completes, the runner calls this with the
+        originating conversation's transport + conv_key and the formatted
+        completion text (sub-agent reply + YAML trailer).
+
+        Reuses the same vehicle the scheduler uses to inject a turn: a
+        synthetic :class:`InboundEvent` dispatched through
+        :meth:`dispatch`. The crucial difference from the scheduler is
+        that we DO NOT attach a ``completion_future`` — so the worker runs
+        the turn through its normal interactive path, ANNA reads the
+        result, and her reply flushes to the originating conversation via
+        the standard send callback. The conv_key is preserved verbatim so
+        the completion lands in the conversation that started the
+        delegation (the identity-aliasing rewrite in :meth:`dispatch` is a
+        no-op for an already-canonical key).
+        """
+        event = InboundEvent(
+            transport=transport,
+            conversation_key=conv_key,
+            sender_id="anna.subagent",
+            sender_display="ANNA Sub-agent",
+            text=text,
+            is_dm=False,
+            is_thread=False,
+            raw={"background_delegation": True},
+        )
+        await self.dispatch(event)
 
     def _normalize_conv_key(self, event: InboundEvent) -> str:
         """Phase 2 §5 identity aliasing.
@@ -364,7 +412,30 @@ class ConversationRouter:
         late dispatch attempt cannot revive a worker we are tearing down.
         Errors in individual ``worker.stop()`` calls are logged but do not
         prevent the remaining workers from being closed.
+
+        In-flight background delegations are drained first: a detached
+        sub-agent that is mid-run when SIGTERM lands would otherwise be
+        orphaned. :meth:`SubAgentRunner.drain_background_jobs` awaits each
+        job (bounded) so it can deliver its completion turn — or be
+        cancelled cleanly rather than left dangling on the torn-down loop.
+
+        A completion that lands during the drain is best-effort and may
+        not be acted on: ``worker.stop()`` cancels the run-loop without
+        draining the queue, and ``_closeout`` only checkpoints + evicts —
+        it does not process queued inbound events. So a delivery that
+        arrives after its worker's run-loop is already cancelled will sit
+        unprocessed. Nothing is lost from the record, though: the
+        transcript line and the ``background_complete`` audit still fire.
         """
+        if self._subagent_runner is not None:
+            try:
+                await self._subagent_runner.drain_background_jobs()
+            except Exception as exc:
+                self._log.error(
+                    "router.shutdown.background_drain_failed",
+                    error=str(exc),
+                )
+
         async with self._workers_lock:
             workers = list(self._workers.values())
             self._workers.clear()

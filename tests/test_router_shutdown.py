@@ -120,3 +120,81 @@ async def test_shutdown_drains_registry_before_stopping(tmp_path) -> None:
             "registry should be drained before any worker.stop() is called; "
             f"saw {list(snapshot)}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Background-delegation completion delivery + shutdown drain
+# ---------------------------------------------------------------------------
+
+
+class _FakeRunner:
+    """Minimal SubAgentRunner stand-in for the router wiring tests."""
+
+    def __init__(self) -> None:
+        self.delivery = None
+        self.drained = False
+
+    def set_delivery(self, delivery) -> None:  # type: ignore[no-untyped-def]
+        self.delivery = delivery
+
+    async def drain_background_jobs(self) -> None:
+        self.drained = True
+
+
+def _make_router_with_runner(tmp_path, runner) -> ConversationRouter:
+    cfg = AnnaConfig()
+    object.__setattr__(cfg, "anna_home", tmp_path / "anna_home")
+    cfg.vault.path = str(tmp_path / "vault")
+    cfg.core_dir.mkdir(parents=True, exist_ok=True)
+    supervisor = Supervisor(config=cfg)
+    return ConversationRouter(
+        config=cfg,
+        supervisor=supervisor,
+        adapters={},
+        subagent_runner=runner,  # type: ignore[arg-type]
+    )
+
+
+@pytest.mark.asyncio
+async def test_router_installs_delivery_callback_on_runner(tmp_path) -> None:
+    """The router wires its delivery method onto the runner at construction."""
+    runner = _FakeRunner()
+    router = _make_router_with_runner(tmp_path, runner)
+    assert runner.delivery == router.deliver_background_completion
+
+
+@pytest.mark.asyncio
+async def test_deliver_background_completion_dispatches_turn(tmp_path) -> None:
+    """A completion is injected as a new inbound turn on the origin conv_key."""
+    runner = _FakeRunner()
+    router = _make_router_with_runner(tmp_path, runner)
+
+    dispatched: list[Any] = []
+
+    async def _capture(event) -> None:  # type: ignore[no-untyped-def]
+        dispatched.append(event)
+
+    router.dispatch = _capture  # type: ignore[method-assign]
+
+    await router.deliver_background_completion(
+        "slack", "slack:dm:U123", "the sub-agent reply"
+    )
+
+    assert len(dispatched) == 1
+    event = dispatched[0]
+    assert event.transport == "slack"
+    assert event.conversation_key == "slack:dm:U123"
+    assert event.text == "the sub-agent reply"
+    # No completion_future → the worker runs the normal interactive path
+    # (ANNA reads + acts) rather than resolving a future for a caller.
+    assert event.completion_future is None
+    assert event.raw.get("background_delegation") is True
+
+
+@pytest.mark.asyncio
+async def test_shutdown_drains_background_jobs_first(tmp_path) -> None:
+    """router.shutdown drains in-flight background jobs before workers."""
+    runner = _FakeRunner()
+    router = _make_router_with_runner(tmp_path, runner)
+    await router.shutdown()
+    assert runner.drained is True

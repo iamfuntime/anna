@@ -1289,3 +1289,282 @@ async def test_delegate_concurrency_is_semaphore_bounded(
         f"third delegate should have waited ~{hold_seconds}s; "
         f"actual wait={third_wait:.3f}s"
     )
+
+
+# ---------------------------------------------------------------------------
+# Background delegation (async / detached)
+# ---------------------------------------------------------------------------
+
+
+class _GatedReplyClient(_FakeReplyClient):
+    """Fake SDK client that blocks in receive_response until released.
+
+    Lets a test observe that ``start_background`` returned a job id while
+    the sub-agent run is still in flight, then release the gate so the
+    run completes and the delivery callback fires.
+    """
+
+    def __init__(self, gate: asyncio.Event, *, reply: str = "bg done") -> None:
+        super().__init__(reply=reply)
+        self._gate = gate
+
+    async def receive_response(self):
+        await self._gate.wait()
+        async for msg in super().receive_response():
+            yield msg
+
+
+@pytest.mark.asyncio
+async def test_start_background_returns_job_id_immediately(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """start_background returns a job id without waiting for the sub-agent."""
+    runner = _make_runner(tmp_path)
+    _write_persona(tmp_path, "slug")
+
+    gate = asyncio.Event()
+    _install_fake_sdk(monkeypatch, lambda opts: _GatedReplyClient(gate))
+
+    delivered: list[tuple[str, str, str]] = []
+
+    async def _delivery(transport: str, conv_key: str, text: str) -> None:
+        delivered.append((transport, conv_key, text))
+
+    runner.set_delivery(_delivery)
+
+    job_id = runner.start_background(
+        agent_slug="slug",
+        task="t",
+        parent_conv_key="slack:dm:U123",
+        parent_transport="slack",
+    )
+    # A job id came back synchronously and the run is still gated (not yet
+    # delivered).
+    assert isinstance(job_id, str)
+    assert job_id
+    assert delivered == []
+    assert len(runner._background_jobs) == 1  # noqa: SLF001
+
+    # Release the gate and let the background task finish + deliver.
+    gate.set()
+    await runner.drain_background_jobs()
+
+    assert len(delivered) == 1
+    transport, conv_key, text = delivered[0]
+    assert transport == "slack"
+    assert conv_key == "slack:dm:U123"
+    assert "bg done" in text
+    assert job_id in text
+
+
+@pytest.mark.asyncio
+async def test_background_completion_delivers_to_origin_conv_key(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The completion turn carries the originating conv_key + transport."""
+    runner = _make_runner(tmp_path)
+    _write_persona(tmp_path, "slug")
+    _install_fake_sdk(
+        monkeypatch, lambda opts: _FakeReplyClient(reply="research result")
+    )
+
+    delivered: list[tuple[str, str, str]] = []
+
+    async def _delivery(transport: str, conv_key: str, text: str) -> None:
+        delivered.append((transport, conv_key, text))
+
+    runner.set_delivery(_delivery)
+
+    runner.start_background(
+        agent_slug="slug",
+        task="dig",
+        parent_conv_key="telegram:dm:99",
+        parent_transport="telegram",
+    )
+    await runner.drain_background_jobs()
+
+    assert len(delivered) == 1
+    transport, conv_key, text = delivered[0]
+    assert transport == "telegram"
+    assert conv_key == "telegram:dm:99"
+    assert "research result" in text
+    # The YAML trailer rides along so ANNA reads a consistent surface.
+    assert "delegation:" in text
+    assert "status: ok" in text
+
+
+@pytest.mark.asyncio
+async def test_background_emits_start_and_complete_audit(
+    tmp_path: Path, monkeypatch
+) -> None:
+    runner = _make_runner(tmp_path)
+    _write_persona(tmp_path, "slug")
+    _install_fake_sdk(monkeypatch, lambda opts: _FakeReplyClient(reply="r"))
+
+    async def _delivery(transport: str, conv_key: str, text: str) -> None:
+        return None
+
+    runner.set_delivery(_delivery)
+    job_id = runner.start_background(
+        agent_slug="slug",
+        task="t",
+        parent_conv_key="slack:dm:U123",
+        parent_transport="slack",
+    )
+    await runner.drain_background_jobs()
+
+    events = _audit_events(tmp_path)
+    names = [e["event"] for e in events]
+    assert "audit.subagent.background_start" in names
+    assert "audit.subagent.background_complete" in names
+    start = next(
+        e for e in events if e["event"] == "audit.subagent.background_start"
+    )
+    complete = next(
+        e for e in events if e["event"] == "audit.subagent.background_complete"
+    )
+    assert start["job_id"] == job_id
+    assert complete["job_id"] == job_id
+    assert complete["status"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_background_failure_delivers_failure_turn(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A failing background job still delivers a turn (with the failure)."""
+    runner = _make_runner(tmp_path)
+    # No persona written → not_found inside delegate().
+    _install_fake_sdk(monkeypatch, lambda opts: _FakeReplyClient())
+
+    delivered: list[tuple[str, str, str]] = []
+
+    async def _delivery(transport: str, conv_key: str, text: str) -> None:
+        delivered.append((transport, conv_key, text))
+
+    runner.set_delivery(_delivery)
+    job_id = runner.start_background(
+        agent_slug="ghost",
+        task="t",
+        parent_conv_key="slack:dm:U123",
+        parent_transport="slack",
+    )
+    await runner.drain_background_jobs()
+
+    assert len(delivered) == 1
+    _, conv_key, text = delivered[0]
+    assert conv_key == "slack:dm:U123"
+    assert "failed" in text
+    assert "not_found" in text
+    assert job_id in text
+
+    events = _audit_events(tmp_path)
+    complete = next(
+        e for e in events if e["event"] == "audit.subagent.background_complete"
+    )
+    assert complete["status"] == "not_found"
+
+
+@pytest.mark.asyncio
+async def test_background_raw_exception_delivers_failure_and_warns(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A NON-SubAgentError raised mid-run still delivers a turn + warns.
+
+    Steps that run after semaphore acquisition but are not wrapped as a
+    SubAgentError (skill load, prompt build, options build, spawn audit,
+    transcript write) can raise a raw exception. The broad ``except
+    Exception`` branch in ``_run_background`` must still deliver a failure
+    turn AND emit a WARNING-level ``background_complete`` audit so the job
+    never silently vanishes from the operator's view. Here we patch a
+    post-semaphore step (``_load_skills``) to raise ``RuntimeError``.
+    """
+    runner = _make_runner(tmp_path)
+    _write_persona(tmp_path, "slug")
+    _install_fake_sdk(monkeypatch, lambda opts: _FakeReplyClient())
+
+    def _boom(_slug: str) -> list[str]:
+        raise RuntimeError("disk exploded")
+
+    monkeypatch.setattr(runner, "_load_skills", _boom)
+
+    delivered: list[tuple[str, str, str]] = []
+
+    async def _delivery(transport: str, conv_key: str, text: str) -> None:
+        delivered.append((transport, conv_key, text))
+
+    runner.set_delivery(_delivery)
+    job_id = runner.start_background(
+        agent_slug="slug",
+        task="t",
+        parent_conv_key="slack:dm:U123",
+        parent_transport="slack",
+    )
+    await runner.drain_background_jobs()
+
+    # A failure turn still landed despite the raw (non-SubAgentError)
+    # exception.
+    assert len(delivered) == 1
+    transport, conv_key, text = delivered[0]
+    assert transport == "slack"
+    assert conv_key == "slack:dm:U123"
+    assert "failed" in text
+    assert job_id in text
+    assert "disk exploded" in text
+
+    # A WARNING-level background_complete audit fired with the exception
+    # type as the status.
+    events = _audit_events(tmp_path)
+    complete = next(
+        e for e in events if e["event"] == "audit.subagent.background_complete"
+    )
+    assert complete["level"] == "WARNING"
+    assert complete["status"] == "RuntimeError"
+    assert complete["job_id"] == job_id
+
+
+@pytest.mark.asyncio
+async def test_drain_background_jobs_no_jobs_is_noop(tmp_path: Path) -> None:
+    runner = _make_runner(tmp_path)
+    # Should not raise with an empty job set.
+    await runner.drain_background_jobs()
+
+
+@pytest.mark.asyncio
+async def test_drain_cancels_jobs_past_timeout(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A background job that never finishes is cancelled by the drain.
+
+    Mirrors a SIGTERM landing while a sub-agent is still running: the
+    drain waits up to its timeout, then cancels the dangling task so the
+    loop teardown does not hang. The job set is empty afterward (no
+    orphans).
+    """
+    runner = _make_runner(tmp_path)
+    _write_persona(tmp_path, "slug")
+
+    never = asyncio.Event()  # never set → receive_response blocks forever
+    _install_fake_sdk(monkeypatch, lambda opts: _GatedReplyClient(never))
+
+    delivered: list[tuple[str, str, str]] = []
+
+    async def _delivery(transport: str, conv_key: str, text: str) -> None:
+        delivered.append((transport, conv_key, text))
+
+    runner.set_delivery(_delivery)
+    runner.start_background(
+        agent_slug="slug",
+        task="t",
+        parent_conv_key="slack:dm:U123",
+        parent_transport="slack",
+    )
+    assert len(runner._background_jobs) == 1  # noqa: SLF001
+
+    # Short drain timeout so the test does not block; the job is still
+    # gated, so the drain falls through to the cancel branch.
+    await runner.drain_background_jobs(timeout=0.2)
+
+    assert runner._background_jobs == set()  # noqa: SLF001
+    # The cancelled job never reached its delivery callback.
+    assert delivered == []

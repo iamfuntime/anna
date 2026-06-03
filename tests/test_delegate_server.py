@@ -32,6 +32,7 @@ class _FakeRunner:
 
     def __post_init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
+        self.background_calls: list[dict[str, Any]] = []
 
     async def delegate(self, **kwargs: Any) -> DelegateResult:
         self.calls.append(kwargs)
@@ -39,6 +40,10 @@ class _FakeRunner:
             raise self.raise_error
         assert self.return_result is not None, "test forgot to set return_result"
         return self.return_result
+
+    def start_background(self, **kwargs: Any) -> str:
+        self.background_calls.append(kwargs)
+        return "job-deadbeef"
 
 
 def _make_config(tmp_path: Path, *, subagents_enabled: bool = True) -> AnnaConfig:
@@ -89,7 +94,7 @@ def _list_tools(server: dict[str, Any]) -> list[Any]:
     return list(result.root.tools)
 
 
-def test_delegate_tool_schema_has_all_four_fields(tmp_path: Path) -> None:
+def test_delegate_tool_schema_has_all_fields(tmp_path: Path) -> None:
     cfg = _make_config(tmp_path)
     runner = _FakeRunner()
     server = build_delegate_server(
@@ -107,11 +112,13 @@ def test_delegate_tool_schema_has_all_four_fields(tmp_path: Path) -> None:
         "task",
         "context_json",
         "timeout_seconds",
+        "background",
     }
     assert props["agent_slug"]["type"] == "string"
     assert props["task"]["type"] == "string"
     assert props["context_json"]["type"] == "string"
     assert props["timeout_seconds"]["type"] == "integer"
+    assert props["background"]["type"] == "boolean"
 
 
 # ---------------------------------------------------------------------------
@@ -122,9 +129,14 @@ def test_delegate_tool_schema_has_all_four_fields(tmp_path: Path) -> None:
 def _call_tool(server: dict[str, Any], arguments: dict[str, Any]) -> Any:
     instance = server["instance"]
     handler = instance.request_handlers[CallToolRequest]
+    # The MCP SDK marks every declared schema field required, so callers
+    # must always supply ``background``. Default it to False here so the
+    # existing sync-path tests stay terse; tests that exercise the
+    # background path pass it explicitly.
+    args = {"background": False, **arguments}
     request = CallToolRequest(
         method="tools/call",
-        params=CallToolRequestParams(name="delegate", arguments=arguments),
+        params=CallToolRequestParams(name="delegate", arguments=args),
     )
     return asyncio.run(handler(request))
 
@@ -333,6 +345,45 @@ def test_delegate_call_not_found_error_returns_text_response(tmp_path: Path) -> 
     body = _result_text(call_result)
     assert "delegation failed" in body
     assert "not_found" in body
+
+
+def test_delegate_background_returns_job_id_without_blocking(
+    tmp_path: Path,
+) -> None:
+    """background=True returns a job id immediately and never awaits delegate."""
+    cfg = _make_config(tmp_path)
+    runner = _FakeRunner(return_result=_ok_result(tmp_path))
+    server = build_delegate_server(
+        runner=runner,  # type: ignore[arg-type]
+        conv_key=CONV_KEY,
+        config=cfg,
+        conv_transport="telegram",
+    )
+    call_result = _call_tool(
+        server,
+        {
+            "agent_slug": "threat-researcher",
+            "task": "dig into CVE-2026-0001",
+            "context_json": '{"cve_id": "CVE-2026-0001"}',
+            "timeout_seconds": 90,
+            "background": True,
+        },
+    )
+    body = _result_text(call_result)
+    # The synchronous delegate path was NOT taken.
+    assert runner.calls == []
+    # start_background was invoked with the threaded kwargs.
+    assert len(runner.background_calls) == 1
+    bg = runner.background_calls[0]
+    assert bg["agent_slug"] == "threat-researcher"
+    assert bg["task"] == "dig into CVE-2026-0001"
+    assert bg["parent_conv_key"] == CONV_KEY
+    assert bg["parent_transport"] == "telegram"
+    assert bg["context"] == {"cve_id": "CVE-2026-0001"}
+    assert bg["timeout_seconds"] == 90
+    # The job id is surfaced to ANNA right away.
+    assert "job-deadbeef" in body
+    assert "Background delegation started" in body
 
 
 def test_delegate_call_empty_dict_context_json_normalizes_to_none(

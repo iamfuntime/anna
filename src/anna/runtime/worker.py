@@ -366,6 +366,7 @@ class ConversationWorker:
                 runner=self._subagent_runner,
                 conv_key=self.conversation_key,
                 config=self._config,
+                conv_transport=self.transport,
             )
             if delegate_server is not None:
                 mcp_servers["anna_delegate"] = delegate_server

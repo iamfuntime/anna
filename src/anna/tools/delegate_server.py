@@ -41,6 +41,15 @@ def _text_response(text: str) -> dict[str, Any]:
     return {"content": [{"type": "text", "text": text}]}
 
 
+def _trailer_yaml(trailer: dict[str, Any]) -> str:
+    dumped: str = yaml.safe_dump(
+        trailer,
+        default_flow_style=False,
+        sort_keys=False,
+    )
+    return dumped.rstrip()
+
+
 def _format_success(result: Any) -> str:
     """Render a DelegateResult as ``<body>\\n\\n---\\n<yaml trailer>``."""
     trailer = {
@@ -52,12 +61,60 @@ def _format_success(result: Any) -> str:
             "transcript": str(result.transcript_path),
         }
     }
-    yaml_block = yaml.safe_dump(
-        trailer,
-        default_flow_style=False,
-        sort_keys=False,
-    ).rstrip()
-    return f"{result.text}\n\n---\n{yaml_block}"
+    return f"{result.text}\n\n---\n{_trailer_yaml(trailer)}"
+
+
+def format_background_success(
+    *,
+    job_id: str,
+    agent_slug: str,
+    result: Any,
+) -> str:
+    """Render a finished background delegation for delivery as a new turn.
+
+    Same YAML trailer shape as :func:`_format_success` (so ANNA reads a
+    consistent surface whether the run was sync or async), with the
+    ``job_id`` and ``agent_slug`` folded into the trailer and a one-line
+    header naming the background job so ANNA can tell this inbound turn is
+    a delegation completion rather than an operator message.
+    """
+    trailer = {
+        "delegation": {
+            "job_id": job_id,
+            "agent_slug": agent_slug,
+            "duration_ms": result.duration_ms,
+            "status": result.status,
+            "cost_usd": result.cost_usd,
+            "tool_calls": list(result.tool_calls),
+            "transcript": str(result.transcript_path),
+        }
+    }
+    header = (
+        f"Background delegation {job_id} ({agent_slug}) finished. "
+        "Here is the sub-agent's reply:"
+    )
+    return f"{header}\n\n{result.text}\n\n---\n{_trailer_yaml(trailer)}"
+
+
+def format_background_failure(
+    *,
+    job_id: str,
+    agent_slug: str,
+    kind: str,
+    detail: str,
+) -> str:
+    """Render a failed background delegation for delivery as a new turn."""
+    trailer = {
+        "delegation": {
+            "job_id": job_id,
+            "agent_slug": agent_slug,
+            "status": kind,
+        }
+    }
+    header = (
+        f"Background delegation {job_id} ({agent_slug}) failed: {detail}"
+    )
+    return f"{header}\n\n---\n{_trailer_yaml(trailer)}"
 
 
 def build_delegate_server(
@@ -65,6 +122,7 @@ def build_delegate_server(
     runner: "SubAgentRunner",
     conv_key: str,
     config: AnnaConfig,
+    conv_transport: str = "slack",
 ) -> Any | None:
     """Construct the per-worker ``anna_delegate`` MCP server.
 
@@ -82,6 +140,11 @@ def build_delegate_server(
             cite the originating conversation.
         config: The active :class:`AnnaConfig`; consulted for the
             enabled flag.
+        conv_transport: The mounting worker's transport. Captured by the
+            closure and threaded into ``runner.start_background`` so a
+            background delegation's completion turn resolves the right
+            send adapter even if the originating worker has idled out by
+            the time the job finishes.
 
     Returns:
         An SDK MCP server, or ``None`` when sub-agents are disabled.
@@ -96,14 +159,20 @@ def build_delegate_server(
         "free-text instruction the sub-agent will work on. context_json "
         "is an optional JSON-encoded dict of structured context (pass "
         "the empty string when no context). timeout_seconds is the "
-        "wall-clock cap (0 to use the default). Returns the sub-agent's "
-        "reply with a YAML trailer citing transcript path, duration, "
-        "cost, and tool calls.",
+        "wall-clock cap (0 to use the default). Set background to true to "
+        "fire the sub-agent detached: the tool returns a job id "
+        "immediately without blocking, and when the sub-agent finishes "
+        "its reply is delivered back to you as a new message. Leave "
+        "background false (the default) to wait synchronously for the "
+        "reply. Returns the sub-agent's reply (sync) or a job id "
+        "(background), with a YAML trailer citing transcript path, "
+        "duration, cost, and tool calls.",
         {
             "agent_slug": str,
             "task": str,
             "context_json": str,
             "timeout_seconds": int,
+            "background": bool,
         },
     )
     async def _delegate(args: dict[str, Any]) -> dict[str, Any]:
@@ -111,6 +180,7 @@ def build_delegate_server(
         task = args["task"]
         raw_context = args.get("context_json") or ""
         raw_timeout = args.get("timeout_seconds")
+        background = bool(args.get("background") or False)
 
         # Parse the JSON context blob. Empty string → None (no context
         # section in the sub-agent's prompt). Invalid JSON → text error
@@ -140,6 +210,26 @@ def build_delegate_server(
         else:
             timeout_seconds = int(raw_timeout)
 
+        # Background path: fire the delegation detached and return a job id
+        # immediately. The runner schedules the run as a tracked task and
+        # delivers the completion back into this conversation as a new
+        # inbound turn when the sub-agent finishes. ANNA stays responsive
+        # in the meantime instead of blocking on the full sub-agent run.
+        if background:
+            job_id = runner.start_background(
+                agent_slug=agent_slug,
+                task=task,
+                parent_conv_key=conv_key,
+                parent_transport=conv_transport,
+                context=context,
+                timeout_seconds=timeout_seconds,
+            )
+            return _text_response(
+                f"Background delegation started for '{agent_slug}'. "
+                f"Job id: {job_id}. The sub-agent's reply will arrive as a "
+                "new message when it finishes; you do not need to wait."
+            )
+
         try:
             result = await runner.delegate(
                 agent_slug=agent_slug,
@@ -166,4 +256,6 @@ def build_delegate_server(
 __all__ = [
     "DELEGATE_TOOL_NAMES",
     "build_delegate_server",
+    "format_background_failure",
+    "format_background_success",
 ]
