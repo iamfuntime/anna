@@ -9,6 +9,7 @@ import yaml
 
 from anna.config import (
     AnnaConfig,
+    CheckpointConfig,
     IdentityAliasEntry,
     RuntimeVisibilityConfig,
     VoiceConfig,
@@ -518,3 +519,34 @@ def test_anna_config_identities_round_trips_through_model_dump() -> None:
     # Re-validating the dumped form produces an equivalent config.
     cfg2 = AnnaConfig.model_validate(dumped)
     assert cfg2.identities == cfg.identities
+
+
+def test_checkpoint_defaults_when_block_omitted() -> None:
+    """A config with no checkpoint: block uses CheckpointConfig defaults."""
+    cfg = AnnaConfig.model_validate({"auth": {"mode": "max"}})
+    assert cfg.checkpoint.periodic_enabled is True
+    assert cfg.checkpoint.every_turns == 6
+    assert cfg.checkpoint.every_minutes == 10
+    assert cfg.checkpoint.resume_from_transcript is True
+    assert cfg.checkpoint.tail_max_turns == 8
+    assert cfg.checkpoint.tail_max_tokens == 1500
+
+
+def test_checkpoint_parses_from_nested_block() -> None:
+    raw = {"checkpoint": {"every_turns": 3, "periodic_enabled": False}}
+    cfg = AnnaConfig.model_validate(raw)
+    assert cfg.checkpoint.every_turns == 3
+    assert cfg.checkpoint.periodic_enabled is False
+    # Unset fields fall back to defaults.
+    assert cfg.checkpoint.every_minutes == 10
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["every_turns", "every_minutes", "tail_max_turns", "tail_max_tokens"],
+)
+def test_checkpoint_rejects_non_positive_int(field: str) -> None:
+    with pytest.raises(ValueError):
+        CheckpointConfig(**{field: 0})
+    with pytest.raises(ValueError):
+        CheckpointConfig(**{field: -1})

@@ -24,7 +24,6 @@ import yaml
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-
 # ---------------------------------------------------------------------------
 # Sub-models
 # ---------------------------------------------------------------------------
@@ -249,6 +248,44 @@ class HousekeepingConfig(BaseModel):
 class SessionsConfig(BaseModel):
     dm_gap_hours: float = 8.0
     thread_gap_hours: float = 1.0
+
+
+class CheckpointConfig(BaseModel):
+    """Conversation checkpointing and transcript-tail resume.
+
+    Two coordinated behaviours:
+
+    * ``resume_from_transcript`` folds a bounded RAW tail of the JSONL
+      transcript into the resume block when that tail is newer than the
+      latest checkpoint — covering the gap left by a hard crash or kill
+      that never ran graceful closeout. ``tail_max_turns`` /
+      ``tail_max_tokens`` bound the injected excerpt.
+    * ``periodic_enabled`` writes a lightweight checkpoint every
+      ``every_turns`` turns or ``every_minutes`` minutes during an active
+      conversation, between turns, decoupled from eviction.
+
+    No hot-reload: edits take effect on the next ``systemctl --user
+    restart anna``.
+    """
+
+    periodic_enabled: bool = True
+    every_turns: int = 6
+    every_minutes: int = 10
+    resume_from_transcript: bool = True
+    tail_max_turns: int = 8
+    tail_max_tokens: int = 1500
+
+    @field_validator(
+        "every_turns",
+        "every_minutes",
+        "tail_max_turns",
+        "tail_max_tokens",
+    )
+    @classmethod
+    def _positive(cls, v: int, info: Any) -> int:
+        if v <= 0:
+            raise ValueError(f"checkpoint.{info.field_name} must be a positive integer")
+        return v
 
 
 class AdminConfig(BaseModel):
@@ -759,6 +796,7 @@ class AnnaConfig(BaseModel):
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     housekeeping: HousekeepingConfig = Field(default_factory=HousekeepingConfig)
     sessions: SessionsConfig = Field(default_factory=SessionsConfig)
+    checkpoint: CheckpointConfig = Field(default_factory=CheckpointConfig)
     admin: AdminConfig = Field(default_factory=AdminConfig)
     scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
     google: GoogleConfig = Field(default_factory=GoogleConfig)
