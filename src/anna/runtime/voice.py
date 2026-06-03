@@ -417,6 +417,16 @@ class VoiceProcessor:
         ttl = self._config.voice.outbound.recent_voice_window_seconds
         self._recent_voice_inbounds[conv_key] = time.monotonic() + ttl
 
+    def clear_voice_inbound(self, *, conv_key: str) -> None:
+        """Drop any voice-inbound mark for this conv_key.
+
+        Called by an adapter when a non-voice (text) inbound arrives so the
+        outbound path stops treating the conversation as voice. Keeps the
+        'most-recent inbound was voice' invariant literal rather than a
+        rolling TTL window.
+        """
+        self._recent_voice_inbounds.pop(conv_key, None)
+
     def _recent_voice_active(self, conv_key: str) -> bool:
         """True when this conv_key has an unexpired voice-inbound mark."""
         expiry = self._recent_voice_inbounds.get(conv_key)

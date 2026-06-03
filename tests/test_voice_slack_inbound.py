@@ -44,6 +44,7 @@ class _FakeVoice:
         self._transcript = transcript
         self.transcribe_calls: list[dict[str, Any]] = []
         self.mark_calls: list[str] = []
+        self.clear_calls: list[str] = []
 
     async def transcribe_inbound(self, **kwargs: Any) -> str:
         self.transcribe_calls.append(kwargs)
@@ -54,6 +55,9 @@ class _FakeVoice:
 
     def mark_voice_inbound(self, *, conv_key: str) -> None:
         self.mark_calls.append(conv_key)
+
+    def clear_voice_inbound(self, *, conv_key: str) -> None:
+        self.clear_calls.append(conv_key)
 
 
 def _make_adapter(
@@ -174,6 +178,8 @@ async def test_non_audio_file_is_ignored(
     assert inbound.text == "here is a screenshot"
     assert voice.transcribe_calls == []
     assert voice.mark_calls == []
+    # A non-voice (text) inbound clears any prior voice mark for this conv_key.
+    assert voice.clear_calls == [inbound.conversation_key]
 
 
 async def test_voice_none_passes_through_unchanged(tmp_path: Path) -> None:

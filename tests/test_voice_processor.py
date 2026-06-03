@@ -328,6 +328,40 @@ def test_mark_voice_inbound_caches_and_expires(tmp_path: Path) -> None:
     assert proc._recent_voice_active("slack:dm:U1") is False
 
 
+def test_clear_voice_inbound_drops_active_mark(tmp_path: Path) -> None:
+    cfg = AnnaConfig.model_validate(
+        {"voice": {"outbound": {"recent_voice_window_seconds": 600}}}
+    ).model_copy(update={"anna_home": tmp_path})
+    proc = VoiceProcessor(config=cfg, inbound_provider=None, outbound_provider=None)
+
+    proc.mark_voice_inbound(conv_key="telegram:dm:42")
+    assert proc._recent_voice_active("telegram:dm:42") is True
+
+    proc.clear_voice_inbound(conv_key="telegram:dm:42")
+    assert proc._recent_voice_active("telegram:dm:42") is False
+
+    # Clearing an unknown conv_key is a harmless no-op.
+    proc.clear_voice_inbound(conv_key="slack:dm:never-marked")
+
+
+async def test_synthesize_outbound_none_after_clear(tmp_path: Path) -> None:
+    provider = _MockTTSProvider(b"unused")
+    proc = VoiceProcessor(
+        config=_outbound_config(tmp_path),
+        inbound_provider=None,
+        outbound_provider=provider,
+    )
+    proc.mark_voice_inbound(conv_key="telegram:dm:42")
+    proc.clear_voice_inbound(conv_key="telegram:dm:42")
+
+    result = await proc.maybe_synthesize_outbound(
+        text="hello", conv_key="telegram:dm:42", transport="telegram"
+    )
+
+    assert result is None
+    assert provider.calls == []
+
+
 # ---------------------------------------------------------------------------
 # Subtask 7: maybe_synthesize_outbound
 # ---------------------------------------------------------------------------

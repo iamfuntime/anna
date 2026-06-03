@@ -328,6 +328,11 @@ class TelegramAdapter(ChannelAdapter):
                 message_id=str(message.message_id),
                 raw=raw,
             )
+        elif self._voice is not None:
+            # Text (non-voice) inbound: clear any prior voice-inbound mark so
+            # the outbound path treats the literal most-recent inbound as
+            # text, not a rolling 10-minute voice window.
+            self._voice.clear_voice_inbound(conv_key=conv_key)
 
         return InboundEvent(
             transport="telegram",
