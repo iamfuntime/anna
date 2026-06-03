@@ -67,6 +67,13 @@ class WizardState:
     telegram_admin_chat_id: str = ""
     auth_mode: str = "max"
     anthropic_api_key: str = ""
+    # Phase 2.5 voice messages. Optional, skippable. One key covers both
+    # inbound Whisper STT and outbound tts-1 TTS (the voice: block in
+    # anna.yaml defaults both api_key_env to OPENAI_API_KEY). A
+    # wizard-owned .env key: written on fresh install, updated IN PLACE via
+    # dotenv.set_key on reconfigure so it is never dropped and an existing
+    # value pre-fills the prompt default. Empty = operator skipped it.
+    openai_api_key: str = ""
     operator_short_name: str = ""
     addressed_as_examples: list[str] = field(default_factory=list)
     operator_context: str = ""
@@ -377,6 +384,54 @@ def step_auth_path(state: WizardState) -> None:
         _emit_step(state, step="auth.api_key", answer=key, is_secret=True)
     else:
         _check_claude_login()
+
+    _prompt_openai_key(state)
+
+
+def _prompt_openai_key(state: WizardState) -> None:
+    """Optional, skippable prompt for the OpenAI API key (voice messages).
+
+    Phase 2.5 voice uses OpenAI for both inbound speech-to-text (Whisper)
+    and outbound text-to-speech (tts-1); a single ``OPENAI_API_KEY`` covers
+    both. The key is entirely optional — leaving it blank just means voice
+    notes won't transcribe and TTS replies won't synthesize until the
+    operator adds the key later (here on a ``--reconfigure``, by hand in
+    ``.env``, or via the web dashboard).
+
+    On ``--reconfigure`` the existing value (loaded into
+    ``state.openai_api_key`` by ``_preload_existing_into_state``) is shown
+    as a masked default so an Enter-through preserves it rather than wiping
+    it. The key is then persisted as a wizard-owned ``.env`` variable —
+    written wholesale on a fresh install, updated IN PLACE on reconfigure
+    (see ``_env_pairs`` / ``_write_env_file``) so it is never dropped.
+    """
+    click.echo(
+        "\nVoice messages (optional). ANNA can transcribe inbound Slack/\n"
+        "Telegram voice notes (OpenAI Whisper) and speak replies back\n"
+        "(OpenAI tts-1). Both use a single OpenAI API key. Leave blank to\n"
+        "skip — you can add OPENAI_API_KEY to .env later and restart.\n"
+        "Get one at https://platform.openai.com/api-keys."
+    )
+    existing = state.openai_api_key
+    # On reconfigure, show a masked default so Enter preserves the live key
+    # instead of blanking it. On a fresh install there is nothing to show.
+    if existing:
+        prompt_label = "OpenAI API key (Enter keeps the existing key)"
+        default = existing
+        show_default = False
+    else:
+        prompt_label = "OpenAI API key (Enter to skip)"
+        default = ""
+        show_default = False
+    key = click.prompt(
+        prompt_label,
+        hide_input=True,
+        default=default,
+        show_default=show_default,
+    )
+    state.openai_api_key = key
+    if key:
+        _emit_step(state, step="voice.openai_api_key", answer=key, is_secret=True)
 
 
 def _check_claude_login() -> None:
@@ -704,6 +759,15 @@ def _env_pairs(state: WizardState) -> list[tuple[str, str]]:
     if state.use_telegram:
         pairs.append(("TELEGRAM_BOT_TOKEN", state.telegram_bot_token))
         pairs.append(("ANNA_TELEGRAM_ALLOWED_USERS", state.telegram_admin_chat_id))
+    # Phase 2.5 voice. Optional and wizard-owned: include it only when the
+    # operator supplied a value, so skipping the prompt neither writes an
+    # empty OPENAI_API_KEY on a fresh install nor blanks an existing key on
+    # reconfigure (a blank pair would set_key it to "" and drop the live
+    # value). When present it is updated IN PLACE on reconfigure via the
+    # same set_key loop as every other wizard-owned key, so it is never
+    # dropped and never wholesale-overwritten alongside operator-added vars.
+    if state.openai_api_key:
+        pairs.append(("OPENAI_API_KEY", state.openai_api_key))
     return pairs
 
 
@@ -1429,6 +1493,11 @@ def _preload_existing_into_state(state: WizardState) -> None:
         allowed = env.get("ANNA_TELEGRAM_ALLOWED_USERS")
         if allowed:
             state.telegram_admin_chat_id = allowed
+        # Pre-fill the optional voice key so its prompt defaults to the live
+        # value and an Enter-through preserves it (never blanks it).
+        openai_key = env.get("OPENAI_API_KEY")
+        if openai_key:
+            state.openai_api_key = openai_key
 
     # Snapshot the loaded values keyed by the step strings the step_* functions
     # emit, so _emit_step records honest step_changed/step_completed diffs.

@@ -73,6 +73,7 @@ def _telegram_inputs(short_name: str = "Tester", detail: str = "") -> str:
             "tok-SEKRET",  # ...confirm
             "999000",      # numeric user id
             "",            # Auth mode -> default max
+            "",            # OpenAI API key (voice) -> Enter to skip
             short_name,    # persona: address as
             "",            # greeting examples
             "",            # what do you do
@@ -281,6 +282,7 @@ _EXISTING_ENV = (
     "SLACK_APP_TOKEN=xapp-old\n"
     "TELEGRAM_BOT_TOKEN=tg-old\n"
     "ANNA_TELEGRAM_ALLOWED_USERS=5550000\n"
+    "OPENAI_API_KEY=sk-openai-live\n"
     "BRAVE_SEARCH_API_KEY=brave-operator-added-key\n"
 )
 
@@ -401,6 +403,7 @@ def test_broader_reconfigure_loads_existing_values_as_defaults(patched):
             "xapp-new",    # confirm
             "C0SENTINEL",  # slack admin channel
             "max",         # auth mode (switch to max)
+            "",            # OpenAI API key (voice) -> Enter keeps existing
             "Op",          # persona name
             "", "", "", "", "", "", "",  # remaining persona prompts
             "",            # disable web? -> default no
@@ -495,6 +498,7 @@ def test_broader_reconfigure_preserves_cli_and_untouched_sections(patched):
             "xapp-new",    # confirm
             "C0SENTINEL",  # slack admin channel
             "max",         # auth mode
+            "",            # OpenAI API key (voice) -> Enter keeps existing
             "Op",          # persona name
             "", "", "", "", "", "", "",  # remaining persona prompts
             "",            # disable web? -> default no
@@ -571,3 +575,151 @@ def test_reconfigure_invalid_existing_yaml_clear_error(patched):
     assert "failed validation" in result.output
     # No Python traceback leaked.
     assert "Traceback (most recent call last)" not in result.output
+
+
+# ---------------------------------------------------------------------------
+# Phase 2.5 voice: optional OpenAI API key is a wizard-owned .env var.
+#
+# The 8200539 reconfigure-safe contract extends to this key: on reconfigure
+# it must be updated IN PLACE via dotenv.set_key (never wholesale-overwritten),
+# so an Enter-through preserves the live value and no operator-added key
+# (BRAVE_SEARCH_API_KEY) is dropped. These mirror the 8200539 reconfigure
+# preservation tests above.
+# ---------------------------------------------------------------------------
+
+
+def test_reconfigure_preserves_openai_key_in_place(patched):
+    """A bare --reconfigure with an Enter-through on the OpenAI prompt keeps
+    the live OPENAI_API_KEY untouched and drops no other .env key."""
+    home = patched / "anna"
+    vault = patched / "customvault"
+    _seed_existing_install(home, vault=vault)
+
+    stdin = "\n".join(
+        [
+            "",            # vault root -> default
+            "y",           # Enable Telegram?
+            "y",           # Enable Slack?
+            "n",           # detailed telegram steps
+            "tg-new",      # telegram bot token
+            "tg-new",      # confirm
+            "5550000",     # numeric id
+            "n",           # detailed slack steps
+            "xoxb-new",    # slack bot token
+            "xoxb-new",    # confirm
+            "xapp-new",    # slack app token
+            "xapp-new",    # confirm
+            "C0SENTINEL",  # slack admin channel
+            "max",         # auth mode
+            "",            # OpenAI API key -> Enter keeps the existing key
+            "Op",          # persona name
+            "", "", "", "", "", "", "",  # remaining persona prompts
+            "",            # disable web? -> default no
+            "",            # write + start?
+        ]
+    ) + "\n"
+
+    runner = CliRunner()
+    result = runner.invoke(
+        wizard.main,
+        ["--anna-home", str(home), "--reconfigure"],
+        input=stdin,
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0, result.output
+
+    env_after = (home / ".env").read_text()
+    # The voice key is preserved in place (Enter-through used the live value
+    # as the prompt default), and no operator-added key was dropped.
+    assert "OPENAI_API_KEY=sk-openai-live" in env_after
+    assert "BRAVE_SEARCH_API_KEY=brave-operator-added-key" in env_after
+    # Exactly one OPENAI_API_KEY line — updated in place, not duplicated.
+    assert env_after.count("OPENAI_API_KEY=") == 1
+    # Wizard-owned key the operator did change is updated too.
+    assert "TELEGRAM_BOT_TOKEN=tg-new" in env_after
+    # Raw key never leaked to the console.
+    assert "sk-openai-live" not in result.output
+
+
+def test_reconfigure_updates_openai_key_when_changed(patched):
+    """Supplying a new value at the OpenAI prompt updates the key in place
+    (single line, not duplicated) while preserving operator-added keys."""
+    home = patched / "anna"
+    vault = patched / "customvault"
+    _seed_existing_install(home, vault=vault)
+
+    stdin = "\n".join(
+        [
+            "",            # vault root -> default
+            "y",           # Enable Telegram?
+            "y",           # Enable Slack?
+            "n",           # detailed telegram steps
+            "tg-new",      # telegram bot token
+            "tg-new",      # confirm
+            "5550000",     # numeric id
+            "n",           # detailed slack steps
+            "xoxb-new",    # slack bot token
+            "xoxb-new",    # confirm
+            "xapp-new",    # slack app token
+            "xapp-new",    # confirm
+            "C0SENTINEL",  # slack admin channel
+            "max",         # auth mode
+            "sk-openai-rotated",  # OpenAI API key -> new value
+            "Op",          # persona name
+            "", "", "", "", "", "", "",  # remaining persona prompts
+            "",            # disable web? -> default no
+            "",            # write + start?
+        ]
+    ) + "\n"
+
+    runner = CliRunner()
+    result = runner.invoke(
+        wizard.main,
+        ["--anna-home", str(home), "--reconfigure"],
+        input=stdin,
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0, result.output
+
+    env_after = (home / ".env").read_text()
+    assert "OPENAI_API_KEY=sk-openai-rotated" in env_after
+    assert env_after.count("OPENAI_API_KEY=") == 1  # in place, not appended
+    assert "sk-openai-live" not in env_after  # old value gone
+    assert "BRAVE_SEARCH_API_KEY=brave-operator-added-key" in env_after
+
+
+def test_fresh_install_skips_openai_key_when_blank(patched):
+    """Skipping the optional OpenAI prompt on a fresh install writes no
+    OPENAI_API_KEY line at all (the voice: defaults still apply)."""
+    result, home = _run_wizard(patched, [], _telegram_inputs())
+    assert result.exit_code == 0, result.output
+    env_text = (home / ".env").read_text()
+    assert "OPENAI_API_KEY" not in env_text
+
+
+def test_fresh_install_writes_openai_key_when_supplied(patched):
+    """Supplying the OpenAI key on a fresh install writes it as a normal
+    wizard-owned .env var."""
+    stdin = "\n".join(
+        [
+            "",            # vault root -> default
+            "",            # Enable Telegram? -> default yes
+            "",            # Enable Slack? -> default no
+            "",            # detailed telegram steps
+            "tok-SEKRET",  # telegram bot token
+            "tok-SEKRET",  # confirm
+            "999000",      # numeric id
+            "",            # auth mode -> default max
+            "sk-openai-fresh",  # OpenAI API key
+            "Tester",      # persona name
+            "", "", "", "", "", "", "",  # remaining persona prompts
+            "",            # disable web?
+            "",            # write + start?
+        ]
+    ) + "\n"
+    result, home = _run_wizard(patched, [], stdin)
+    assert result.exit_code == 0, result.output
+    env_text = (home / ".env").read_text()
+    assert "OPENAI_API_KEY=sk-openai-fresh" in env_text
+    # Secret never leaked to the console.
+    assert "sk-openai-fresh" not in result.output
