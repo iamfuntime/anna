@@ -59,10 +59,17 @@ class _StubSlackClient:
     def __init__(self) -> None:
         self.post_calls: list[dict[str, Any]] = []
         self.upload_calls: list[dict[str, Any]] = []
+        self.open_calls: list[dict[str, Any]] = []
 
     async def chat_postMessage(self, **kwargs: Any) -> dict[str, Any]:
         self.post_calls.append(kwargs)
         return {"ok": True, "ts": "1716832700.000700"}
+
+    async def conversations_open(self, **kwargs: Any) -> dict[str, Any]:
+        # Slack resolves a user ID to its IM (DM) channel ID, which always
+        # starts with ``D``. The voice-upload path needs this real channel ID.
+        self.open_calls.append(kwargs)
+        return {"ok": True, "channel": {"id": "D0RESOLVED1"}}
 
     async def files_upload_v2(self, **kwargs: Any) -> dict[str, Any]:
         self.upload_calls.append(kwargs)
@@ -140,8 +147,49 @@ async def test_slack_posts_text_and_audio_when_synth_returns_bytes(
     up = client.upload_calls[0]
     assert up["content"] == b"OggS-bytes"
     assert up["filename"] == "voice.ogg"
-    assert up["channel"] == "U1"
+    # DM conv_keys carry a user ID; the upload API needs the resolved IM
+    # channel ID (``D...``), not the user ID (``U...``).
+    assert up["channel"] == "D0RESOLVED1"
+    assert client.open_calls == [{"users": "U1"}]
     assert voice.synth_calls[0]["transport"] == "slack"
+
+
+async def test_slack_voice_upload_resolves_user_id_to_dm_channel(
+    tmp_path: Path,
+) -> None:
+    """A ``slack:dm:`` key resolves the user ID to the IM channel before
+    uploading audio. Regression: the upload API rejects user IDs (``U``/``W``)
+    with ``channel_id must match ^[CGDZ][A-Z0-9]{8,}$``."""
+    voice = _FakeVoice((b"OggS-bytes", "audio/ogg", ".ogg"))
+    adapter, client = _slack_adapter(tmp_path, voice=voice)
+
+    await adapter.send(
+        OutboundMessage(conversation_key="slack:dm:USP2QLB41", text="spoken")
+    )
+
+    # Text post still uses the user ID (chat.postMessage accepts it).
+    assert client.post_calls[0]["channel"] == "USP2QLB41"
+    # Upload resolved it to the DM channel ID.
+    assert client.open_calls == [{"users": "USP2QLB41"}]
+    assert client.upload_calls[0]["channel"] == "D0RESOLVED1"
+
+
+async def test_slack_voice_upload_skips_resolve_for_channel_id(
+    tmp_path: Path,
+) -> None:
+    """A channel/thread conv_key already carries a real channel ID, so no
+    ``conversations.open`` call is needed."""
+    voice = _FakeVoice((b"OggS-bytes", "audio/ogg", ".ogg"))
+    adapter, client = _slack_adapter(tmp_path, voice=voice)
+
+    await adapter.send(
+        OutboundMessage(
+            conversation_key="slack:ch:C0CHANNEL1:1716832700.000700", text="hi"
+        )
+    )
+
+    assert client.open_calls == []
+    assert client.upload_calls[0]["channel"] == "C0CHANNEL1"
 
 
 async def test_slack_text_only_when_synth_returns_none(tmp_path: Path) -> None:

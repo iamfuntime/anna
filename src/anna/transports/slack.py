@@ -197,8 +197,28 @@ class SlackAdapter(ChannelAdapter):
             return
         audio_bytes, _mime_type, extension = synth
 
+        # ``chat.postMessage`` accepts a bare user ID as ``channel`` and opens
+        # the DM implicitly, so :meth:`_channel_and_thread_for` returns the
+        # user ID for ``slack:dm:`` keys. The file-upload API is stricter: its
+        # ``channel_id`` must be a real conversation ID matching
+        # ``^[CGDZ][A-Z0-9]{8,}$`` and rejects user IDs (``U``/``W``). Resolve
+        # the user ID to the IM channel ID before uploading.
+        upload_channel = channel
+        if channel[:1] in ("U", "W"):
+            try:
+                opened = await self._client.conversations_open(users=channel)
+                upload_channel = opened["channel"]["id"]
+            except Exception as exc:
+                self._log.warning(
+                    "voice.outbound.dm_resolve_failed",
+                    channel="slack",
+                    conv_key=message.conversation_key,
+                    error=str(exc),
+                )
+                return
+
         upload_kwargs: dict[str, Any] = {
-            "channel": channel,
+            "channel": upload_channel,
             "content": audio_bytes,
             "filename": f"voice{extension}",
         }
