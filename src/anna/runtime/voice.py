@@ -110,9 +110,28 @@ class TTSProvider(Protocol):
         *,
         text: str,
         voice_id: str | None = None,
+        fmt: str = "opus",
     ) -> bytes:
-        """Return the synthesized audio as bytes. Raises TTSError on failure."""
+        """Return the synthesized audio as bytes. Raises TTSError on failure.
+
+        ``fmt`` selects the output container (``"opus"`` for Opus-in-OGG,
+        ``"mp3"`` for MPEG audio). See :data:`_TTS_FORMAT_SPECS`.
+        """
         ...
+
+
+# ---------------------------------------------------------------------------
+# Output-format specs
+# ---------------------------------------------------------------------------
+
+# Maps a logical format name to (OpenAI ``response_format``, mime, extension).
+# ``opus`` is Opus-in-OGG (Telegram send_voice wants this; Slack shows it as a
+# plain file). ``mp3`` is MPEG audio, which Slack renders with an inline audio
+# player.
+_TTS_FORMAT_SPECS: dict[str, tuple[str, str, str]] = {
+    "opus": ("opus", "audio/ogg", ".ogg"),
+    "mp3": ("mp3", "audio/mpeg", ".mp3"),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -314,15 +333,17 @@ class OpenAITTSProvider:
         *,
         text: str,
         voice_id: str | None = None,
+        fmt: str = "opus",
     ) -> bytes:
         client = await self._get_client()
+        response_format = _TTS_FORMAT_SPECS.get(fmt, _TTS_FORMAT_SPECS["opus"])[0]
         payload: dict[str, str] = {
             "model": self._model,
             "voice": voice_id or "alloy",
             "input": text,
-            # Opus-in-OGG: Telegram send_voice wants OGG/Opus; Slack uploads
-            # the same bytes as an .ogg attachment.
-            "response_format": "opus",
+            # Per-transport container: Telegram send_voice wants Opus-in-OGG;
+            # Slack renders an .mp3 upload with an inline audio player.
+            "response_format": response_format,
         }
         try:
             resp = await client.post(
@@ -678,12 +699,17 @@ class VoiceProcessor:
             return None
 
         provider = self._outbound
+        fmt = cfg.formats.get(transport, "opus")
+        response_format, mime_type, extension = _TTS_FORMAT_SPECS.get(
+            fmt, _TTS_FORMAT_SPECS["opus"]
+        )
         started = time.monotonic()
         try:
             audio = await asyncio.wait_for(
                 provider.synthesize(
                     text=text,
                     voice_id=cfg.voice_id,
+                    fmt=fmt,
                 ),
                 timeout=cfg.timeout_seconds,
             )
@@ -712,8 +738,9 @@ class VoiceProcessor:
             text_chars=len(text),
             audio_bytes=len(audio),
             transport=transport,
+            fmt=fmt,
         )
-        return (audio, provider.output_mime_type, provider.output_extension)
+        return (audio, mime_type, extension)
 
 
 # ---------------------------------------------------------------------------

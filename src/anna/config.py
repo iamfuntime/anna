@@ -652,6 +652,12 @@ class VoiceOutboundConfig(BaseModel):
     recent_voice_window_seconds: int = 600
     max_synthesis_chars: int = 4000
     timeout_seconds: int = 30
+    # Per-transport output container. Slack renders an .mp3 upload with an
+    # inline audio player; Telegram's send_voice wants Opus-in-OGG. Any
+    # transport missing here falls back to opus.
+    formats: dict[str, Literal["opus", "mp3"]] = Field(
+        default_factory=lambda: {"slack": "mp3", "telegram": "opus"}
+    )
 
     @field_validator("recent_voice_window_seconds")
     @classmethod

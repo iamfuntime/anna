@@ -382,8 +382,10 @@ class _MockTTSProvider:
         self._result = result
         self.calls: list[dict[str, object]] = []
 
-    async def synthesize(self, *, text: str, voice_id: str | None = None) -> bytes:
-        self.calls.append({"text": text, "voice_id": voice_id})
+    async def synthesize(
+        self, *, text: str, voice_id: str | None = None, fmt: str = "opus"
+    ) -> bytes:
+        self.calls.append({"text": text, "voice_id": voice_id, "fmt": fmt})
         if isinstance(self._result, Exception):
             raise self._result
         assert isinstance(self._result, bytes)
@@ -416,7 +418,9 @@ async def test_synthesize_outbound_happy_path(tmp_path: Path) -> None:
     assert audio == b"OggS-audio-bytes"
     assert mime == "audio/ogg"
     assert ext == ".ogg"
-    assert provider.calls == [{"text": "here is your reply", "voice_id": "alloy"}]
+    assert provider.calls == [
+        {"text": "here is your reply", "voice_id": "alloy", "fmt": "opus"}
+    ]
     events = _read_audit_events(tmp_path)
     outbound = [e for e in events if e["event"] == "audit.voice.outbound"]
     assert len(outbound) == 1
@@ -425,6 +429,35 @@ async def test_synthesize_outbound_happy_path(tmp_path: Path) -> None:
     assert outbound[0]["text_chars"] == len("here is your reply")
     assert outbound[0]["audio_bytes"] == len(b"OggS-audio-bytes")
     assert outbound[0]["transport"] == "telegram"
+
+
+async def test_synthesize_outbound_slack_gets_inline_mp3(tmp_path: Path) -> None:
+    # Slack renders an .mp3 upload with an inline audio player, so the
+    # default per-transport format maps slack -> mp3 while telegram stays
+    # opus/ogg. The returned mime/extension follow the chosen format, not
+    # the provider's nominal output_mime_type/output_extension.
+    provider = _MockTTSProvider(b"ID3-mp3-bytes")
+    proc = VoiceProcessor(
+        config=_outbound_config(tmp_path, transports=["slack", "telegram"]),
+        inbound_provider=None,
+        outbound_provider=provider,
+    )
+    proc.mark_voice_inbound(conv_key="slack:dm:U1")
+
+    result = await proc.maybe_synthesize_outbound(
+        text="hello", conv_key="slack:dm:U1", transport="slack"
+    )
+
+    assert result is not None
+    audio, mime, ext = result
+    assert audio == b"ID3-mp3-bytes"
+    assert mime == "audio/mpeg"
+    assert ext == ".mp3"
+    assert provider.calls == [{"text": "hello", "voice_id": "alloy", "fmt": "mp3"}]
+    events = _read_audit_events(tmp_path)
+    outbound = [e for e in events if e["event"] == "audit.voice.outbound"]
+    assert outbound[0]["fmt"] == "mp3"
+    assert outbound[0]["transport"] == "slack"
 
 
 async def test_synthesize_outbound_disabled_returns_none(tmp_path: Path) -> None:
