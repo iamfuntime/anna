@@ -18,19 +18,30 @@ def write_checkpoint(
     conversation_key: str,
     summary: str,
     operator_short_name: str | None = None,
+    kind: str = "closeout",
 ) -> Path:
     """Write a markdown checkpoint and return its path.
 
     Layout, matching the v3 vault sketch:
 
-    ``Conversations/<transport>-<dm-or-ch>-<id>/<YYYY-MM-DD-HHMM>.md``
+    ``Conversations/<transport>-<dm-or-ch>-<id>/<YYYY-MM-DD-HHMMSS>.md``
+
+    The stamp is second-granular so that two writes in the same minute
+    (e.g. a periodic checkpoint followed by a closeout) produce distinct
+    files instead of colliding. The fixed-width zero-padded ``%H%M%S``
+    keeps the lexicographic ordering used by ``list_recent_checkpoints``
+    correct (later wall-clock time sorts after earlier).
+
+    ``kind`` is recorded in the frontmatter as ``checkpoint_kind`` and
+    defaults to ``"closeout"`` for backward compatibility; periodic
+    checkpoints pass ``"periodic"``.
     """
     safe_key = conversation_key.replace(":", "-").replace("/", "_")
     base_dir = vault_root / "Conversations" / safe_key
     base_dir.mkdir(parents=True, exist_ok=True)
 
     now = datetime.now(timezone.utc)
-    stamp = now.strftime("%Y-%m-%d-%H%M")
+    stamp = now.strftime("%Y-%m-%d-%H%M%S")
     path = base_dir / f"{stamp}.md"
 
     frontmatter = (
@@ -41,6 +52,7 @@ def write_checkpoint(
         f"  - type/checkpoint\n"
         f"transport: {transport}\n"
         f"conversation_key: {conversation_key}\n"
+        f"checkpoint_kind: {kind}\n"
         f"---\n\n"
     )
     body = f"# Checkpoint\n\n{summary}\n"
