@@ -266,8 +266,14 @@ class SlackAdapter(ChannelAdapter):
         channel messages still require an ``app_mention``, which fires
         the ``_on_mention`` handler above.
         """
-        # Ignore bot echoes and message-edit subtypes.
-        if event.get("bot_id") or event.get("subtype"):
+        # Ignore bot echoes and message-edit/delete subtypes. ``file_share``
+        # is the exception: Slack delivers voice notes (and other file
+        # attachments) as a ``message`` event with ``subtype == "file_share"``,
+        # so it must pass through to the voice-detection path in
+        # ``_to_inbound_event``. Dropping it here is what silently swallowed
+        # inbound voice notes.
+        subtype = event.get("subtype")
+        if event.get("bot_id") or (subtype and subtype != "file_share"):
             return
 
         channel_type = event.get("channel_type", "")

@@ -216,3 +216,52 @@ async def test_mark_voice_inbound_called_on_success(
     # The audio path + mime are stashed on raw for the outbound TTS path.
     assert inbound.raw.get("voice_mime_type") == "audio/webm"
     assert "voice_audio_path" in inbound.raw
+
+
+async def test_file_share_subtype_reaches_voice_detection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: a Slack voice note arrives as a ``message`` event with
+    ``subtype == "file_share"``. The ``_handle_message_event`` filter must
+    NOT drop it on the subtype guard — otherwise it never reaches voice
+    detection and the operator's voice note is silently swallowed (the live
+    bug behind file F0B8UC8KP96)."""
+    _patch_download(monkeypatch)
+    voice = _FakeVoice("transcribed via the real filter path")
+    adapter = _make_adapter(tmp_path, voice=voice)
+
+    captured: list[Any] = []
+
+    async def _handler(inbound: Any) -> None:
+        captured.append(inbound)
+
+    adapter.subscribe(_handler)
+
+    event = _voice_event()
+    event["subtype"] = "file_share"
+    await adapter._handle_message_event(event, body={})
+
+    assert len(captured) == 1
+    assert captured[0].text == "[voice transcript]: transcribed via the real filter path"
+    assert voice.mark_calls == [captured[0].conversation_key]
+
+
+async def test_message_changed_subtype_still_dropped(tmp_path: Path) -> None:
+    """The guard must still drop edit/delete echoes — only ``file_share``
+    is whitelisted."""
+    voice = _FakeVoice("should never run")
+    adapter = _make_adapter(tmp_path, voice=voice)
+
+    captured: list[Any] = []
+
+    async def _handler(inbound: Any) -> None:
+        captured.append(inbound)
+
+    adapter.subscribe(_handler)
+
+    event = _voice_event()
+    event["subtype"] = "message_changed"
+    await adapter._handle_message_event(event, body={})
+
+    assert captured == []
+    assert voice.transcribe_calls == []
