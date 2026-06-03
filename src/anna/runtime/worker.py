@@ -129,6 +129,16 @@ class ConversationWorker:
         self.last_active: datetime = now
         self.last_event_received_at: datetime | None = None
         self.last_event_processed_at: datetime | None = None
+
+        # Periodic-checkpoint state (Fix 2). ``_created_at`` is the
+        # wall-clock baseline used by the minutes trigger until the first
+        # checkpoint is written. ``_turns_since_checkpoint`` and ``_dirty``
+        # are advanced after each SUCCESSFUL turn in ``_run``; all three
+        # reset on any checkpoint write (periodic or closeout).
+        self._created_at: datetime = now
+        self._turns_since_checkpoint: int = 0
+        self._last_checkpoint_at: datetime | None = None
+        self._dirty: bool = False
         self.is_dm: bool = conversation_key.split(":")[1].startswith("dm") if ":" in conversation_key else False
 
     # ------------------------------------------------------------------
@@ -250,6 +260,18 @@ class ConversationWorker:
                 finally:
                     self.last_event_processed_at = datetime.now(timezone.utc)
                     self.last_active = self.last_event_processed_at
+                    # NOTE: the periodic-checkpoint bookkeeping
+                    # (``_turns_since_checkpoint`` / ``_dirty``) is advanced
+                    # inside ``_handle`` immediately after the SDK query is
+                    # accepted — NOT here. That scopes it to turns that
+                    # actually ran the query path: the ``_client is None``
+                    # early return in ``_handle`` is a no-op that must not
+                    # arm the periodic checkpoint. ``_handle`` swallows SDK
+                    # receive/query errors internally (it still marked the
+                    # turn dirty once the query was accepted), so those
+                    # genuine turns are counted; only an exception that
+                    # escapes ``_handle`` skips the bookkeeping, and that
+                    # propagates and crashes the run loop anyway.
                     self._queue.task_done()
         except asyncio.CancelledError:
             raise
@@ -645,36 +667,11 @@ class ConversationWorker:
             return
 
         # ----- 1. Checkpoint summary --------------------------------------
+        # Closeout always writes its authoritative LLM-authored summary,
+        # regardless of whether a periodic checkpoint just landed. The
+        # dirty-flag gate lives only in ``_maybe_periodic_checkpoint``.
         summary = await self._ask_checkpoint_summary()
-
-        try:
-            ckpt_path = write_checkpoint(
-                vault_root=self._config.vault.resolved_path,
-                transport=self.transport,
-                conversation_key=self.conversation_key,
-                summary=summary,
-                operator_short_name=self._operator_short_name,
-            )
-            audit_event(
-                "audit.checkpoint.written",
-                audit_dir=self._config.audit_dir,
-                actor="anna",
-                conv_key=self.conversation_key,
-                fsync_on_write=self._config.logging.audit.fsync_on_write,
-                checkpoint_file=str(ckpt_path),
-                summary_chars=len(summary),
-            )
-        except OSError as exc:
-            self._log.error("worker.checkpoint_write_failed", error=str(exc))
-            audit_event(
-                "audit.checkpoint.write_failed",
-                audit_dir=self._config.audit_dir,
-                actor="anna",
-                conv_key=self.conversation_key,
-                fsync_on_write=self._config.logging.audit.fsync_on_write,
-                level="WARNING",
-                error=str(exc),
-            )
+        await self._write_checkpoint_now(summary, kind="closeout")
 
         # ----- 2. Per-core-file eviction ---------------------------------
         for which in CORE_FILES.keys():
@@ -708,6 +705,172 @@ class ConversationWorker:
                     )
 
         self._log.info("worker.closeout.complete")
+
+    async def _write_checkpoint_now(self, summary: str, kind: str) -> Path | None:
+        """Write a checkpoint under the supervisor lock and audit it.
+
+        Extracted from :meth:`_closeout` so both the graceful-close path
+        (``kind="closeout"``) and the periodic path
+        (``kind="periodic"``) share one write+audit code path. NOTE:
+        this does NOT run eviction — eviction stays exclusively in
+        :meth:`_closeout`. On success the worker's checkpoint bookkeeping
+        is reset (``_dirty`` cleared, turn counter zeroed,
+        ``_last_checkpoint_at`` stamped). Returns the written path, or
+        ``None`` if the write failed (an OSError is caught and audited,
+        matching the prior closeout behavior).
+
+        The lock key ``checkpoint/<conv_key>`` is per-conversation: it
+        serialises a periodic write against the closeout write for the
+        same conversation without contending with eviction's
+        ``core/<file>`` locks.
+        """
+        lock = await self._supervisor.acquire(f"checkpoint/{self.conversation_key}")
+        async with lock:
+            try:
+                ckpt_path = write_checkpoint(
+                    vault_root=self._config.vault.resolved_path,
+                    transport=self.transport,
+                    conversation_key=self.conversation_key,
+                    summary=summary,
+                    operator_short_name=self._operator_short_name,
+                    kind=kind,
+                )
+            except OSError as exc:
+                self._log.error("worker.checkpoint_write_failed", error=str(exc))
+                audit_event(
+                    "audit.checkpoint.write_failed",
+                    audit_dir=self._config.audit_dir,
+                    actor="anna",
+                    conv_key=self.conversation_key,
+                    fsync_on_write=self._config.logging.audit.fsync_on_write,
+                    level="WARNING",
+                    error=str(exc),
+                    checkpoint_kind=kind,
+                )
+                return None
+
+            audit_event(
+                "audit.checkpoint.written",
+                audit_dir=self._config.audit_dir,
+                actor="anna",
+                conv_key=self.conversation_key,
+                fsync_on_write=self._config.logging.audit.fsync_on_write,
+                checkpoint_file=str(ckpt_path),
+                summary_chars=len(summary),
+                checkpoint_kind=kind,
+            )
+
+        # Reset checkpoint bookkeeping now that a checkpoint covers the
+        # current state. Applies to both periodic and closeout writes.
+        self._dirty = False
+        self._turns_since_checkpoint = 0
+        self._last_checkpoint_at = datetime.now(timezone.utc)
+        return ckpt_path
+
+    async def _maybe_periodic_checkpoint(self) -> None:
+        """Write a lightweight periodic checkpoint between turns, if due.
+
+        Invoked at the TOP of :meth:`_handle`, BEFORE ``self._client.query``,
+        on the single-consumer run loop. Because it runs strictly between
+        turns, it can never race an in-flight streaming reply — this is the
+        property that eliminates the exit-143 mid-reply-kill footgun. There
+        is no background timer.
+
+        Trigger logic (all gates must pass):
+
+        * Skip when ``self._ephemeral`` (one-shot CLI sessions never
+          checkpoint).
+        * Skip when ``checkpoint.periodic_enabled`` is False.
+        * Skip when not ``self._dirty`` — nothing new since the last
+          checkpoint, so a write would be redundant.
+        * Fire when ``_turns_since_checkpoint >= every_turns`` OR when the
+          minutes elapsed since the baseline ``>= every_minutes``.
+
+        Baseline for the minutes check: ``_last_checkpoint_at`` once any
+        checkpoint has been written this session; before that, the worker
+        creation time (``last_active`` is seeded to creation time in
+        ``__init__``, but we keep a dedicated ``_created_at`` so a long
+        first burst of turns can still arm the wall-clock trigger
+        independent of activity). The dirty gate guarantees we only fire
+        when there is actually a new turn to capture.
+
+        The summary is MECHANICAL — the Fix-1 transcript tail rendered
+        compactly. No SDK round-trip, so it cannot contend with the shared
+        client. If the tail is empty (nothing new on disk yet) we skip the
+        write but still reset the dirty flag / counters to avoid an empty
+        checkpoint and repeated no-op attempts.
+
+        The whole body is wrapped so a periodic-checkpoint failure NEVER
+        breaks the turn: on any error we log + audit a warning and return,
+        letting ``_handle`` proceed to the query.
+        """
+        if self._ephemeral:
+            return
+        ckpt_cfg = self._config.checkpoint
+        if not ckpt_cfg.periodic_enabled:
+            return
+        if not self._dirty:
+            return
+
+        now = datetime.now(timezone.utc)
+        baseline = self._last_checkpoint_at or self._created_at
+        minutes_since = (now - baseline).total_seconds() / 60.0
+        due = (
+            self._turns_since_checkpoint >= ckpt_cfg.every_turns
+            or minutes_since >= ckpt_cfg.every_minutes
+        )
+        if not due:
+            return
+
+        try:
+            vault_root = self._config.vault.resolved_path
+            since_mtime = latest_checkpoint_mtime(vault_root, self.conversation_key)
+            tail = transcript_tail_since(
+                transcripts_dir=self._config.transcripts_dir,
+                conv_key=self.conversation_key,
+                since_mtime=since_mtime,
+                max_turns=ckpt_cfg.tail_max_turns,
+                max_tokens=ckpt_cfg.tail_max_tokens,
+            )
+            summary = render_tail_block(tail)
+            if not summary:
+                # Nothing new on disk to capture. Reset the bookkeeping so
+                # we do not retry every turn against an empty tail.
+                self._dirty = False
+                self._turns_since_checkpoint = 0
+                self._last_checkpoint_at = now
+                return
+
+            # Capture the triggering count BEFORE the write — it resets
+            # ``_turns_since_checkpoint`` to 0 (Fix 2), so reading the
+            # field after would always log 0 in the audit event.
+            triggering_turns = self._turns_since_checkpoint
+            ckpt_path = await self._write_checkpoint_now(summary, kind="periodic")
+            if ckpt_path is not None:
+                audit_event(
+                    "audit.checkpoint.periodic",
+                    audit_dir=self._config.audit_dir,
+                    actor="anna",
+                    conv_key=self.conversation_key,
+                    fsync_on_write=self._config.logging.audit.fsync_on_write,
+                    checkpoint_file=str(ckpt_path),
+                    turns_since_checkpoint=triggering_turns,
+                )
+                self._log.info(
+                    "worker.checkpoint.periodic",
+                    checkpoint_file=str(ckpt_path),
+                )
+        except Exception as exc:  # noqa: BLE001 — never break the turn
+            self._log.warning("worker.checkpoint.periodic_failed", error=str(exc))
+            audit_event(
+                "audit.checkpoint.periodic_failed",
+                audit_dir=self._config.audit_dir,
+                actor="anna",
+                conv_key=self.conversation_key,
+                fsync_on_write=self._config.logging.audit.fsync_on_write,
+                level="WARNING",
+                error=str(exc),
+            )
 
     async def _ask_checkpoint_summary(self) -> str:
         """Round-trip the SDK for a closing summary. Best-effort.
@@ -767,6 +930,15 @@ class ConversationWorker:
                     RuntimeError("worker has no SDK client; cannot dispatch")
                 )
             return
+
+        # Periodic checkpoint (Fix 2). Runs BETWEEN turns: this is the top
+        # of the turn handler, BEFORE ``self._client.query(...)`` below, on
+        # the single-consumer run loop. Because no reply is in flight at
+        # this point, the checkpoint can never race a streaming response —
+        # this ordering is load-bearing and must stay before the query.
+        # The call is fully self-contained and exception-isolated, so a
+        # checkpoint failure never blocks the turn.
+        await self._maybe_periodic_checkpoint()
 
         try:
             from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock, ToolUseBlock
@@ -848,6 +1020,16 @@ class ConversationWorker:
                     text=f"I hit an error talking to the model: {exc}",
                 ))
                 return
+
+            # A real turn has now run: the SDK accepted the query. Advance
+            # the periodic-checkpoint bookkeeping here so it is scoped to
+            # turns that reached the query path. The ``_client is None``
+            # early return above never gets here, so a no-client no-op no
+            # longer arms the periodic checkpoint (Fix 1). A downstream
+            # receive error still counts — the query ran and produced
+            # transcript activity worth checkpointing.
+            self._turns_since_checkpoint += 1
+            self._dirty = True
 
             try:
                 async for msg in self._client.receive_response():  # type: ignore[attr-defined]
