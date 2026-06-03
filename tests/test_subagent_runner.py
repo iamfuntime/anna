@@ -147,13 +147,15 @@ async def test_delegate_missing_persona_raises_not_found(tmp_path: Path) -> None
 
 
 def test_load_persona_reads_file_off_disk(tmp_path: Path) -> None:
-    """A persona file at agents/<slug>.md is returned verbatim."""
+    """A persona file at agents/<slug>.md has its body returned verbatim."""
     runner = _make_runner(tmp_path)
     agents_dir = tmp_path / "agents"
     agents_dir.mkdir(parents=True, exist_ok=True)
     persona = "You are a threat researcher.\n\nFocus on CVEs.\n"
     (agents_dir / "threat-researcher.md").write_text(persona, encoding="utf-8")
-    assert runner._load_persona("threat-researcher") == persona  # noqa: SLF001
+    doc = runner._load_persona("threat-researcher")  # noqa: SLF001
+    assert doc.body == persona
+    assert doc.grants is None
 
 
 def test_load_persona_missing_raises_subagent_error(tmp_path: Path) -> None:
@@ -165,7 +167,7 @@ def test_load_persona_missing_raises_subagent_error(tmp_path: Path) -> None:
 
 
 def test_load_persona_empty_file_returns_empty_string(tmp_path: Path) -> None:
-    """An empty persona file returns '' — not an error.
+    """An empty persona file returns body='' — not an error.
 
     A persona-create flow that lands an empty file should not crash the
     runner; the operator can edit it in place and try again.
@@ -174,7 +176,45 @@ def test_load_persona_empty_file_returns_empty_string(tmp_path: Path) -> None:
     agents_dir = tmp_path / "agents"
     agents_dir.mkdir(parents=True, exist_ok=True)
     (agents_dir / "blank.md").write_text("", encoding="utf-8")
-    assert runner._load_persona("blank") == ""  # noqa: SLF001
+    doc = runner._load_persona("blank")  # noqa: SLF001
+    assert doc.body == ""
+    assert doc.grants is None
+
+
+def test_load_persona_frontmatter_grants_parses(tmp_path: Path) -> None:
+    """A grants: frontmatter block parses into AgentGrants; body is stripped."""
+    runner = _make_runner(tmp_path)
+    agents_dir = tmp_path / "agents"
+    agents_dir.mkdir(parents=True, exist_ok=True)
+    text = (
+        "---\n"
+        "grants:\n"
+        "  mcp_servers: [playwright]\n"
+        "  write_dirs: [reports]\n"
+        "  permission_mode: bypassPermissions\n"
+        "---\n"
+        "# Persona\nYou are a researcher.\n"
+    )
+    (agents_dir / "fm.md").write_text(text, encoding="utf-8")
+    doc = runner._load_persona("fm")  # noqa: SLF001
+    assert doc.body == "# Persona\nYou are a researcher.\n"
+    assert "---" not in doc.body
+    assert doc.grants is not None
+    assert doc.grants.mcp_servers == ["playwright"]
+    assert doc.grants.write_dirs == ["reports"]
+    assert doc.grants.permission_mode == "bypassPermissions"
+
+
+def test_load_persona_malformed_grants_returns_none(tmp_path: Path) -> None:
+    """A grants block of the wrong shape degrades to grants=None, body intact."""
+    runner = _make_runner(tmp_path)
+    agents_dir = tmp_path / "agents"
+    agents_dir.mkdir(parents=True, exist_ok=True)
+    text = "---\ngrants: not-a-mapping\n---\n# Persona\nbody\n"
+    (agents_dir / "bad.md").write_text(text, encoding="utf-8")
+    doc = runner._load_persona("bad")  # noqa: SLF001
+    assert doc.body == "# Persona\nbody\n"
+    assert doc.grants is None
 
 
 def test_load_skills_missing_directory_returns_empty(tmp_path: Path) -> None:
@@ -492,6 +532,194 @@ def test_build_system_prompt_is_pure(tmp_path: Path) -> None:
     a = SubAgentRunner._build_system_prompt(**args)  # noqa: SLF001
     b = SubAgentRunner._build_system_prompt(**args)  # noqa: SLF001
     assert a == b
+
+
+# ---------------------------------------------------------------------------
+# Subtask 7/8: per-agent grant wiring into options + prompt
+# ---------------------------------------------------------------------------
+
+
+def _make_runner_with_subagents(tmp_path: Path, **subagents: object) -> SubAgentRunner:
+    """Runner whose config carries the given subagents block overrides."""
+    raw: dict = {"tools": {"enabled": True}, "subagents": subagents}
+    cfg = AnnaConfig.model_validate(raw)
+    cfg = cfg.model_copy(update={"anna_home": tmp_path})
+    cfg.vault.path = str(tmp_path / "vault")
+    supervisor = Supervisor(config=cfg)
+    return SubAgentRunner(
+        config=cfg,
+        supervisor=supervisor,
+        agents_registry=SubAgentRegistry(
+            supervisor=supervisor,
+            agents_dir=tmp_path / "agents",
+            audit_dir=tmp_path / "audit",
+            fsync_on_write=False,
+        ),
+        skills_registry=SkillRegistry(
+            supervisor=supervisor,
+            skills_dir=tmp_path / "skills",
+            audit_dir=tmp_path / "audit",
+            fsync_on_write=False,
+        ),
+    )
+
+
+def test_build_subagent_options_empty_grant_equivalent_to_today(
+    tmp_path: Path,
+) -> None:
+    """No grant (resolved=None) reproduces the pre-chunk-A option surface.
+
+    anna_web only (tools enabled), add_dirs from extra_dirs, allowed_tools
+    equal to subagents.allowed_tools.
+    """
+    runner = _make_runner_with_tools(tmp_path, tools_enabled=True)
+    options = runner._build_subagent_options(  # noqa: SLF001
+        system_prompt="system",
+        conv_key="subagent:slug:abc",
+    )
+    assert set(options.mcp_servers.keys()) == {"anna_web"}
+    assert options.add_dirs == []
+    assert sorted(options.allowed_tools) == sorted(
+        runner._config.subagents.allowed_tools  # noqa: SLF001
+    )
+    assert options.permission_mode == "acceptEdits"
+
+
+def test_build_subagent_options_resolved_grant_changes_surface(
+    tmp_path: Path,
+) -> None:
+    """A resolved grant drives mcp_servers / add_dirs / allowed_tools / mode."""
+    from anna.runtime.grants import resolve_effective_grant
+
+    runner = _make_runner_with_subagents(
+        tmp_path,
+        dir_pool={"reports": str(tmp_path / "reports")},
+        mcp_registry={"pw": {"kind": "stdio", "command": "npx"}},
+        agents={
+            "writer": {
+                "write_dirs": ["reports"],
+                "mcp_servers": ["pw"],
+                "allowed_tools": ["Read", "Glob"],
+                "permission_mode": "bypassPermissions",
+            }
+        },
+    )
+    resolved = resolve_effective_grant(runner._config, "writer", None)  # noqa: SLF001
+    options = runner._build_subagent_options(  # noqa: SLF001
+        system_prompt="system",
+        conv_key="subagent:writer:abc",
+        resolved=resolved,
+    )
+    # External stdio server bound; anna_web NOT present (grant replaced it).
+    assert set(options.mcp_servers.keys()) == {"pw"}
+    assert options.mcp_servers["pw"]["command"] == "npx"
+    # write_dirs resolved to the pool's absolute path.
+    assert options.add_dirs == [str(tmp_path / "reports")]
+    # allowed_tools = grant tools UNION the external wildcard, deduped.
+    assert options.allowed_tools == ["Read", "Glob", "mcp__pw__*"]
+    assert options.permission_mode == "bypassPermissions"
+
+
+def test_build_subagent_options_permission_override_beats_resolved(
+    tmp_path: Path,
+) -> None:
+    """An explicit permission_mode_override wins over the resolved grant."""
+    from anna.runtime.grants import resolve_effective_grant
+
+    runner = _make_runner_with_subagents(
+        tmp_path,
+        agents={"writer": {"permission_mode": "bypassPermissions"}},
+    )
+    resolved = resolve_effective_grant(runner._config, "writer", None)  # noqa: SLF001
+    options = runner._build_subagent_options(  # noqa: SLF001
+        system_prompt="system",
+        conv_key="subagent:writer:abc",
+        permission_mode_override="plan",
+        resolved=resolved,
+    )
+    assert options.permission_mode == "plan"
+
+
+def test_build_subagent_options_forbidden_builtin_never_mounts(
+    tmp_path: Path,
+) -> None:
+    """A registry entry naming a forbidden builtin never reaches mcp_servers."""
+    from anna.runtime.grants import resolve_effective_grant
+
+    runner = _make_runner_with_subagents(
+        tmp_path,
+        mcp_registry={"evil": {"kind": "builtin", "builtin_name": "anna_self_edit"}},
+        agents={"writer": {"mcp_servers": ["evil"]}},
+    )
+    resolved = resolve_effective_grant(runner._config, "writer", None)  # noqa: SLF001
+    options = runner._build_subagent_options(  # noqa: SLF001
+        system_prompt="system",
+        conv_key="subagent:writer:abc",
+        resolved=resolved,
+    )
+    assert "anna_self_edit" not in options.mcp_servers
+    assert "evil" not in options.mcp_servers
+    assert options.mcp_servers == {}
+
+
+def test_summarize_server_tools_fallback_is_none(tmp_path: Path) -> None:
+    """The fallback-only (anna_web) surface returns None → default wording."""
+    from anna.runtime.grants import resolve_effective_grant
+
+    runner = _make_runner_with_tools(tmp_path, tools_enabled=True)
+    resolved = resolve_effective_grant(runner._config, "x", None)  # noqa: SLF001
+    assert SubAgentRunner._summarize_server_tools(resolved) is None  # noqa: SLF001
+
+
+def test_summarize_server_tools_names_external(tmp_path: Path) -> None:
+    """A resolved external server is named in the summary phrase."""
+    from anna.runtime.grants import resolve_effective_grant
+
+    runner = _make_runner_with_subagents(
+        tmp_path,
+        mcp_registry={
+            "detections": {
+                "kind": "http",
+                "url": "https://srv/mcp",
+                "tool_names": ["search_rules"],
+            }
+        },
+        agents={"writer": {"mcp_servers": ["detections"]}},
+    )
+    resolved = resolve_effective_grant(runner._config, "writer", None)  # noqa: SLF001
+    phrase = SubAgentRunner._summarize_server_tools(resolved)  # noqa: SLF001
+    assert phrase == "detections (search_rules)"
+
+
+def test_build_system_prompt_empty_case_byte_identical(tmp_path: Path) -> None:
+    """server_tools=None reproduces the pre-chunk-A delegation wording exactly."""
+    prompt = SubAgentRunner._build_system_prompt(  # noqa: SLF001
+        persona="persona",
+        skills=[],
+        task="t",
+        context=None,
+        vault_root=tmp_path / "vault",
+        server_tools=None,
+    )
+    assert (
+        "You have web_search, web_fetch, and vault_download for "
+        "outside-the-vault work." in prompt
+    )
+
+
+def test_build_system_prompt_names_resolved_servers(tmp_path: Path) -> None:
+    """A non-fallback server_tools phrase appears in the delegation framing."""
+    prompt = SubAgentRunner._build_system_prompt(  # noqa: SLF001
+        persona="persona",
+        skills=[],
+        task="t",
+        context=None,
+        vault_root=tmp_path / "vault",
+        extra_dirs=[str(tmp_path / "reports")],
+        server_tools="playwright",
+    )
+    assert "You have playwright for outside-the-vault work." in prompt
+    assert str(tmp_path / "reports") in prompt
 
 
 # ---------------------------------------------------------------------------

@@ -205,6 +205,49 @@ def test_example_yaml_includes_subagents_block() -> None:
     assert "mcp__anna_web__web_search" in cfg.subagents.allowed_tools
 
 
+def test_example_yaml_parses_with_subagents_grant_blocks_uncommented() -> None:
+    """The documented dir_pool / mcp_registry / agents examples round-trip.
+
+    The anna.yaml.example ships these commented (so the default config stays
+    minimal), but the operator copies + uncomments them. This test keeps the
+    documented shapes honest by validating them through the real config
+    loader exactly as written in the example's `subagents:` comment block.
+    """
+    raw = yaml.safe_load(EXAMPLE_PATH.read_text(encoding="utf-8"))
+    raw["subagents"]["dir_pool"] = {"git": "~/git", "brain": "~/Obsidian/Brain"}
+    raw["subagents"]["mcp_registry"] = {
+        "web": {"kind": "builtin", "builtin_name": "anna_web"},
+        "playwright": {
+            "kind": "stdio",
+            "command": "npx",
+            "args": ["-y", "@playwright/mcp@latest"],
+        },
+        "detections": {
+            "kind": "http",
+            "url": "https://detections.internal/mcp",
+            "headers": {"Authorization": "Bearer x"},
+            "tool_names": ["search_rules", "get_rule"],
+        },
+    }
+    raw["subagents"]["agents"] = {
+        "code-writer": {"write_dirs": ["git"], "mcp_servers": ["web"]},
+        "brain-writer": {
+            "write_dirs": ["brain"],
+            "mcp_servers": ["web", "detections"],
+            "permission_mode": "acceptEdits",
+        },
+    }
+    cfg = AnnaConfig.model_validate(raw)
+    assert cfg.subagents.dir_pool["git"] == "~/git"
+    assert cfg.subagents.mcp_registry["playwright"].kind == "stdio"
+    assert cfg.subagents.mcp_registry["detections"].tool_names == [
+        "search_rules",
+        "get_rule",
+    ]
+    assert cfg.subagents.agents["code-writer"].write_dirs == ["git"]
+    assert cfg.subagents.agents["brain-writer"].permission_mode == "acceptEdits"
+
+
 def test_cli_transport_defaults_when_block_omitted() -> None:
     """A config with no transports.cli block uses CLITransportConfig defaults."""
     raw = {"auth": {"mode": "max"}}

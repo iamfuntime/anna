@@ -351,6 +351,83 @@ subagents:
     - mcp__anna_web__web_search
     - mcp__anna_web__web_fetch
     - mcp__anna_web__vault_download
+  # ----------------------------------------------------------
+  # Per-agent permissions + ANNA-native MCP registry.
+  #
+  # Two trust tiers:
+  #   POLICY  (operator-only, trusted) — the dir_pool and mcp_registry
+  #           below. They live in THIS file, which the anna_self_edit MCP
+  #           cannot rewrite, so they are the blessed set of capabilities.
+  #           Restart-gated: no hot reload. Edit, then restart anna.
+  #   GRANTS  (untrusted) — the agents.<slug> map below AND a persona
+  #           file's `grants:` frontmatter. A grant may ONLY reference a
+  #           pool / registry name. An unknown name is dropped + logged
+  #           with a WARNING, never invented. So a sub-agent's reachable
+  #           set is always a subset of what the operator blessed, and a
+  #           persona file can never widen its own reach past the policy.
+  #
+  # Precedence is REPLACE, not union, per field, layered:
+  #   global fallback (extra_dirs / allowed_tools above)
+  #     -> anna.yaml agents.<slug>
+  #       -> persona frontmatter grants:
+  # A higher layer that SPECIFIES a field replaces the lower layer's value
+  # entirely. A grant list left empty (or absent) passes the lower layer
+  # through unchanged.
+  #
+  # dir_pool: named, operator-blessed write directories a grant may name.
+  # Maps a short name -> absolute path (~ is expanded at resolution).
+  # dir_pool:
+  #   git: ~/git
+  #   brain: ~/Obsidian/Brain
+  #
+  # mcp_registry: named, operator-blessed MCP server specs a grant may
+  # name. Three kinds:
+  #   builtin  dispatches to an ANNA in-process factory by builtin_name.
+  #            Only anna_web is reachable; anna_self_edit / anna_google /
+  #            anna_delegate are structurally excluded (a registry entry
+  #            naming one is dropped at resolution — that is how
+  #            one-level-only delegation and no-self-edit are enforced).
+  #   stdio    external MCP server launched as a subprocess. Needs command;
+  #            args / env optional.
+  #   http     external MCP server over HTTP. Needs url; headers optional.
+  # tool_names pins an external server's tool surface to named tools; left
+  # empty, the resolver contributes the mcp__<name>__* wildcard instead.
+  # mcp_registry:
+  #   web:
+  #     kind: builtin
+  #     builtin_name: anna_web
+  #   playwright:
+  #     kind: stdio
+  #     command: npx
+  #     args: ["-y", "@playwright/mcp@latest"]
+  #   detections:
+  #     kind: http
+  #     url: https://detections.internal/mcp
+  #     headers:
+  #       Authorization: Bearer ${DETECTIONS_TOKEN}
+  #     tool_names: ["search_rules", "get_rule"]
+  #
+  # agents: per-slug grants. Each value may reference dir_pool /
+  # mcp_registry names ONLY. write_dirs and mcp_servers are name lists;
+  # allowed_tools / permission_mode are optional overrides.
+  # agents:
+  #   code-writer:
+  #     write_dirs: [git]
+  #     mcp_servers: [web]
+  #   brain-writer:
+  #     write_dirs: [brain]
+  #     mcp_servers: [web, detections]
+  #     permission_mode: acceptEdits
+  #
+  # The same grant shape can live in a persona file's frontmatter, where
+  # it REPLACES the agents.<slug> layer for that field:
+  #   ---
+  #   grants:
+  #     write_dirs: [brain]
+  #     mcp_servers: [playwright]
+  #     permission_mode: acceptEdits
+  #   ---
+  #   # Persona body...
 
 # ============================================================
 # web: Phase 2.5 dashboard.

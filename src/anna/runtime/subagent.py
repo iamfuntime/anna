@@ -33,11 +33,13 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
-from anna.config import AnnaConfig
+from anna.config import AgentGrants, AnnaConfig
 from anna.log import audit_event, get_logger
+from anna.runtime.frontmatter import split_frontmatter
 
 if TYPE_CHECKING:
     from anna.agents.registry import SubAgentRegistry
+    from anna.runtime.grants import ResolvedGrant
     from anna.runtime.supervisor import Supervisor
     from anna.skills.registry import SkillRegistry
 
@@ -86,6 +88,23 @@ class DelegateResult:
     cost_usd: float
     duration_ms: int
     status: str
+
+
+@dataclass(frozen=True)
+class PersonaDoc:
+    """Parsed persona file: stripped body + optional frontmatter grants.
+
+    ``_load_persona`` peels any leading ``---``-fenced YAML off the persona
+    file. ``body`` is the markdown that gets spliced into the system prompt
+    (the fence is never visible to the model). ``grants`` is the parsed
+    ``grants:`` frontmatter block as an :class:`AgentGrants`, or ``None`` when
+    the file has no frontmatter, no ``grants`` key, or a malformed grants
+    block (which is logged). The grants are threaded through ``delegate`` for
+    a later wiring pass (subtask 7) — they do not yet affect spawned options.
+    """
+
+    body: str
+    grants: AgentGrants | None
 
 
 class SubAgentError(Exception):
@@ -420,8 +439,8 @@ class SubAgentRunner:
     # Persona + skills loading (subtask 3)
     # ------------------------------------------------------------------
 
-    def _load_persona(self, slug: str) -> str:
-        """Read ``$ANNA_HOME/agents/<slug>.md`` off disk and return the body.
+    def _load_persona(self, slug: str) -> PersonaDoc:
+        """Read ``$ANNA_HOME/agents/<slug>.md`` and split body from grants.
 
         Reads on every call — no caching — so the operator can edit a
         persona file without restarting ANNA. The registry is *not*
@@ -430,8 +449,15 @@ class SubAgentRunner:
         a linear scan or a new ``get(slug)`` method; the runner skips
         both by reading the well-known path directly.
 
+        Any leading ``---``-fenced YAML frontmatter is peeled off via
+        :func:`split_frontmatter`. The returned ``body`` is the markdown
+        with the fence removed (so the fence never reaches the system
+        prompt); ``grants`` is the parsed ``grants:`` block as an
+        :class:`AgentGrants`, or ``None`` when absent or malformed.
+
         Returns:
-            Persona text, possibly empty if the file exists but is blank.
+            A :class:`PersonaDoc`. ``body`` may be empty if the file exists
+            but is blank.
 
         Raises:
             :class:`SubAgentError`: when the persona file does not
@@ -441,9 +467,41 @@ class SubAgentRunner:
         """
         path = self._config.anna_home / "agents" / f"{slug}.md"
         try:
-            return path.read_text(encoding="utf-8")
+            text = path.read_text(encoding="utf-8")
         except FileNotFoundError as exc:
             raise SubAgentError("not_found") from exc
+
+        body, meta = split_frontmatter(text)
+        grants = self._parse_grants(slug, meta)
+        return PersonaDoc(body=body, grants=grants)
+
+    def _parse_grants(self, slug: str, meta: dict[str, Any]) -> AgentGrants | None:
+        """Tolerantly parse a frontmatter ``grants:`` block into AgentGrants.
+
+        Unknown keys inside the block are ignored (pydantic drops extras by
+        default). A malformed block (wrong type, or values that fail
+        validation) degrades to ``None`` + a WARNING so a bad header can
+        never break a delegation.
+        """
+        raw = meta.get("grants")
+        if raw is None:
+            return None
+        if not isinstance(raw, dict):
+            self._log.warning(
+                "subagent.persona.grants.malformed",
+                slug=slug,
+                reason="grants is not a mapping",
+            )
+            return None
+        try:
+            return AgentGrants.model_validate(raw)
+        except Exception as exc:  # noqa: BLE001 - tolerate any validation error
+            self._log.warning(
+                "subagent.persona.grants.malformed",
+                slug=slug,
+                reason=str(exc),
+            )
+            return None
 
     def _load_skills(self, slug: str) -> list[str]:
         """Return skill body texts for the given agent slug, alphabetical order.
@@ -470,6 +528,12 @@ class SubAgentRunner:
     # System prompt assembly (subtask 4)
     # ------------------------------------------------------------------
 
+    # Default sub-agent server-tool surface, used when no resolved grant is
+    # threaded in (the empty-config / backward-compat case). Kept as a
+    # constant so the empty-case prompt stays byte-identical to the pre-
+    # chunk-A wording while a real grant can override it (subtask 8).
+    _DEFAULT_SERVER_TOOLS = "web_search, web_fetch, and vault_download"
+
     @staticmethod
     def _build_system_prompt(
         persona: str,
@@ -478,6 +542,7 @@ class SubAgentRunner:
         context: dict[str, Any] | None,
         vault_root: Path,
         extra_dirs: list[str] | None = None,
+        server_tools: str | None = None,
     ) -> str:
         """Splice the persona, skills, delegation framing, task, and optional context.
 
@@ -509,6 +574,12 @@ class SubAgentRunner:
         skills, so a persona-only sub-agent gets a tidy prompt.
         Similarly, ``# Context`` is only present when the caller passed
         a non-None dict.
+
+        ``extra_dirs`` names the RESOLVED write dirs (from the effective
+        grant) and ``server_tools`` is a short human phrase naming the
+        RESOLVED MCP server tool surface (subtask 8). Both fall back to the
+        pre-chunk-A wording when absent so an ungranted sub-agent gets a
+        byte-identical prompt to before.
         """
         import yaml
 
@@ -526,11 +597,17 @@ class SubAgentRunner:
                 "and write outputs to its Inbox when the task asks)"
             )
         reach_line += "."
+        tools_phrase = (
+            server_tools
+            if server_tools is not None
+            else SubAgentRunner._DEFAULT_SERVER_TOOLS
+        )
         delegation_block = (
             "You are running as a one-shot sub-agent spawned by ANNA. You "
             "do not have the delegate tool; you cannot spawn further "
-            "sub-agents. You have web_search, web_fetch, and "
-            "vault_download for outside-the-vault work. "
+            "sub-agents. You have "
+            + tools_phrase
+            + " for outside-the-vault work. "
             + reach_line
             + " Your reply is returned to the parent agent as a single "
             "tool result; write the final answer as one message."
@@ -555,6 +632,44 @@ class SubAgentRunner:
             sections.append(f"# Context\n{context_yaml}")
         return "\n\n".join(sections)
 
+    @staticmethod
+    def _summarize_server_tools(resolved: "ResolvedGrant") -> str | None:
+        """Human phrase naming the resolved sub-agent server tool surface.
+
+        Threaded into :meth:`_build_system_prompt` as ``server_tools`` so the
+        delegation framing matches the actual grant (subtask 8). Returns
+        ``None`` for the fallback-only case (a single ``anna_web`` builtin)
+        so the prompt stays byte-identical to the pre-chunk-A wording. For
+        any other resolved surface, returns a short comma list:
+
+        * ``anna_web`` → its three concrete tool names (web_search,
+          web_fetch, vault_download).
+        * an external (stdio/http) server → the server name, optionally with
+          its pinned ``tool_names`` in parens.
+
+        With no servers resolved at all, returns the empty-string phrase
+        ``"no outside-the-vault tools"`` so the prompt does not claim a
+        surface the sub-agent lacks.
+        """
+        names = [name for name, _ in resolved.mcp_specs]
+        # Fallback-only: exactly the implicit anna_web builtin. Keep the
+        # original wording (return None → _DEFAULT_SERVER_TOOLS).
+        if names == ["anna_web"] and resolved.mcp_specs[0][1].kind == "builtin":
+            return None
+
+        if not resolved.mcp_specs:
+            return "no outside-the-vault tools"
+
+        parts: list[str] = []
+        for name, spec in resolved.mcp_specs:
+            if spec.kind == "builtin" and spec.builtin_name == "anna_web":
+                parts.append("web_search, web_fetch, vault_download")
+            elif spec.tool_names:
+                parts.append(f"{name} ({', '.join(spec.tool_names)})")
+            else:
+                parts.append(name)
+        return ", ".join(parts)
+
     # ------------------------------------------------------------------
     # Sub-agent ClaudeAgentOptions builder (subtask 5)
     # ------------------------------------------------------------------
@@ -564,25 +679,34 @@ class SubAgentRunner:
         system_prompt: str,
         conv_key: str,
         permission_mode_override: str | None = None,
+        resolved: "ResolvedGrant | None" = None,
     ) -> Any:
         """Construct the ``ClaudeAgentOptions`` used to spawn the sub-agent client.
 
         This is also where the depth-protection invariant is enforced
         at the runtime level: ``anna_self_edit``, ``anna_google``, and
         ``anna_delegate`` are *never* mounted on a sub-agent's options.
-        The only MCP server a sub-agent ever sees is ``anna_web`` (and
-        only when ``config.tools.enabled`` is true).
+        That invariant lives in :func:`anna.runtime.grants.build_mcp_servers`
+        — those three builtins are absent from its dispatch table and a
+        registry entry naming one is dropped. This method never builds an
+        MCP server by any other path, so there is no way to smuggle one in.
 
         Args:
             system_prompt: Output of :meth:`_build_system_prompt`.
             conv_key: Synthetic conv_key for this delegation; flows
-                into the ``anna_web`` server closure so the tool calls
+                into the per-builtin server closures so the tool calls
                 that fire from inside the sub-agent get audit-stamped
                 with a distinct identifier.
             permission_mode_override: Optional per-call permission
-                mode. Default is ``acceptEdits`` (stricter than the
-                worker's ``bypassPermissions``); pass to tighten or
-                loosen on a per-delegation basis.
+                mode. When set it wins over the resolved grant's mode;
+                otherwise the resolved grant supplies it (default
+                ``acceptEdits``).
+            resolved: The effective :class:`ResolvedGrant` for this
+                delegation. ``None`` means "no grant" and reproduces the
+                pre-chunk-A behavior exactly: ``anna_web`` only (when
+                ``tools.enabled``), ``add_dirs`` from
+                ``subagents.extra_dirs``, ``allowed_tools`` from
+                ``subagents.allowed_tools``.
 
         Returns:
             ``ClaudeAgentOptions`` ready to feed into ``ClaudeSDKClient``.
@@ -591,26 +715,42 @@ class SubAgentRunner:
         # the SDK transitively. Mirrors ``ConversationWorker._build_options``.
         from claude_agent_sdk import ClaudeAgentOptions
 
-        from anna.tools.vault_tools import VaultTools
-        from anna.tools.web_server import build_web_server
-        from anna.tools.web_tools import WebTools
+        from anna.runtime.grants import (
+            build_mcp_servers,
+            resolve_effective_grant,
+        )
 
         vault_root = self._config.vault.resolved_path
 
-        mcp_servers: dict[str, Any] = {}
-        if self._config.tools.enabled:
-            web_tools = WebTools(config=self._config)
-            vault_tools = VaultTools(config=self._config)
-            web_server = build_web_server(
-                config=self._config,
-                web_tools=web_tools,
-                vault_tools=vault_tools,
-                conv_key=conv_key,
-            )
-            if web_server is not None:
-                mcp_servers["anna_web"] = web_server
+        # No explicit grant → synthesize the fallback grant so this method
+        # behaves exactly as it did before chunk A. resolve_effective_grant
+        # with no per-agent / frontmatter layers yields today's fallback
+        # (anna_web when tools.enabled, extra_dirs, subagents.allowed_tools).
+        if resolved is None:
+            resolved = resolve_effective_grant(self._config, "", None)
 
-        permission_mode = permission_mode_override or "acceptEdits"
+        # Bind the resolved MCP specs into the SDK dict + tool additions.
+        # build_mcp_servers is the SINGLE path that constructs MCP servers
+        # for a sub-agent; it structurally excludes the forbidden trio.
+        mcp_servers, extra_tool_names = build_mcp_servers(
+            self._config, resolved.mcp_specs, conv_key
+        )
+
+        permission_mode = permission_mode_override or resolved.permission_mode
+
+        # allowed_tools = the grant's tool surface UNION the MCP tool
+        # additions, deduped with a stable (first-seen) order so the option
+        # set is deterministic across runs and the existing tests can assert
+        # on a sorted comparison.
+        allowed_tools: list[str] = []
+        for name in [*resolved.allowed_tools, *extra_tool_names]:
+            if name not in allowed_tools:
+                allowed_tools.append(name)
+
+        # write_dirs are already absolute / ~-expanded by the resolver;
+        # guard with expanduser defensively in case a future caller passes
+        # a tilde path through.
+        add_dirs = [str(Path(d).expanduser()) for d in resolved.write_dirs]
 
         return ClaudeAgentOptions(
             system_prompt=system_prompt,
@@ -619,23 +759,17 @@ class SubAgentRunner:
             # leaks in.
             setting_sources=[],
             permission_mode=permission_mode,
-            # Only anna_web (when tools enabled). Never anna_self_edit,
-            # anna_google, or anna_delegate. This is the runtime-level
-            # enforcement of one-level-only delegation.
+            # Resolved MCP servers only. Never anna_self_edit, anna_google,
+            # or anna_delegate — build_mcp_servers enforces that.
             mcp_servers=mcp_servers,
-            allowed_tools=list(self._config.subagents.allowed_tools),
+            allowed_tools=allowed_tools,
             cwd=str(vault_root),
-            # add_dirs grants extra reachable roots beyond the cwd
-            # (ANNA vault). Driven by ``subagents.extra_dirs`` config —
-            # typically the collaborative Brain vault so sub-agents can
-            # read detection templates / query libraries / example
-            # reports and write reports into Brain/Inbox directly. Still
-            # never mounts core/: ANNA's identity files stay invisible
-            # because core/ is not under any configured extra_dir.
-            add_dirs=[
-                str(Path(d).expanduser())
-                for d in self._config.subagents.extra_dirs
-            ],
+            # add_dirs grants extra reachable roots beyond the cwd (ANNA
+            # vault). Driven by the resolved grant's write_dirs (fallback:
+            # subagents.extra_dirs) — typically the collaborative Brain
+            # vault. Still never mounts core/: ANNA's identity files stay
+            # invisible because core/ is not in any blessed dir_pool entry.
+            add_dirs=add_dirs,
         )
 
     # ------------------------------------------------------------------
@@ -807,7 +941,7 @@ class SubAgentRunner:
         try:
             # Step 2: load persona. Missing persona is a spawn-time fail.
             try:
-                persona = self._load_persona(agent_slug)
+                persona_doc = self._load_persona(agent_slug)
             except SubAgentError as exc:
                 # _load_persona only raises kind="not_found"; surface a
                 # matching fail audit and re-raise.
@@ -821,10 +955,29 @@ class SubAgentRunner:
                 )
                 raise
 
+            # Persona body feeds the prompt; grants flow through the
+            # resolver below into both the prompt framing and the spawned
+            # options so the sub-agent's reach matches its effective grant.
+            persona = persona_doc.body
+            persona_grants = persona_doc.grants
+
+            # Resolve the effective grant for this slug across the three
+            # layers (fallback → anna.yaml agents.<slug> → frontmatter).
+            # Local import keeps the SDK-free unit tests that exercise
+            # _load_persona / _build_system_prompt from pulling grants in.
+            from anna.runtime.grants import resolve_effective_grant
+
+            resolved = resolve_effective_grant(
+                self._config, agent_slug, persona_grants
+            )
+
             # Step 3: load skills (missing dir → []).
             skills = self._load_skills(agent_slug)
 
-            # Step 4: assemble system prompt.
+            # Step 4: assemble system prompt. The prompt names the RESOLVED
+            # write dirs + server tool surface so the framing matches the
+            # actual grant (subtask 8). With no grant the resolver returns
+            # the fallback and the prompt stays byte-identical to before.
             vault_root = self._config.vault.resolved_path
             system_prompt = self._build_system_prompt(
                 persona=persona,
@@ -832,13 +985,15 @@ class SubAgentRunner:
                 task=task,
                 context=context,
                 vault_root=vault_root,
-                extra_dirs=list(self._config.subagents.extra_dirs),
+                extra_dirs=list(resolved.write_dirs),
+                server_tools=self._summarize_server_tools(resolved),
             )
 
-            # Step 5: build options.
+            # Step 5: build options off the resolved grant.
             options = self._build_subagent_options(
                 system_prompt=system_prompt,
                 conv_key=conv_key,
+                resolved=resolved,
             )
 
             # Step 6+7: stamp spawn audit. Truncate the task for the

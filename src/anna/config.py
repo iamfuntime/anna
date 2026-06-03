@@ -467,6 +467,118 @@ class ToolsConfig(BaseModel):
     vault_download: VaultDownloadConfig = Field(default_factory=VaultDownloadConfig)
 
 
+class McpServerSpec(BaseModel):
+    """One entry in the operator-blessed ``subagents.mcp_registry``.
+
+    The registry is POLICY (operator-only, restart-gated): it lives in
+    ``anna.yaml`` and the ``anna_self_edit`` MCP cannot touch it. Untrusted
+    GRANTS (per-agent config / persona frontmatter) may only *reference* a
+    registry entry by name — they can never invent a server. An unknown name
+    is dropped at resolution time, not at parse time.
+
+    Three kinds:
+
+    * ``builtin`` — dispatches to an ANNA in-process factory by
+      ``builtin_name`` (e.g. ``anna_web``). The resolver's dispatch table
+      structurally excludes the forbidden builtins (``anna_self_edit``,
+      ``anna_google``, ``anna_delegate``); a registry entry naming one of
+      those parses fine here but is dropped at resolution.
+    * ``stdio`` — an external MCP server launched as a subprocess. Requires
+      ``command``; ``args``/``env`` optional. Emitted to the SDK as the
+      literal ``{"type": "stdio", "command": ..., ...}`` TypedDict.
+    * ``http`` — an external MCP server reached over HTTP. Requires ``url``;
+      ``headers`` optional.
+
+    ``tool_names`` is the explicit tool allow-list contributed to
+    ``allowed_tools``. For builtins it is ignored (the factory's own
+    ``*_TOOL_NAMES`` drive the additions). For external servers it is left
+    empty by default and the resolver contributes the server-namespace
+    wildcard ``mcp__<name>__*`` (confirmed honored by the bundled CLI — see
+    grants.py header); set it to restrict the surface to named tools.
+    """
+
+    kind: Literal["builtin", "stdio", "http"]
+    builtin_name: str | None = None
+    command: str | None = None
+    args: list[str] = Field(default_factory=list)
+    env: dict[str, str] = Field(default_factory=dict)
+    url: str | None = None
+    headers: dict[str, str] = Field(default_factory=dict)
+    tool_names: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _check_kind_fields(self) -> "McpServerSpec":
+        """Enforce required-field-per-kind and reject cross-kind combos.
+
+        A builtin with a bogus ``builtin_name`` is *allowed* here —
+        resolution-time drop handles unknown builtins. What is rejected is a
+        structurally incoherent spec: a missing required field for the kind,
+        or a field that belongs to a different kind (e.g. a stdio spec that
+        also sets ``url``).
+        """
+        if self.kind == "builtin":
+            if not self.builtin_name:
+                raise ValueError(
+                    "McpServerSpec(kind='builtin') requires builtin_name"
+                )
+            if self.command or self.url:
+                raise ValueError(
+                    "McpServerSpec(kind='builtin') must not set command/url"
+                )
+        elif self.kind == "stdio":
+            if not self.command:
+                raise ValueError(
+                    "McpServerSpec(kind='stdio') requires command"
+                )
+            if self.url or self.headers:
+                raise ValueError(
+                    "McpServerSpec(kind='stdio') must not set url/headers"
+                )
+            if self.builtin_name:
+                raise ValueError(
+                    "McpServerSpec(kind='stdio') must not set builtin_name"
+                )
+        elif self.kind == "http":
+            if not self.url:
+                raise ValueError(
+                    "McpServerSpec(kind='http') requires url"
+                )
+            if self.command or self.args or self.env:
+                raise ValueError(
+                    "McpServerSpec(kind='http') must not set command/args/env"
+                )
+            if self.builtin_name:
+                raise ValueError(
+                    "McpServerSpec(kind='http') must not set builtin_name"
+                )
+        return self
+
+
+class AgentGrants(BaseModel):
+    """Untrusted per-agent capability grant.
+
+    Sourced from either ``subagents.agents.<slug>`` in anna.yaml or a
+    persona file's ``grants:`` frontmatter. Every list field is a set of
+    *names* that must resolve against the operator-blessed pools
+    (``subagents.dir_pool`` / ``subagents.mcp_registry``); names that do not
+    resolve are dropped + logged at resolution time, never invented. The
+    reachable set is therefore always a subset of what the operator blessed.
+
+    Per-field semantics in the resolver (grants.py): a field that is set
+    REPLACES the lower layer's value; a field left unset (``None`` for the
+    optional scalars, or simply absent) passes the lower layer through.
+    Note the lists default to ``[]`` — an explicit empty list means "grant
+    nothing here", which is a deliberate REPLACE, distinct from absence.
+    """
+
+    write_dirs: list[str] = Field(default_factory=list)
+    mcp_servers: list[str] = Field(default_factory=list)
+    allowed_tools: list[str] | None = None
+    permission_mode: Literal[
+        "default", "acceptEdits", "bypassPermissions", "plan"
+    ] | None = None
+
+
 class SubagentsConfig(BaseModel):
     """Phase 2 §3 sub-agent spawn runtime.
 
@@ -525,6 +637,61 @@ class SubagentsConfig(BaseModel):
             "deployment opts in."
         ),
     )
+    dir_pool: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "POLICY (operator-only, restart-gated): named pool of absolute "
+            "write-directory paths a per-agent grant may reference. Maps a "
+            "short name to an abs path (``~``-expanded at resolution). "
+            "Untrusted grants (``agents.<slug>.write_dirs`` / persona "
+            "frontmatter) may only name a pool entry; an unknown name is "
+            "dropped + logged, never invented."
+        ),
+    )
+    mcp_registry: dict[str, McpServerSpec] = Field(
+        default_factory=dict,
+        description=(
+            "POLICY (operator-only, restart-gated): named registry of MCP "
+            "server specs a per-agent grant may reference. Untrusted grants "
+            "may only name a registry entry; unknown names and the forbidden "
+            "builtins (anna_self_edit/anna_google/anna_delegate) are dropped "
+            "+ logged at resolution, never invented."
+        ),
+    )
+    agents: dict[str, AgentGrants] = Field(
+        default_factory=dict,
+        description=(
+            "GRANTS (untrusted): per-slug capability grants. Each value may "
+            "only reference dir_pool / mcp_registry names. Layered under "
+            "persona frontmatter grants and over the global fallback "
+            "(extra_dirs / allowed_tools). See grants.py for precedence."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _check_reserved_registry_keys(self) -> "SubagentsConfig":
+        """Reject mcp_registry keys that collide with forbidden builtins.
+
+        ``anna_self_edit`` / ``anna_google`` / ``anna_delegate`` are reserved
+        for in-process servers that must never be sub-agent-mountable. An
+        operator keying a stdio/http registry entry under one of those names
+        would mount an external server under a reserved name; fail fast at
+        config-load so the operator gets immediate feedback rather than a
+        silent resolution-time drop. The forbidden set is sourced from
+        grants.py (single source of truth — avoid drift).
+        """
+        # Imported lazily: grants.py imports from config.py, so a module-level
+        # import here would be circular.
+        from anna.runtime.grants import FORBIDDEN_BUILTINS
+
+        collisions = sorted(set(self.mcp_registry) & FORBIDDEN_BUILTINS)
+        if collisions:
+            raise ValueError(
+                f"subagents.mcp_registry keys collide with reserved builtin "
+                f"names: {', '.join(collisions)}. These names are reserved "
+                f"for in-process servers and must not be sub-agent-mountable."
+            )
+        return self
 
 
 class SchedulerConfig(BaseModel):

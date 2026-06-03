@@ -208,6 +208,43 @@ checkpoint:
 There is no hot-reload — `checkpoint` edits take effect on the next
 `systemctl --user restart anna`.
 
+### Per-agent permissions and the MCP registry
+
+Sub-agents do not inherit ANNA's full tool surface. Each delegation runs
+with an *effective grant* — the concrete set of writable directories and
+MCP servers it can reach — resolved at spawn time from two trust tiers:
+
+- **Policy (trusted).** `subagents.dir_pool` (named write directories) and
+  `subagents.mcp_registry` (named MCP server specs) live in `anna.yaml`,
+  which the `anna_self_edit` MCP cannot rewrite. They are the operator's
+  blessed set of capabilities. Both are restart-gated — there is no hot
+  reload.
+- **Grants (untrusted).** `subagents.agents.<slug>` in `anna.yaml` and a
+  persona file's `grants:` frontmatter. A grant may only *reference* a
+  pool or registry name; an unknown name is dropped and logged with a
+  warning, never invented. A persona file therefore cannot widen its own
+  reach past what the operator already blessed.
+
+Resolution layers global fallback (`subagents.extra_dirs` /
+`subagents.allowed_tools`) under the `agents.<slug>` grant under the
+persona frontmatter grant. Precedence is **replace, not union**: a higher
+layer that specifies a field replaces the lower layer's value for that
+field; a field left empty passes the lower layer through.
+
+The security rationale is that policy and grants are kept on opposite
+sides of the trust boundary. Capability *definitions* live in `anna.yaml`
+(operator-only); capability *selections* live in grants (which ANNA can
+edit via `anna_self_edit`, or which a persona author can write), but a
+selection can only ever name an already-blessed pool entry. The forbidden
+builtins (`anna_self_edit`, `anna_google`, `anna_delegate`) are
+structurally unreachable: they are absent from the registry's builtin
+dispatch table, and a registry entry naming one is dropped at resolution.
+That is the same mechanism that enforces one-level-only delegation — a
+sub-agent can never be handed the delegate server.
+
+See the `subagents:` block in `anna.yaml.example` for `dir_pool`,
+`mcp_registry`, `agents`, and persona-frontmatter examples.
+
 ## Repository Layout
 
 ```

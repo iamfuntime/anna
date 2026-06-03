@@ -348,6 +348,14 @@ class ConversationWorker:
         # and the runtime gave us a GoogleClients handle. Workers spawned
         # in unit tests (no clients passed) and runs with google.enabled
         # false both fall through without the server.
+        # FUTURE SEAM: ANNA's main session still builds its MCP surface
+        # imperatively below (self_edit always, google/web/delegate
+        # conditionally). The per-agent registry/pool model lives in
+        # ``src/anna/runtime/grants.py`` (resolve_effective_grant +
+        # build_mcp_servers) and currently drives only sub-agents. The
+        # planned fast-follow migrates this main-session construction onto
+        # the same registry so the operator can curate ANNA's own server
+        # surface in anna.yaml. No behavior change here yet.
         mcp_servers: dict[str, Any] = {"anna_self_edit": self_edit_server}
         include_google = False
         if self._google_clients is not None and self._config.google.enabled:
@@ -443,6 +451,12 @@ class ConversationWorker:
             # take the supervisor lock, but Read/Glob over core/ is fine and
             # is the only way she can quote her own files back to the
             # operator.
+            # FUTURE SEAM: this hardcoded core/ mount is the main-session
+            # equivalent of a resolved write-dir grant. When the main
+            # session migrates onto the registry/pool model in
+            # ``src/anna/runtime/grants.py``, this becomes a dir_pool entry
+            # resolved through resolve_effective_grant. No behavior change
+            # yet.
             add_dirs=[str(anna_home / "core")],
         )
 
