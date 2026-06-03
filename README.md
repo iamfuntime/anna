@@ -174,6 +174,40 @@ Two files drive runtime behavior:
 - `anna.yaml` (chmod 644), holds non-secret config: log level, retention windows,
   watchdog cadence, transport enable flags. `anna.yaml.example` is the schema.
 
+### Checkpointing and resume
+
+ANNA persists every turn to a JSONL transcript and writes a markdown
+*checkpoint* (a compact session summary) to
+`<vault>/Conversations/<conv-key>/`. On worker spawn she rebuilds working
+memory from the two newest checkpoints. Two behaviors keep that working
+memory in sync with what was actually said, even across an ungraceful
+restart:
+
+- **Resume from transcript.** If the conversation's transcript tail is
+  newer than its latest checkpoint, a bounded RAW excerpt of that tail is
+  folded into the resume block on spawn. This covers the gap left by a
+  hard crash, OOM, or `kill -9` that never ran graceful closeout, because
+  it keys off transcript-vs-checkpoint mtime rather than a clean shutdown.
+- **Periodic checkpoint.** During an active conversation a lightweight
+  checkpoint (`checkpoint_kind: periodic`) is written between turns every
+  `every_turns` turns or `every_minutes` minutes, decoupled from eviction,
+  so a restart never loses more than a few turns of context.
+
+The `checkpoint:` block in `anna.yaml` tunes both (defaults shown):
+
+```yaml
+checkpoint:
+  periodic_enabled: true       # write periodic checkpoints during a conversation
+  every_turns: 6               # turns since last checkpoint before a periodic write
+  every_minutes: 10            # minutes since last checkpoint before a periodic write
+  resume_from_transcript: true # fold the unsaved transcript tail into the resume block
+  tail_max_turns: 8            # max turns of tail injected on resume
+  tail_max_tokens: 1500        # max tokens of tail injected on resume (newest-trimmed-first)
+```
+
+There is no hot-reload — `checkpoint` edits take effect on the next
+`systemctl --user restart anna`.
+
 ## Repository Layout
 
 ```

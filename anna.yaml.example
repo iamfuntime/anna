@@ -151,6 +151,37 @@ sessions:
   thread_gap_hours: 1
 
 # ============================================================
+# Checkpointing and resume
+#
+# Two coordinated behaviors keep working memory in sync with what was
+# actually said:
+#   resume-from-transcript  on worker spawn, if the conversation's JSONL
+#                           transcript tail is newer than its latest
+#                           checkpoint, a bounded RAW excerpt of that tail
+#                           is folded into the resume block. This covers
+#                           the gap left by a hard crash or kill -9 that
+#                           never ran graceful closeout.
+#   periodic checkpoint     during an active conversation a lightweight
+#                           checkpoint (checkpoint_kind: periodic) is
+#                           written between turns, decoupled from eviction,
+#                           so a restart never loses more than a few turns.
+# No hot-reload: edits take effect on the next restart.
+# ============================================================
+checkpoint:
+  # Write a lightweight periodic checkpoint during an active conversation.
+  periodic_enabled: true
+  # Turns since the last checkpoint before a periodic one is written.
+  every_turns: 6
+  # Minutes since the last checkpoint before a periodic one is written.
+  every_minutes: 10
+  # Fold the unsaved transcript tail into the resume block on spawn.
+  resume_from_transcript: true
+  # Max conversation turns of tail to inject into the resume block.
+  tail_max_turns: 8
+  # Max tokens of tail to inject into the resume block (newest-trimmed-first).
+  tail_max_tokens: 1500
+
+# ============================================================
 # Operator alerts
 #
 # When the watchdog restarts a transport, the operator should learn about

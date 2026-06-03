@@ -1043,6 +1043,20 @@ sessions:
   dm_gap_hours: 8
   thread_gap_hours: 1
 
+# Checkpointing and resume. resume_from_transcript folds the unsaved
+# transcript tail (newer than the latest checkpoint) into the resume
+# block on worker spawn, so a restart that skipped a checkpoint still
+# comes back with recent context. periodic_enabled writes a lightweight
+# checkpoint every every_turns / every_minutes during an active
+# conversation, decoupled from eviction. No hot-reload — restart to apply.
+checkpoint:
+  periodic_enabled: true
+  every_turns: 6
+  every_minutes: 10
+  resume_from_transcript: true
+  tail_max_turns: 8
+  tail_max_tokens: 1500
+
 admin:
   slack_channel_id: "{slack_admin}"
   telegram_chat_id: "{telegram_admin}"
