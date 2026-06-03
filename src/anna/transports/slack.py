@@ -15,7 +15,10 @@ from __future__ import annotations
 
 import asyncio
 import os
-from typing import Any
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+import httpx
 
 from anna.config import AnnaConfig
 from anna.log import get_logger
@@ -28,6 +31,9 @@ from anna.transports.base import (
 )
 from anna.transports.slack_thread_state import ThreadParticipation
 
+if TYPE_CHECKING:  # pragma: no cover - import-only for typing
+    from anna.runtime.voice import VoiceProcessor
+
 
 class SlackAdapter(ChannelAdapter):
     name = "slack"
@@ -37,6 +43,7 @@ class SlackAdapter(ChannelAdapter):
         *,
         config: AnnaConfig,
         thread_participation: ThreadParticipation,
+        voice: VoiceProcessor | None = None,
     ) -> None:
         self._config = config
         self._log = get_logger("anna.transport.slack")
@@ -47,6 +54,7 @@ class SlackAdapter(ChannelAdapter):
         self._client: Any = None
         self._connect_attempt = 0
         self._thread_participation = thread_participation
+        self._voice = voice
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -220,7 +228,7 @@ class SlackAdapter(ChannelAdapter):
 
     async def _dispatch_event(self, event: dict[str, Any], body: dict[str, Any]) -> None:
         try:
-            inbound = self._to_inbound_event(event)
+            inbound = await self._to_inbound_event(event)
         except Exception as exc:
             self._log.warning("channel.normalize_failed", channel="slack", error=str(exc))
             return
@@ -239,17 +247,27 @@ class SlackAdapter(ChannelAdapter):
             except Exception as exc:
                 self._log.error("router.handler_failed", error=str(exc))
 
-    def _to_inbound_event(self, event: dict[str, Any]) -> InboundEvent:
+    async def _to_inbound_event(self, event: dict[str, Any]) -> InboundEvent:
         channel_type = event.get("channel_type", "")
-        channel_id = event.get("channel", "")
         thread_ts = event.get("thread_ts")
-        event_ts = event.get("ts", "")
         user_id = event.get("user", "")
         text = event.get("text", "")
         is_dm = channel_type == "im"
         is_thread = bool(thread_ts)
 
         conv_key = self.conversation_key_for(event)
+
+        # Phase 2.5 voice: a Slack voice note arrives as a files[] entry
+        # with mode == "audio" / mimetype == "audio/webm". When present,
+        # rewrite the inbound text to the transcript (or a polite error
+        # one-liner) before dispatch so the worker sees a normal turn.
+        voice_file = self._detect_voice_file(event)
+        if voice_file is not None:
+            text = await self._handle_voice_inbound(
+                event=event,
+                voice_file=voice_file,
+                conv_key=conv_key,
+            )
 
         return InboundEvent(
             transport="slack",
@@ -261,6 +279,171 @@ class SlackAdapter(ChannelAdapter):
             is_thread=is_thread,
             raw=event,
         )
+
+    # ------------------------------------------------------------------
+    # Phase 2.5 voice inbound
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _detect_voice_file(event: dict[str, Any]) -> dict[str, Any] | None:
+        """Return the first audio ``files[]`` entry, or None.
+
+        A Slack voice note is a file with ``mode == "audio"`` (the codec
+        is WebM-Opus, ``mimetype == "audio/webm"``). Any other file
+        attachment (image, document, snippet) is ignored — voice is the
+        only attachment type this adapter rewrites.
+        """
+        files = event.get("files")
+        if not isinstance(files, list):
+            return None
+        for entry in files:
+            if not isinstance(entry, dict):
+                continue
+            mode = entry.get("mode")
+            mimetype = entry.get("mimetype", "")
+            if mode == "audio" or (
+                isinstance(mimetype, str) and mimetype.startswith("audio/")
+            ):
+                return entry
+        return None
+
+    async def _handle_voice_inbound(
+        self,
+        *,
+        event: dict[str, Any],
+        voice_file: dict[str, Any],
+        conv_key: str,
+    ) -> str:
+        """Download + transcribe an inbound Slack voice note.
+
+        Returns the text to carry on the ``InboundEvent``: the transcript
+        prefixed by the ``[voice transcript]:`` marker on success, or a
+        polite operator-facing one-liner on any failure (voice disabled,
+        download error, transcribe error) so the operator gets a reply
+        instead of a silent drop.
+        """
+        # Failure mode 1: audio arrives but voice inbound is off entirely
+        # (no VoiceProcessor wired, or inbound disabled in config).
+        if self._voice is None or not self._config.voice.inbound.enabled:
+            self._log.info(
+                "voice.inbound.disabled",
+                channel="slack",
+                conv_key=conv_key,
+            )
+            return (
+                "[voice transcript]: (voice transcription is off — please type "
+                "your message instead)"
+            )
+
+        message_id = str(event.get("ts", ""))
+        mime_type = voice_file.get("mimetype") or "audio/webm"
+
+        try:
+            audio_path = await self._download_slack_voice(
+                voice_file=voice_file,
+                conv_key=conv_key,
+                message_id=message_id,
+            )
+        except Exception as exc:
+            self._log.warning(
+                "voice.download_failed",
+                channel="slack",
+                conv_key=conv_key,
+                error=str(exc),
+            )
+            return (
+                "[voice transcript]: (couldn't download your voice note — "
+                "please try again or type your message)"
+            )
+
+        try:
+            transcript = await self._voice.transcribe_inbound(
+                audio_path=audio_path,
+                mime_type=mime_type,
+                conv_key=conv_key,
+                message_id=message_id,
+                duration_seconds=voice_file.get("duration_ms") / 1000.0
+                if isinstance(voice_file.get("duration_ms"), (int, float))
+                else None,
+            )
+        except Exception as exc:
+            self._log.warning(
+                "voice.transcribe_failed",
+                channel="slack",
+                conv_key=conv_key,
+                error=str(exc),
+            )
+            return (
+                "[voice transcript]: (couldn't transcribe your voice note — "
+                "please try again or type your message)"
+            )
+
+        # Stash the audio path + mime for the outbound TTS path (Pass 3)
+        # and mark the conv_key so voice-in can produce voice-out.
+        if self._config.voice.inbound.keep_audio_files:
+            event["voice_audio_path"] = str(audio_path)
+        event["voice_mime_type"] = mime_type
+        self._voice.mark_voice_inbound(conv_key=conv_key)
+
+        return f"[voice transcript]: {transcript}"
+
+    async def _download_slack_voice(
+        self,
+        *,
+        voice_file: dict[str, Any],
+        conv_key: str,
+        message_id: str,
+    ) -> Path:
+        """Download a Slack voice file to the per-conversation voice dir.
+
+        Uses ``url_private_download`` with a ``Bearer <bot_token>`` header
+        (Slack file CDN requires bot-token auth). Writes under
+        ``$ANNA_HOME/transcripts/voice/<safe(conv_key)>/<msg_id>.<ext>``
+        when ``keep_audio_files`` is true; otherwise to a tempfile the
+        VoiceProcessor unlinks after transcribe.
+        """
+        url = voice_file.get("url_private_download") or voice_file.get("url_private")
+        if not url:
+            raise RuntimeError("slack voice file has no download URL")
+
+        bot_token = os.environ.get("SLACK_BOT_TOKEN", "")
+        ext = self._voice_extension(voice_file)
+        dest = self._voice_dest_path(
+            conv_key=conv_key, message_id=message_id, ext=ext
+        )
+
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                url,
+                headers={"Authorization": f"Bearer {bot_token}"},
+            )
+            resp.raise_for_status()
+            dest.write_bytes(resp.content)
+        return dest
+
+    @staticmethod
+    def _voice_extension(voice_file: dict[str, Any]) -> str:
+        filetype = voice_file.get("filetype")
+        if isinstance(filetype, str) and filetype:
+            return filetype.lstrip(".")
+        mimetype = voice_file.get("mimetype", "")
+        if isinstance(mimetype, str) and "/" in mimetype:
+            return mimetype.split("/", 1)[1] or "webm"
+        return "webm"
+
+    def _voice_dest_path(
+        self, *, conv_key: str, message_id: str, ext: str
+    ) -> Path:
+        if self._config.voice.inbound.keep_audio_files:
+            safe = conv_key.replace(":", "-").replace("/", "_")
+            voice_dir = self._config.transcripts_dir / "voice" / safe
+            voice_dir.mkdir(parents=True, exist_ok=True)
+            return voice_dir / f"{message_id}.{ext}"
+        import tempfile
+
+        fd, name = tempfile.mkstemp(suffix=f".{ext}", prefix="anna-voice-")
+        os.close(fd)
+        return Path(name)
 
     @classmethod
     def conversation_key_for(cls, event: Any) -> str:

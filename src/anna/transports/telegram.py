@@ -17,7 +17,8 @@ from __future__ import annotations
 import asyncio
 import os
 import time
-from typing import Any
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 from anna.config import AnnaConfig
 from anna.log import get_logger
@@ -28,6 +29,9 @@ from anna.transports.base import (
     OutboundMessage,
     SignalHandle,
 )
+
+if TYPE_CHECKING:  # pragma: no cover - import-only for typing
+    from anna.runtime.voice import VoiceProcessor
 
 
 async def _typing_refresher(
@@ -70,13 +74,19 @@ async def _typing_refresher(
 class TelegramAdapter(ChannelAdapter):
     name = "telegram"
 
-    def __init__(self, *, config: AnnaConfig) -> None:
+    def __init__(
+        self,
+        *,
+        config: AnnaConfig,
+        voice: VoiceProcessor | None = None,
+    ) -> None:
         self._config = config
         self._log = get_logger("anna.transport.telegram")
         self._handlers: list[InboundHandler] = []
         self._application: Any = None
         self._updater_task: asyncio.Task[None] | None = None
         self._connect_attempt = 0
+        self._voice = voice
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -95,7 +105,10 @@ class TelegramAdapter(ChannelAdapter):
 
         self._application = ApplicationBuilder().token(token).build()
         self._application.add_handler(
-            MessageHandler(filters.TEXT & (~filters.COMMAND), self._on_message)
+            MessageHandler(
+                (filters.TEXT | filters.VOICE) & (~filters.COMMAND),
+                self._on_message,
+            )
         )
 
         await self._application.initialize()
@@ -189,7 +202,7 @@ class TelegramAdapter(ChannelAdapter):
 
     async def _on_message(self, update: Any, context: Any) -> None:
         try:
-            inbound = self._to_inbound_event(update)
+            inbound = await self._to_inbound_event(update)
         except Exception as exc:
             self._log.warning("channel.normalize_failed", channel="telegram", error=str(exc))
             return
@@ -207,7 +220,7 @@ class TelegramAdapter(ChannelAdapter):
             except Exception as exc:
                 self._log.error("router.handler_failed", error=str(exc))
 
-    def _to_inbound_event(self, update: Any) -> InboundEvent:
+    async def _to_inbound_event(self, update: Any) -> InboundEvent:
         message = update.message
         if message is None:
             raise ValueError("telegram update has no message")
@@ -224,6 +237,27 @@ class TelegramAdapter(ChannelAdapter):
             topic_id=getattr(message, "message_thread_id", None),
         )
 
+        raw: dict[str, Any] = {
+            "chat_id": chat.id,
+            "chat_type": chat.type,
+            "message_id": message.message_id,
+            "topic_id": getattr(message, "message_thread_id", None),
+        }
+
+        # Phase 2.5 voice: Telegram exposes voice as update.message.voice
+        # (a telegram.Voice with file_id, duration, mime_type "audio/ogg").
+        # When present, rewrite the inbound text to the transcript (or a
+        # polite error one-liner) before dispatch so the worker sees a
+        # normal text turn.
+        voice = getattr(message, "voice", None)
+        if voice is not None:
+            text = await self._handle_voice_inbound(
+                voice=voice,
+                conv_key=conv_key,
+                message_id=str(message.message_id),
+                raw=raw,
+            )
+
         return InboundEvent(
             transport="telegram",
             conversation_key=conv_key,
@@ -232,13 +266,131 @@ class TelegramAdapter(ChannelAdapter):
             text=text,
             is_dm=is_dm,
             is_thread=False,
-            raw={
-                "chat_id": chat.id,
-                "chat_type": chat.type,
-                "message_id": message.message_id,
-                "topic_id": getattr(message, "message_thread_id", None),
-            },
+            raw=raw,
         )
+
+    # ------------------------------------------------------------------
+    # Phase 2.5 voice inbound
+    # ------------------------------------------------------------------
+
+    async def _handle_voice_inbound(
+        self,
+        *,
+        voice: Any,
+        conv_key: str,
+        message_id: str,
+        raw: dict[str, Any],
+    ) -> str:
+        """Download + transcribe an inbound Telegram voice note.
+
+        Returns the text to carry on the ``InboundEvent``: the transcript
+        prefixed by the ``[voice transcript]:`` marker on success, or a
+        polite operator-facing one-liner on any failure so the operator
+        gets a reply instead of a silent drop.
+        """
+        # Failure mode 1: audio arrives but voice inbound is off entirely.
+        if self._voice is None or not self._config.voice.inbound.enabled:
+            self._log.info(
+                "voice.inbound.disabled",
+                channel="telegram",
+                conv_key=conv_key,
+            )
+            return (
+                "[voice transcript]: (voice transcription is off — please type "
+                "your message instead)"
+            )
+
+        mime_type = getattr(voice, "mime_type", None) or "audio/ogg"
+        duration = getattr(voice, "duration", None)
+        duration_seconds = float(duration) if duration is not None else None
+
+        try:
+            audio_path = await self._download_telegram_voice(
+                voice=voice,
+                conv_key=conv_key,
+                message_id=message_id,
+                mime_type=mime_type,
+            )
+        except Exception as exc:
+            self._log.warning(
+                "voice.download_failed",
+                channel="telegram",
+                conv_key=conv_key,
+                error=str(exc),
+            )
+            return (
+                "[voice transcript]: (couldn't download your voice note — "
+                "please try again or type your message)"
+            )
+
+        try:
+            transcript = await self._voice.transcribe_inbound(
+                audio_path=audio_path,
+                mime_type=mime_type,
+                conv_key=conv_key,
+                message_id=message_id,
+                duration_seconds=duration_seconds,
+            )
+        except Exception as exc:
+            self._log.warning(
+                "voice.transcribe_failed",
+                channel="telegram",
+                conv_key=conv_key,
+                error=str(exc),
+            )
+            return (
+                "[voice transcript]: (couldn't transcribe your voice note — "
+                "please try again or type your message)"
+            )
+
+        # Stash the audio path + mime for the outbound TTS path (Pass 3)
+        # and mark the conv_key so voice-in can produce voice-out.
+        if self._config.voice.inbound.keep_audio_files:
+            raw["voice_audio_path"] = str(audio_path)
+        raw["voice_mime_type"] = mime_type
+        self._voice.mark_voice_inbound(conv_key=conv_key)
+
+        return f"[voice transcript]: {transcript}"
+
+    async def _download_telegram_voice(
+        self,
+        *,
+        voice: Any,
+        conv_key: str,
+        message_id: str,
+        mime_type: str,
+    ) -> Path:
+        """Download a Telegram voice file via the existing PTB bot.
+
+        ``bot.get_file(file_id)`` resolves a download handle;
+        ``download_to_drive(custom_path=...)`` writes the bytes. Writes
+        under ``$ANNA_HOME/transcripts/voice/<safe(conv_key)>/<msg_id>.ogg``
+        when ``keep_audio_files`` is true; otherwise to a tempfile the
+        VoiceProcessor unlinks after transcribe.
+        """
+        ext = "ogg"
+        if isinstance(mime_type, str) and "/" in mime_type:
+            ext = mime_type.split("/", 1)[1] or "ogg"
+        dest = self._voice_dest_path(
+            conv_key=conv_key, message_id=message_id, ext=ext
+        )
+        bot_file = await self._application.bot.get_file(voice.file_id)
+        await bot_file.download_to_drive(custom_path=str(dest))
+        return dest
+
+    def _voice_dest_path(
+        self, *, conv_key: str, message_id: str, ext: str
+    ) -> Path:
+        if self._config.voice.inbound.keep_audio_files:
+            safe = conv_key.replace(":", "-").replace("/", "_")
+            voice_dir = self._config.transcripts_dir / "voice" / safe
+            voice_dir.mkdir(parents=True, exist_ok=True)
+            return voice_dir / f"{message_id}.{ext}"
+        import tempfile
+
+        fd, name = tempfile.mkstemp(suffix=f".{ext}", prefix="anna-voice-")
+        os.close(fd)
+        return Path(name)
 
     @staticmethod
     def _derive_key(*, chat_id: int, chat_type: str, topic_id: int | None) -> str:
