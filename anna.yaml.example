@@ -346,6 +346,64 @@ web:
   target_unit: anna.service
 
 # ============================================================
+# voice: Phase 2.5 voice messages.
+#
+# Inbound: Slack/Telegram voice notes are downloaded, transcribed,
+# and dispatched to the router as if they were typed (the text is
+# prefixed with a "[voice transcript]:" marker). Outbound: when the
+# most-recent inbound on a conversation was voice, the reply is
+# optionally synthesized back to a voice note.
+#
+# Both providers default to OpenAI (Whisper for STT, tts-1 for TTS)
+# and read the same OPENAI_API_KEY from ~/anna/.env. The CLI
+# transport, scheduler, and sub-agent runtime are voice-agnostic.
+# ============================================================
+voice:
+  inbound:
+    enabled: true
+    # whisper-openai (cloud, default) | faster-whisper-local (needs the
+    # voice-local extras: uv tool install 'anna[voice-local]').
+    provider: whisper-openai
+    # Env var holding the provider key; ignored by the local provider.
+    api_key_env: OPENAI_API_KEY
+    # Provider-specific model id.
+    model: whisper-1
+    # Persist downloaded audio under ~/anna/transcripts/voice/ so you can
+    # re-listen or re-transcribe; false runs against a tempfile that is
+    # unlinked immediately after the transcribe call.
+    keep_audio_files: true
+    # 10-minute hard cap; longer clips reject before the provider call.
+    max_duration_seconds: 600
+    # 25 MB (OpenAI cap); larger clips reject before the provider call.
+    max_audio_size_bytes: 26214400
+    # Language hint; null lets the provider auto-detect per clip.
+    hint_language: en
+    # Per-transcribe wall-clock bound.
+    timeout_seconds: 60
+    # Extra attempts on transient HTTP 5xx / timeout only (not 4xx /
+    # unsupported codec).
+    retry_attempts: 2
+  outbound:
+    # Voice-in produces voice-out by default.
+    enabled: true
+    # Which adapters synthesize voice replies.
+    transports:
+      - slack
+      - telegram
+    provider: openai-tts
+    api_key_env: OPENAI_API_KEY
+    # tts-1 (standard, ~$0.015/1k chars) | tts-1-hd (2x cost).
+    model: tts-1
+    voice_id: alloy
+    # Voice-in produces voice-only-out; text-in still produces text-out.
+    voice_only: true
+    # TTL on the per-conversation "last inbound was voice" cache.
+    recent_voice_window_seconds: 600
+    # Replies longer than this fall through to text-only.
+    max_synthesis_chars: 4000
+    timeout_seconds: 30
+
+# ============================================================
 # identities: Phase 2 §5 cross-transport identity aliasing.
 #
 # DO NOT UNCOMMENT. Identity aliasing across slack/telegram/cli is

@@ -549,6 +549,145 @@ class WebDashboardConfig(BaseModel):
         return v
 
 
+class VoiceInboundConfig(BaseModel):
+    """Inbound voice (speech-to-text) config.
+
+    Phase 2.5 voice messages. When ``enabled`` is true and a Slack or
+    Telegram inbound carries an audio payload, the adapter downloads the
+    file, calls the configured transcription provider, and substitutes the
+    returned transcript into the ``InboundEvent.text`` prefixed by a
+    ``[voice transcript]:`` marker.
+
+    * ``provider`` — ``whisper-openai`` (cloud, default) or
+      ``faster-whisper-local`` (local model behind the ``voice-local``
+      extras group). Providers are explicitly named; there is no plugin
+      discovery.
+    * ``api_key_env`` — env var holding the provider key (ignored by the
+      local provider).
+    * ``model`` — provider-specific model id (``whisper-1`` for OpenAI).
+    * ``keep_audio_files`` — when true, persist the downloaded audio under
+      ``$ANNA_HOME/transcripts/voice/`` so the operator can re-listen or
+      re-transcribe; when false the transcribe call runs against a
+      tempfile that is unlinked immediately after the call returns.
+    * ``max_duration_seconds`` / ``max_audio_size_bytes`` — hard caps;
+      clips over either are rejected before the provider call.
+    * ``hint_language`` — language hint passed to the provider; null lets
+      the provider auto-detect.
+    * ``timeout_seconds`` — per-transcribe ``asyncio.wait_for`` bound.
+    * ``retry_attempts`` — extra attempts on transient HTTP 5xx / timeout
+      only; 4xx and unsupported-codec errors do not retry.
+    """
+
+    enabled: bool = True
+    provider: Literal["whisper-openai", "faster-whisper-local"] = "whisper-openai"
+    api_key_env: str = "OPENAI_API_KEY"
+    model: str = "whisper-1"
+    keep_audio_files: bool = True
+    max_duration_seconds: int = 600
+    max_audio_size_bytes: int = 26_214_400  # 25 MB (OpenAI cap)
+    hint_language: str | None = "en"
+    timeout_seconds: int = 60
+    retry_attempts: int = 2
+
+    @field_validator("max_duration_seconds")
+    @classmethod
+    def _duration_positive(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError("voice.inbound.max_duration_seconds must be > 0")
+        return v
+
+    @field_validator("max_audio_size_bytes")
+    @classmethod
+    def _size_positive(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError("voice.inbound.max_audio_size_bytes must be > 0")
+        return v
+
+    @field_validator("retry_attempts")
+    @classmethod
+    def _retries_non_negative(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("voice.inbound.retry_attempts must be >= 0")
+        return v
+
+
+def _default_voice_transports() -> list[Literal["slack", "telegram"]]:
+    """Default outbound-voice allowlist: both buffered transports.
+
+    A named helper (rather than an inline lambda) so the return type is
+    the Literal list mypy expects for the field's default_factory.
+    """
+    return ["slack", "telegram"]
+
+
+class VoiceOutboundConfig(BaseModel):
+    """Outbound voice (text-to-speech) config.
+
+    Phase 2.5 voice messages. When ``enabled`` is true and the worker's
+    reply targets a conv_key whose most-recent inbound was voice (within
+    ``recent_voice_window_seconds``), the adapter synthesizes the reply
+    and posts it as a voice file. Off by default per-transport via the
+    ``transports`` allowlist.
+
+    * ``provider`` — ``openai-tts`` (the only provider that ships in v1).
+    * ``voice_id`` — provider voice id (``alloy`` is neutral, operator
+      tunable).
+    * ``voice_only`` — voice-in produces voice-only-out; text-in still
+      produces text-out.
+    * ``recent_voice_window_seconds`` — TTL on the per-conv_key
+      "last inbound was voice" cache.
+    * ``max_synthesis_chars`` — replies longer than this fall through to
+      text-only.
+    """
+
+    enabled: bool = True
+    transports: list[Literal["slack", "telegram"]] = Field(
+        default_factory=lambda: _default_voice_transports()
+    )
+    provider: Literal["openai-tts"] = "openai-tts"
+    api_key_env: str = "OPENAI_API_KEY"
+    model: str = "tts-1"
+    voice_id: str = "alloy"
+    voice_only: bool = True
+    recent_voice_window_seconds: int = 600
+    max_synthesis_chars: int = 4000
+    timeout_seconds: int = 30
+
+    @field_validator("recent_voice_window_seconds")
+    @classmethod
+    def _window_positive(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError("voice.outbound.recent_voice_window_seconds must be > 0")
+        return v
+
+    @field_validator("max_synthesis_chars")
+    @classmethod
+    def _max_chars_positive(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError("voice.outbound.max_synthesis_chars must be > 0")
+        return v
+
+
+class VoiceConfig(BaseModel):
+    """Phase 2.5 voice-messages top-level block.
+
+    Voice is a runtime-level capability the Slack and Telegram adapters
+    consume: inbound audio is transcribed upstream of the router so the
+    worker sees a normal text event, and outbound replies are optionally
+    synthesized back to a voice note. The CLI transport, scheduler, and
+    sub-agent runtime are voice-agnostic and unaffected.
+
+    Both sub-blocks default to a sensible enabled state so an existing
+    config without a ``voice:`` section still validates with voice on;
+    the operator flips ``inbound.enabled`` / ``outbound.enabled`` to opt
+    out. See Inbox/2026-06-02-ANNA-Voice-Messages-Plan.md for the full
+    design.
+    """
+
+    inbound: VoiceInboundConfig = Field(default_factory=VoiceInboundConfig)
+    outbound: VoiceOutboundConfig = Field(default_factory=VoiceOutboundConfig)
+
+
 class IdentityAliasEntry(BaseModel):
     """Phase 2 §5 identity alias.
 
@@ -606,6 +745,7 @@ class AnnaConfig(BaseModel):
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
     subagents: SubagentsConfig = Field(default_factory=SubagentsConfig)
     web: WebDashboardConfig = Field(default_factory=WebDashboardConfig)
+    voice: VoiceConfig = Field(default_factory=VoiceConfig)
     identities: list[IdentityAliasEntry] = Field(default_factory=list)
 
     # Derived runtime paths. Not in the YAML file. ANNA_HOME from .env wins,
@@ -640,6 +780,18 @@ class AnnaConfig(BaseModel):
         — see Inbox/2026-06-01-ANNA-Phase-2-Subagent-Runtime-Plan.md.
         """
         return self.transcripts_dir / self.subagents.transcript_subdir
+
+    @property
+    def voice_dir(self) -> Path:
+        """Per-conversation voice-audio root.
+
+        Inbound voice notes persist under
+        ``$ANNA_HOME/transcripts/voice/<safe(conv_key)>/<msg_id>.<ext>``
+        when ``voice.inbound.keep_audio_files`` is true. Treated as a
+        transcript artifact and swept on the transcript retention
+        schedule — see Inbox/2026-06-02-ANNA-Voice-Messages-Plan.md.
+        """
+        return self.transcripts_dir / "voice"
 
     @property
     def core_dir(self) -> Path:

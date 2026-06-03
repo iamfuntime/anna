@@ -11,6 +11,9 @@ from anna.config import (
     AnnaConfig,
     IdentityAliasEntry,
     RuntimeVisibilityConfig,
+    VoiceConfig,
+    VoiceInboundConfig,
+    VoiceOutboundConfig,
     WebDashboardConfig,
     load_config,
 )
@@ -330,6 +333,159 @@ def test_example_yaml_includes_web_block() -> None:
     assert cfg.web.host == "127.0.0.1"
     assert cfg.web.port == 8765
     assert cfg.web.target_unit == "anna.service"
+
+
+def test_voice_block_parses() -> None:
+    """A full voice: block round-trips through the model."""
+    raw = {
+        "voice": {
+            "inbound": {
+                "enabled": True,
+                "provider": "whisper-openai",
+                "api_key_env": "OPENAI_API_KEY",
+                "model": "whisper-1",
+                "keep_audio_files": True,
+                "max_duration_seconds": 600,
+                "max_audio_size_bytes": 26_214_400,
+                "hint_language": "en",
+                "timeout_seconds": 60,
+                "retry_attempts": 2,
+            },
+            "outbound": {
+                "enabled": True,
+                "transports": ["slack", "telegram"],
+                "provider": "openai-tts",
+                "api_key_env": "OPENAI_API_KEY",
+                "model": "tts-1",
+                "voice_id": "alloy",
+                "voice_only": True,
+                "recent_voice_window_seconds": 600,
+                "max_synthesis_chars": 4000,
+                "timeout_seconds": 30,
+            },
+        }
+    }
+    cfg = AnnaConfig.model_validate(raw)
+    assert isinstance(cfg.voice, VoiceConfig)
+    assert isinstance(cfg.voice.inbound, VoiceInboundConfig)
+    assert isinstance(cfg.voice.outbound, VoiceOutboundConfig)
+    assert cfg.voice.inbound.provider == "whisper-openai"
+    assert cfg.voice.inbound.model == "whisper-1"
+    assert cfg.voice.inbound.max_audio_size_bytes == 26_214_400
+    assert cfg.voice.inbound.hint_language == "en"
+    assert cfg.voice.outbound.transports == ["slack", "telegram"]
+    assert cfg.voice.outbound.voice_id == "alloy"
+    assert cfg.voice.outbound.voice_only is True
+
+
+def test_voice_defaults_when_block_omitted() -> None:
+    """A config with no voice: block uses VoiceConfig defaults."""
+    raw = {"auth": {"mode": "max"}}
+    cfg = AnnaConfig.model_validate(raw)
+    assert isinstance(cfg.voice, VoiceConfig)
+    # Inbound defaults.
+    assert cfg.voice.inbound.enabled is True
+    assert cfg.voice.inbound.provider == "whisper-openai"
+    assert cfg.voice.inbound.api_key_env == "OPENAI_API_KEY"
+    assert cfg.voice.inbound.model == "whisper-1"
+    assert cfg.voice.inbound.keep_audio_files is True
+    assert cfg.voice.inbound.max_duration_seconds == 600
+    assert cfg.voice.inbound.max_audio_size_bytes == 26_214_400
+    assert cfg.voice.inbound.hint_language == "en"
+    assert cfg.voice.inbound.timeout_seconds == 60
+    assert cfg.voice.inbound.retry_attempts == 2
+    # Outbound defaults.
+    assert cfg.voice.outbound.enabled is True
+    assert cfg.voice.outbound.transports == ["slack", "telegram"]
+    assert cfg.voice.outbound.provider == "openai-tts"
+    assert cfg.voice.outbound.model == "tts-1"
+    assert cfg.voice.outbound.voice_id == "alloy"
+    assert cfg.voice.outbound.voice_only is True
+    assert cfg.voice.outbound.recent_voice_window_seconds == 600
+    assert cfg.voice.outbound.max_synthesis_chars == 4000
+    assert cfg.voice.outbound.timeout_seconds == 30
+
+
+def test_voice_direct_instantiation_defaults() -> None:
+    """VoiceConfig() with no args matches the documented defaults."""
+    vc = VoiceConfig()
+    assert vc.inbound.enabled is True
+    assert vc.outbound.enabled is True
+    assert vc.inbound.hint_language == "en"
+
+
+def test_voice_hint_language_accepts_null() -> None:
+    """hint_language: null lets the provider auto-detect."""
+    raw = {"voice": {"inbound": {"hint_language": None}}}
+    cfg = AnnaConfig.model_validate(raw)
+    assert cfg.voice.inbound.hint_language is None
+
+
+def test_voice_inbound_disabled_persists() -> None:
+    raw = {"voice": {"inbound": {"enabled": False}}}
+    cfg = AnnaConfig.model_validate(raw)
+    assert cfg.voice.inbound.enabled is False
+    # Outbound still defaults on.
+    assert cfg.voice.outbound.enabled is True
+
+
+def test_voice_inbound_provider_validation() -> None:
+    """An unknown inbound provider is rejected by the Literal."""
+    with pytest.raises(Exception):
+        AnnaConfig.model_validate({"voice": {"inbound": {"provider": "bogus"}}})
+
+
+def test_voice_outbound_provider_validation() -> None:
+    with pytest.raises(Exception):
+        AnnaConfig.model_validate({"voice": {"outbound": {"provider": "bogus"}}})
+
+
+def test_voice_outbound_transport_validation() -> None:
+    """The transports allowlist rejects unknown adapters (e.g. cli)."""
+    with pytest.raises(Exception):
+        AnnaConfig.model_validate({"voice": {"outbound": {"transports": ["cli"]}}})
+
+
+def test_voice_inbound_numeric_field_validation() -> None:
+    for field, bad in (
+        ("max_duration_seconds", 0),
+        ("max_duration_seconds", -1),
+        ("max_audio_size_bytes", 0),
+        ("max_audio_size_bytes", -5),
+        ("retry_attempts", -1),
+    ):
+        with pytest.raises(Exception):
+            AnnaConfig.model_validate({"voice": {"inbound": {field: bad}}})
+
+
+def test_voice_outbound_numeric_field_validation() -> None:
+    for field, bad in (
+        ("recent_voice_window_seconds", 0),
+        ("recent_voice_window_seconds", -1),
+        ("max_synthesis_chars", 0),
+        ("max_synthesis_chars", -10),
+    ):
+        with pytest.raises(Exception):
+            AnnaConfig.model_validate({"voice": {"outbound": {field: bad}}})
+
+
+def test_voice_dir_derived() -> None:
+    """The derived voice_dir joins anna_home + transcripts + voice."""
+    cfg = AnnaConfig.model_validate({"auth": {"mode": "max"}})
+    assert cfg.voice_dir == cfg.transcripts_dir / "voice"
+
+
+def test_example_yaml_includes_voice_block() -> None:
+    """Confirms anna.yaml.example's voice: block round-trips through the model."""
+    raw = yaml.safe_load(EXAMPLE_PATH.read_text(encoding="utf-8"))
+    cfg = AnnaConfig.model_validate(raw)
+    assert cfg.voice.inbound.enabled is True
+    assert cfg.voice.inbound.provider == "whisper-openai"
+    assert cfg.voice.inbound.model == "whisper-1"
+    assert cfg.voice.outbound.enabled is True
+    assert cfg.voice.outbound.provider == "openai-tts"
+    assert cfg.voice.outbound.voice_id == "alloy"
+    assert cfg.voice.outbound.transports == ["slack", "telegram"]
 
 
 def test_anna_config_identities_round_trips_through_model_dump() -> None:

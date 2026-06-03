@@ -78,6 +78,13 @@ dependencies = [
     "jinja2>=3.1",
     "ruamel.yaml>=0.18",
     "dbus-next>=0.2.3",
+    # Phase 2.5 voice messages: the OpenAI SDK backs both the default
+    # inbound transcription provider (Whisper, /v1/audio/transcriptions)
+    # and the default outbound TTS provider (tts-1, /v1/audio/speech).
+    # The actual HTTP calls go through httpx (already pinned above); the
+    # openai dep is kept for its typed error classes and forward-compat
+    # with the SDK's native client.
+    "openai>=1.40",
 ]
 
 [project.optional-dependencies]
@@ -86,6 +93,14 @@ dev = [
     "pytest-asyncio>=0.23",
     "ruff>=0.4",
     "mypy>=1.10",
+]
+# Phase 2.5 voice messages: local (offline) inbound transcription. Pulls
+# the faster-whisper model runner and its ctranslate2 backend. Install
+# with `uv tool install 'anna[voice-local]'` and set
+# voice.inbound.provider: faster-whisper-local in anna.yaml.
+voice-local = [
+    "faster-whisper>=1.0",
+    "ctranslate2>=4.0",
 ]
 
 [project.scripts]
