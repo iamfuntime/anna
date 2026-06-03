@@ -28,6 +28,11 @@ from anna.tools.web_tools import WebTools
 from anna.runtime.visibility import NULL_VISIBILITY, VisibilityCallbacks
 from anna.transports.base import InboundEvent, OutboundMessage, SignalHandle
 from anna.vault.checkpoint import list_recent_checkpoints, write_checkpoint
+from anna.vault.transcript_resume import (
+    latest_checkpoint_mtime,
+    render_tail_block,
+    transcript_tail_since,
+)
 
 if TYPE_CHECKING:
     from anna.runtime.schedule_store import ScheduleStore
@@ -520,6 +525,29 @@ class ConversationWorker:
 
         Returns the formatted block (with leading ``# Recent checkpoints``
         heading), or an empty string when no checkpoints exist.
+
+        When ``checkpoint.resume_from_transcript`` is enabled (and the worker
+        is not ephemeral), a bounded RAW tail of the JSONL transcript newer
+        than the latest checkpoint is appended after the checkpoint block.
+        This covers the gap left by a hard crash / OOM-kill / ``kill -9``
+        that never ran graceful closeout. The tail addition is fully
+        defensive: any failure falls back to the checkpoint block alone.
+        """
+        checkpoint_block = self._assemble_checkpoint_block(vault_root)
+        tail_block = self._assemble_transcript_tail_block(vault_root)
+        if not tail_block:
+            return checkpoint_block
+        if not checkpoint_block:
+            return tail_block
+        # Non-empty tail: delimit it from the checkpoint block with a blank
+        # line so the two sections read cleanly.
+        return f"{checkpoint_block}\n\n{tail_block}"
+
+    def _assemble_checkpoint_block(self, vault_root: Path) -> str:
+        """Read the two newest checkpoints for this conv_key and format them.
+
+        Returns the formatted block (with leading ``# Recent checkpoints``
+        heading), or an empty string when no checkpoints exist.
         """
         try:
             paths = list_recent_checkpoints(
@@ -555,6 +583,31 @@ class ConversationWorker:
             return ""
         body = "\n\n".join(parts)
         return f"# Recent checkpoints (resume context)\n{body}"
+
+    def _assemble_transcript_tail_block(self, vault_root: Path) -> str:
+        """Render the unsaved transcript tail since the latest checkpoint.
+
+        Gated on ``checkpoint.resume_from_transcript`` and ``not
+        self._ephemeral``. Returns the rendered tail block, or "" when the
+        feature is off, the worker is ephemeral, there is no fresh tail, or
+        anything goes wrong. Never raises into prompt assembly.
+        """
+        ckpt_cfg = self._config.checkpoint
+        if not ckpt_cfg.resume_from_transcript or self._ephemeral:
+            return ""
+        try:
+            since_mtime = latest_checkpoint_mtime(vault_root, self.conversation_key)
+            tail = transcript_tail_since(
+                transcripts_dir=self._config.transcripts_dir,
+                conv_key=self.conversation_key,
+                since_mtime=since_mtime,
+                max_turns=ckpt_cfg.tail_max_turns,
+                max_tokens=ckpt_cfg.tail_max_tokens,
+            )
+            return render_tail_block(tail)
+        except Exception as exc:  # noqa: BLE001 — never break prompt assembly
+            self._log.warning("worker.resume.tail_failed", error=str(exc))
+            return ""
 
     async def _closeout(self) -> None:
         """Per v3 §6: write a checkpoint, then run eviction on every core file.
