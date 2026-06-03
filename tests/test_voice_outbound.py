@@ -100,10 +100,11 @@ class _FakeApplication:
 
 
 def _slack_adapter(
-    tmp_path: Path, *, voice: _FakeVoice | None
+    tmp_path: Path, *, voice: _FakeVoice | None, voice_only: bool = True
 ) -> tuple[SlackAdapter, _StubSlackClient]:
     cfg = AnnaConfig()
     object.__setattr__(cfg, "anna_home", tmp_path / "anna_home")
+    cfg.voice.outbound.voice_only = voice_only
     state_path = tmp_path / "anna_home" / "state" / "slack_thread_participation.jsonl"
     tp = ThreadParticipation(state_path=state_path)
     adapter = SlackAdapter(config=cfg, thread_participation=tp, voice=voice)
@@ -129,20 +130,21 @@ def _telegram_adapter(
 # ---------------------------------------------------------------------------
 
 
-async def test_slack_posts_text_and_audio_when_synth_returns_bytes(
+async def test_slack_voice_only_uploads_audio_and_suppresses_text(
     tmp_path: Path,
 ) -> None:
+    """With ``voice_only=True`` (the live default), a successful synth uploads
+    the inline audio and suppresses the text post — the desired audio-only
+    reply on Slack."""
     voice = _FakeVoice((b"OggS-bytes", "audio/ogg", ".ogg"))
-    adapter, client = _slack_adapter(tmp_path, voice=voice)
+    adapter, client = _slack_adapter(tmp_path, voice=voice, voice_only=True)
 
     await adapter.send(
         OutboundMessage(conversation_key="slack:dm:U1", text="here you go")
     )
 
-    # Text always posts.
-    assert len(client.post_calls) == 1
-    assert client.post_calls[0]["text"] == "here you go"
-    # Audio additionally uploaded.
+    # voice_only + synth success -> audio only, no text post.
+    assert client.post_calls == []
     assert len(client.upload_calls) == 1
     up = client.upload_calls[0]
     assert up["content"] == b"OggS-bytes"
@@ -154,6 +156,63 @@ async def test_slack_posts_text_and_audio_when_synth_returns_bytes(
     assert voice.synth_calls[0]["transport"] == "slack"
 
 
+async def test_slack_posts_text_and_audio_when_not_voice_only(
+    tmp_path: Path,
+) -> None:
+    """With ``voice_only=False`` the legacy behavior is preserved: text posts
+    AND audio uploads on a successful synth."""
+    voice = _FakeVoice((b"OggS-bytes", "audio/ogg", ".ogg"))
+    adapter, client = _slack_adapter(tmp_path, voice=voice, voice_only=False)
+
+    await adapter.send(
+        OutboundMessage(conversation_key="slack:dm:U1", text="here you go")
+    )
+
+    # Text posts.
+    assert len(client.post_calls) == 1
+    assert client.post_calls[0]["text"] == "here you go"
+    # Audio additionally uploaded.
+    assert len(client.upload_calls) == 1
+    assert client.upload_calls[0]["content"] == b"OggS-bytes"
+
+
+async def test_slack_voice_failure_falls_back_to_text(tmp_path: Path) -> None:
+    """With ``voice_only=True``, a failed synth (returns None) must still post
+    the text as a fallback so the operator gets a reply."""
+    voice = _FakeVoice(None)
+    adapter, client = _slack_adapter(tmp_path, voice=voice, voice_only=True)
+
+    await adapter.send(
+        OutboundMessage(conversation_key="slack:dm:U1", text="fallback text")
+    )
+
+    assert client.upload_calls == []
+    assert len(client.post_calls) == 1
+    assert client.post_calls[0]["text"] == "fallback text"
+
+
+async def test_slack_voice_only_marks_thread_participation(tmp_path: Path) -> None:
+    """A voice-only send in a channel thread must still mark thread
+    participation, even though the text post is suppressed."""
+    voice = _FakeVoice((b"OggS-bytes", "audio/ogg", ".ogg"))
+    adapter, client = _slack_adapter(tmp_path, voice=voice, voice_only=True)
+
+    await adapter.send(
+        OutboundMessage(
+            conversation_key="slack:ch:C0CHANNEL1:1716832700.000700",
+            text="spoken in thread",
+        )
+    )
+
+    # Audio uploaded, text suppressed.
+    assert client.post_calls == []
+    assert len(client.upload_calls) == 1
+    # Participation still marked despite the suppressed text post.
+    assert adapter._thread_participation.has(
+        channel_id="C0CHANNEL1", thread_ts="1716832700.000700"
+    )
+
+
 async def test_slack_voice_upload_resolves_user_id_to_dm_channel(
     tmp_path: Path,
 ) -> None:
@@ -161,7 +220,7 @@ async def test_slack_voice_upload_resolves_user_id_to_dm_channel(
     uploading audio. Regression: the upload API rejects user IDs (``U``/``W``)
     with ``channel_id must match ^[CGDZ][A-Z0-9]{8,}$``."""
     voice = _FakeVoice((b"OggS-bytes", "audio/ogg", ".ogg"))
-    adapter, client = _slack_adapter(tmp_path, voice=voice)
+    adapter, client = _slack_adapter(tmp_path, voice=voice, voice_only=False)
 
     await adapter.send(
         OutboundMessage(conversation_key="slack:dm:USP2QLB41", text="spoken")

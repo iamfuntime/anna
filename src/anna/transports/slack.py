@@ -120,46 +120,57 @@ class SlackAdapter(ChannelAdapter):
         if self._client is None:
             raise RuntimeError("Slack adapter not started")
         channel, thread_ts = self._channel_and_thread_for(message.conversation_key)
-        try:
-            kwargs: dict[str, Any] = {"channel": channel, "text": message.text}
-            if thread_ts:
-                kwargs["thread_ts"] = thread_ts
-            if message.structured and "blocks" in message.structured:
-                kwargs["blocks"] = message.structured["blocks"]
-            response = await self._client.chat_postMessage(**kwargs)
-            self._log.debug(
-                "channel.message.sent",
-                channel="slack",
-                conv_key=message.conversation_key,
-                text_length=len(message.text),
-                ts=response.get("ts"),
-            )
-        except Exception as exc:
-            self._log.error(
-                "channel.send_failed",
-                channel="slack",
-                conv_key=message.conversation_key,
-                text_length=len(message.text),
-                error=str(exc),
-            )
-            raise
 
-        # If we just posted in a channel thread, mark participation so
-        # future un-@'d replies in that thread route to us. DMs are
-        # already conversational; their conv_keys start with
-        # ``slack:dm:`` and have no thread_ts so they're skipped here.
+        # Phase 2.5 outbound voice: attempt a voice upload first when the
+        # recent inbound on this conv_key was voice and outbound is enabled
+        # for Slack. On success, suppress the text post when ``voice_only``
+        # is set (audio-only reply); otherwise post both. On any voice
+        # failure, fall through cleanly to the normal text post below. This
+        # mirrors the Telegram adapter's ``voice_only`` gating exactly.
+        audio_sent = await self._maybe_upload_voice(
+            message=message, channel=channel, thread_ts=thread_ts
+        )
+
+        # Post the text unless audio landed AND voice_only is set. When
+        # voice_only is false the text always posts (legacy behavior, plus
+        # audio); when audio failed/declined the text is the fallback so the
+        # operator still gets a reply.
+        if not (audio_sent and self._config.voice.outbound.voice_only):
+            try:
+                kwargs: dict[str, Any] = {"channel": channel, "text": message.text}
+                if thread_ts:
+                    kwargs["thread_ts"] = thread_ts
+                if message.structured and "blocks" in message.structured:
+                    kwargs["blocks"] = message.structured["blocks"]
+                response = await self._client.chat_postMessage(**kwargs)
+                self._log.debug(
+                    "channel.message.sent",
+                    channel="slack",
+                    conv_key=message.conversation_key,
+                    text_length=len(message.text),
+                    ts=response.get("ts"),
+                )
+            except Exception as exc:
+                self._log.error(
+                    "channel.send_failed",
+                    channel="slack",
+                    conv_key=message.conversation_key,
+                    text_length=len(message.text),
+                    error=str(exc),
+                )
+                raise
+
+        # Mark thread participation once a reply has actually landed —
+        # either the audio upload or the text post above. A send failure
+        # raises before reaching here, so we never mark a thread we failed
+        # to post in. This still fires on a voice-only send (audio landed,
+        # text suppressed). DMs are already conversational; their conv_keys
+        # start with ``slack:dm:`` and have no thread_ts so they're skipped.
         if thread_ts and not message.conversation_key.startswith("slack:dm:"):
             await self._thread_participation.mark(
                 channel_id=channel,
                 thread_ts=thread_ts,
             )
-
-        # Phase 2.5 outbound voice: Slack always posts the text above
-        # (Slack desktop's voice-note UX is poor), and additionally uploads
-        # the synthesized audio when the recent inbound on this conv_key was
-        # voice and outbound is enabled for Slack. The text already landed,
-        # so an upload failure just logs.
-        await self._maybe_upload_voice(message=message, channel=channel, thread_ts=thread_ts)
 
     async def _maybe_upload_voice(
         self,
@@ -167,18 +178,20 @@ class SlackAdapter(ChannelAdapter):
         message: OutboundMessage,
         channel: str,
         thread_ts: str | None,
-    ) -> None:
-        """Synthesize + upload an OGG voice note alongside the posted text.
+    ) -> bool:
+        """Synthesize + upload an OGG voice note for this reply.
 
-        No-op when no VoiceProcessor is wired or
+        Returns ``True`` when a voice note was successfully uploaded (so the
+        caller can suppress the text post when ``voice_only``), ``False``
+        otherwise. Returns ``False`` when no VoiceProcessor is wired or
         :meth:`VoiceProcessor.maybe_synthesize_outbound` declines (outbound
         disabled, Slack not in the allowlist, text too long, no recent voice
-        inbound, or TTS failure). The text post already happened in
-        :meth:`send`, so any upload failure degrades to text-only and only
-        logs.
+        inbound, or TTS failure), as well as when DM-channel resolution or the
+        upload itself raises — on any failure the caller falls through to the
+        normal text post so the operator still gets a reply.
         """
         if self._voice is None:
-            return
+            return False
         try:
             synth = await self._voice.maybe_synthesize_outbound(
                 text=message.text,
@@ -192,9 +205,9 @@ class SlackAdapter(ChannelAdapter):
                 conv_key=message.conversation_key,
                 error=str(exc),
             )
-            return
+            return False
         if synth is None:
-            return
+            return False
         audio_bytes, _mime_type, extension = synth
 
         # ``chat.postMessage`` accepts a bare user ID as ``channel`` and opens
@@ -215,7 +228,7 @@ class SlackAdapter(ChannelAdapter):
                     conv_key=message.conversation_key,
                     error=str(exc),
                 )
-                return
+                return False
 
         upload_kwargs: dict[str, Any] = {
             "channel": upload_channel,
@@ -232,14 +245,17 @@ class SlackAdapter(ChannelAdapter):
                 conv_key=message.conversation_key,
                 audio_bytes=len(audio_bytes),
             )
+            return True
         except Exception as exc:
-            # Text already posted in send(); the audio is a best-effort add.
+            # Upload failed: return False so send() falls back to the text
+            # post (the operator still gets a reply).
             self._log.warning(
                 "voice.outbound.upload_failed",
                 channel="slack",
                 conv_key=message.conversation_key,
                 error=str(exc),
             )
+            return False
 
     def _channel_and_thread_for(self, conv_key: str) -> tuple[str, str | None]:
         """Recover the Slack channel and thread_ts from a conversation_key.
