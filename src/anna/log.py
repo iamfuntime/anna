@@ -305,3 +305,40 @@ def sweep_transcript_retention(transcripts_dir: Path, retention_days: int) -> tu
                         except OSError:
                             pass
     return (gzipped, deleted)
+
+
+def sweep_voice_retention(transcripts_dir: Path, retention_days: int) -> int:
+    """Delete persisted voice audio files older than retention_days.
+
+    Voice notes live under ``$ANNA_HOME/transcripts/voice/<conv_key>/
+    <msg_id>.{ogg,webm,...}`` (Phase 2.5). They are treated as transcript
+    artifacts but, unlike the JSONL transcripts, are not gzipped — Opus is
+    already compressed, so the files delete outright at ``retention_days``
+    (the same window as :func:`sweep_transcript_retention`'s gzip cutoff).
+
+    Returns the count of audio files deleted. Zero ``retention_days`` means
+    keep forever. Idempotent and best-effort: a file that can't be stat'd or
+    unlinked is skipped and retried on the next sweep.
+    """
+    if retention_days <= 0:
+        return 0
+    voice_dir = transcripts_dir / "voice"
+    if not voice_dir.is_dir():
+        return 0
+    now = datetime.now(timezone.utc).timestamp()
+    cutoff = now - retention_days * 86400
+    deleted = 0
+    for conv_dir in voice_dir.iterdir():
+        if not conv_dir.is_dir():
+            continue
+        for path in conv_dir.iterdir():
+            if not path.is_file():
+                continue
+            try:
+                if path.stat().st_mtime < cutoff:
+                    path.unlink()
+                    deleted += 1
+            except OSError:
+                # Best-effort sweep. The next run retries.
+                continue
+    return deleted

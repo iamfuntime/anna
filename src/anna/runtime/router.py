@@ -17,7 +17,14 @@ from typing import Awaitable, Callable
 
 from anna.config import AnnaConfig, IdentityAliasEntry
 from anna.core.identity import CoreFile, read_core_file
-from anna.log import audit_event, get_logger, sweep_audit_retention, sweep_transcript_retention, transcript_event
+from anna.log import (
+    audit_event,
+    get_logger,
+    sweep_audit_retention,
+    sweep_transcript_retention,
+    sweep_voice_retention,
+    transcript_event,
+)
 from anna.runtime.schedule_store import ScheduleStore
 from anna.runtime.subagent import SubAgentRunner
 from anna.runtime.supervisor import Supervisor
@@ -428,6 +435,10 @@ class ConversationRouter:
                 self._config.transcripts_dir,
                 self._config.logging.transcripts.retention_days,
             )
+            voice_deleted = sweep_voice_retention(
+                self._config.transcripts_dir,
+                self._config.logging.transcripts.retention_days,
+            )
             audit_event(
                 "audit.housekeeping.swept",
                 audit_dir=self._config.audit_dir,
@@ -436,6 +447,7 @@ class ConversationRouter:
                 audit_files_deleted=deleted_audit,
                 transcripts_gzipped=gzipped,
                 transcripts_deleted=deleted_tr,
+                voice_files_deleted=voice_deleted,
             )
         except Exception as exc:
             self._log.error("housekeeping.sweep.failed", error=str(exc))

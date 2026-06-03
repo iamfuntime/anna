@@ -46,6 +46,7 @@ from anna.runtime.startup import (
 )
 from anna.runtime.subagent import SubAgentRunner
 from anna.runtime.supervisor import Supervisor
+from anna.runtime.voice import build_voice_processor
 from anna.runtime.watchdog import Watchdog
 from anna.skills.registry import SkillRegistry
 from anna.tools.google_clients import GoogleClients
@@ -75,7 +76,6 @@ async def _run(config: AnnaConfig) -> None:
     log.info("anna.boot", version="0.1.0", auth_mode=config.auth.mode)
 
     supervisor = Supervisor(config=config)
-    adapters = build_enabled_adapters(config)
 
     # Phase 2 scheduler: build the store and load any persisted schedules
     # before the router so workers see a populated store from the first
@@ -179,6 +179,54 @@ async def _run(config: AnnaConfig) -> None:
                 "will not be mounted on workers"
             ),
         )
+
+    # Phase 2.5 voice messages. One process-wide VoiceProcessor, constructed
+    # after the sub-agent runner and before the router, then threaded into the
+    # Slack and Telegram adapters via build_enabled_adapters. The factory is
+    # boot-safe: if a configured provider's API key is missing it degrades that
+    # provider to None and warns rather than raising, so a misconfigured voice
+    # block can never crash daemon startup. We always construct it (it is cheap
+    # — no I/O at build time) and emit a single ready/disabled line mirroring
+    # anna.web.ready / anna.subagent.ready / anna.cli.ready. The adapters guard
+    # all voice logic on a non-None provider, so an enabled block with no key
+    # still routes inbound voice through the polite "transcription is off" path.
+    voice_processor = build_voice_processor(config)
+    if config.voice.inbound.enabled or config.voice.outbound.enabled:
+        log.info(
+            "anna.voice.ready",
+            inbound_enabled=config.voice.inbound.enabled,
+            inbound_provider=(
+                config.voice.inbound.provider
+                if config.voice.inbound.enabled
+                else None
+            ),
+            outbound_enabled=config.voice.outbound.enabled,
+            outbound_provider=(
+                config.voice.outbound.provider
+                if config.voice.outbound.enabled
+                else None
+            ),
+            outbound_transports=(
+                list(config.voice.outbound.transports)
+                if config.voice.outbound.enabled
+                else []
+            ),
+            retention_days=config.logging.transcripts.retention_days,
+        )
+    else:
+        log.info(
+            "anna.voice.disabled",
+            note=(
+                "voice.inbound.enabled and voice.outbound.enabled are both "
+                "false; inbound voice notes are ignored and replies stay "
+                "text-only on every transport"
+            ),
+        )
+
+    # Build the transport adapters now that the VoiceProcessor exists, so the
+    # Slack and Telegram adapters receive it. Constructed after voice / before
+    # the router (the first consumer of `adapters`).
+    adapters = build_enabled_adapters(config, voice=voice_processor)
 
     # Cadence-Visibility hooks (per Inbox/2026-06-02 plan, subtask 12).
     # The actual wiring lives in ConversationRouter._build_visibility_callbacks
