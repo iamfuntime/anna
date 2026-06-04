@@ -42,6 +42,14 @@ runtime:
   #   response_lint     telemetry-only regex scan of the final
   #                     reply_text. Emits structured warnings on
   #                     match; never blocks delivery.
+  #   periodic_flush_seconds
+  #                     wall-clock "drip" cadence: during a long single
+  #                     turn the worker flushes buffered narration to
+  #                     Slack/Telegram every N seconds so the operator
+  #                     isn't watching dead air. Default 30; 0 disables
+  #                     (final + tool-use flushes only); negatives are
+  #                     rejected. Scheduler and voice-only paths never
+  #                     drip. Takes effect on restart.
   # Defaults are on. lint_patterns ships with five seed regexes for
   # known bad-cadence phrases; bad regex fails fast at boot.
   # ----------------------------------------------------------
@@ -49,6 +57,7 @@ runtime:
   #   reaction_signal: true
   #   cadence_reminder: true
   #   response_lint: true
+  #   periodic_flush_seconds: 30
   #   slack_emoji: thinking_face
   #   telegram_typing_max_seconds: 180
   #   lint_patterns:

@@ -23,11 +23,13 @@ from typing import TYPE_CHECKING, Any
 from anna.config import AnnaConfig
 from anna.log import get_logger
 from anna.transports.base import (
+    TELEGRAM_MAX_CHARS,
     ChannelAdapter,
     InboundEvent,
     InboundHandler,
     OutboundMessage,
     SignalHandle,
+    split_message_text,
 )
 
 if TYPE_CHECKING:  # pragma: no cover - import-only for typing
@@ -173,17 +175,25 @@ class TelegramAdapter(ChannelAdapter):
                 return
 
         try:
-            kwargs: dict[str, Any] = {"chat_id": chat_id, "text": message.text}
-            if topic_id is not None:
-                kwargs["message_thread_id"] = topic_id
-            if message.reply_to:
-                kwargs["reply_to_message_id"] = int(message.reply_to)
-            await self._application.bot.send_message(**kwargs)
+            # Length splitting (Inbox/2026-06-04 plan, decision C): Telegram
+            # rejects a sendMessage over 4096 chars, so an oversized reply is
+            # delivered as a sequence of messages. Most replies fit and yield
+            # exactly one chunk, preserving prior behavior. ``reply_to`` anchors
+            # only the FIRST chunk so the thread is not re-quoted on each part.
+            chunks = split_message_text(message.text, TELEGRAM_MAX_CHARS)
+            for idx, chunk in enumerate(chunks):
+                kwargs: dict[str, Any] = {"chat_id": chat_id, "text": chunk}
+                if topic_id is not None:
+                    kwargs["message_thread_id"] = topic_id
+                if message.reply_to and idx == 0:
+                    kwargs["reply_to_message_id"] = int(message.reply_to)
+                await self._application.bot.send_message(**kwargs)
             self._log.debug(
                 "channel.message.sent",
                 channel="telegram",
                 conv_key=message.conversation_key,
                 text_length=len(message.text),
+                chunks=len(chunks),
             )
         except Exception as exc:
             self._log.error(

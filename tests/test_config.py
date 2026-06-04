@@ -366,6 +366,7 @@ def test_runtime_visibility_defaults() -> None:
     assert vis.response_lint is True
     assert vis.slack_emoji == "thinking_face"
     assert vis.telegram_typing_max_seconds == 180
+    assert vis.periodic_flush_seconds == 30
     assert len(vis.lint_patterns) == 5
 
 
@@ -374,6 +375,24 @@ def test_runtime_visibility_rejects_bad_regex() -> None:
     with pytest.raises(ValueError) as excinfo:
         RuntimeVisibilityConfig(lint_patterns=["(unclosed"])
     assert "lint_patterns" in str(excinfo.value)
+
+
+def test_periodic_flush_seconds_default_is_30() -> None:
+    """The timed-drip interval defaults to 30 seconds."""
+    assert RuntimeVisibilityConfig().periodic_flush_seconds == 30
+
+
+def test_periodic_flush_seconds_zero_accepted() -> None:
+    """``0`` is the explicit off switch and validates."""
+    vis = RuntimeVisibilityConfig(periodic_flush_seconds=0)
+    assert vis.periodic_flush_seconds == 0
+
+
+def test_periodic_flush_seconds_rejects_negative() -> None:
+    """A negative drip interval is rejected at validation."""
+    with pytest.raises(ValueError) as excinfo:
+        RuntimeVisibilityConfig(periodic_flush_seconds=-1)
+    assert "periodic_flush_seconds" in str(excinfo.value)
 
 
 def test_web_dashboard_defaults_when_block_omitted() -> None:

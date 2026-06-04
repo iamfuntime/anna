@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import base64
 from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
@@ -104,6 +105,29 @@ SendCallback = Callable[[OutboundMessage], Awaitable[None]]
 IdleCloseCallback = Callable[[str], Awaitable[None]]
 
 
+@dataclass
+class _FlushBuffer:
+    """Per-turn pending-narration holder shared by the consumer loop and the
+    periodic-flush timer task (Inbox/2026-06-04 plan, Architecture section).
+
+    ``pending`` accumulates the text blocks emitted since the last flush
+    boundary (tool-use OR timed drip). Both the consumer ``async for`` loop
+    and the background timer task mutate ``pending`` IN PLACE (``extend`` /
+    ``clear``) under ``lock`` — never rebind it — so both see the same list.
+    ``last_flush`` is a ``loop.time()`` monotonic stamp written by whichever
+    path last sent a message, so the timer measures its interval since the
+    last message of ANY kind (decision B).
+
+    Scoped to a single ``_handle`` invocation; never long-lived instance
+    state. ``last_flush`` is seeded to the turn-start ``loop.time()`` so the
+    first drip cannot fire before a full interval has elapsed.
+    """
+
+    last_flush: float
+    pending: list[str] = field(default_factory=list)
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+
 class ConversationWorker:
     """An async worker that owns one Claude SDK session for one conversation."""
 
@@ -142,6 +166,12 @@ class ConversationWorker:
         # thinking-signal start/clear, no lint pass. Existing unit tests
         # and the sub-agent path are unchanged.
         self._visibility = visibility
+        # Worker-level periodic-flush interval (Inbox/2026-06-04 plan).
+        # Cached at construction to honor the no-hot-reload contract: an
+        # anna.yaml edit takes effect on the next restart, not mid-process.
+        # ``0`` (or negative, already rejected at load) disables the timed
+        # drip — the timer task is simply never started for any turn.
+        self._flush_interval: int = config.runtime.visibility.periodic_flush_seconds
         # Phase 2 §5 subtask 7: when true the worker skips the checkpoint
         # write and the per-core-file eviction sweep at closeout. Set by
         # the router from the first event's ``ephemeral`` flag when the
@@ -1078,6 +1108,111 @@ class ConversationWorker:
             "parent_tool_use_id": None,
         }
 
+    def _voice_only_for_transport(self) -> bool:
+        """True when this transport would send replies as voice-only.
+
+        Decision F: when voice-only outbound is configured for this
+        transport, the turn stays consolidated to a single voice note at
+        turn end (same as the scheduler path), so the timed drip is not
+        started. We gate on the static config — ``voice.outbound.enabled``,
+        ``voice_only``, and this transport being in the outbound allowlist —
+        which is the condition under which an intermediate drip could be
+        fragmented into its own voice note.
+        """
+        voice_out = self._config.voice.outbound
+        return (
+            voice_out.enabled
+            and voice_out.voice_only
+            and self.transport in voice_out.transports
+        )
+
+    def _periodic_flush_active(self, event: InboundEvent) -> bool:
+        """Whether to start the timed-drip task for this turn.
+
+        Active only for an interactive (non-scheduler), non-voice-only turn
+        on a buffered transport with a positive interval. The scheduler path
+        (``completion_future`` set) and voice-only outbound stay consolidated.
+        """
+        if self._flush_interval <= 0:
+            return False
+        if event.completion_future is not None:
+            return False
+        if self.transport not in ("slack", "telegram"):
+            return False
+        if self._voice_only_for_transport():
+            return False
+        return True
+
+    async def _periodic_flush_loop(
+        self, event: InboundEvent, buffer: _FlushBuffer
+    ) -> None:
+        """Background timer that drips ``buffer.pending`` on a wall-clock cadence.
+
+        Started at turn begin only when :meth:`_periodic_flush_active`, and
+        cancelled-and-awaited in the turn's ``finally``. Sleeps ``poll``
+        seconds, then — under ``buffer.lock`` — sends one ``OutboundMessage``
+        and clears the buffer iff it is non-empty AND at least ``interval``
+        seconds have elapsed since the last message of any kind. Every send
+        restamps ``last_flush`` so a tool-use flush is never immediately
+        followed by a redundant empty drip, and a drip resets the interval
+        for the next one (decision B).
+
+        The consumer loop stays a plain ``async for`` (the spike proved the
+        ``wait_for(__anext__())`` poll-wrapper finalizes the SDK generator
+        stack and drops the rest of the turn); this task is the ONLY timing
+        mechanism. Cancellation is the normal teardown path and is re-raised.
+        """
+        interval = float(self._flush_interval)
+        # Poll at the interval. Clamp to a sane floor so a tiny configured
+        # interval (or a test clock) still wakes promptly without busy-looping.
+        poll = max(interval, 0.05)
+        loop = asyncio.get_running_loop()
+        try:
+            while True:
+                await asyncio.sleep(poll)
+                async with buffer.lock:
+                    if not buffer.pending:
+                        continue
+                    if loop.time() - buffer.last_flush < interval:
+                        continue
+                    txt = "\n".join(c for c in buffer.pending if c).strip()
+                    # Empty/whitespace: nothing to send, but clear+stamp so a
+                    # buffer of only-blank chunks doesn't re-fire every tick.
+                    if not txt:
+                        buffer.pending.clear()
+                        buffer.last_flush = loop.time()
+                        continue
+                    # Send BEFORE clearing so the text is loss-safe: the lock
+                    # is held across the send, so ``pending`` cannot grow
+                    # during it, and only a successful return clears/stamps.
+                    # If a cancel (turn-end teardown) or exception lands inside
+                    # ``self._send``, ``pending`` keeps the text and the final
+                    # turn-end send re-emits it — no silent drop. CancelledError
+                    # propagates for clean teardown; a real send failure is
+                    # logged and the timer keeps ticking (buffer untouched, so
+                    # the text retries on the next tick or the final send).
+                    try:
+                        await self._send(
+                            OutboundMessage(
+                                conversation_key=event.conversation_key,
+                                text=txt,
+                            )
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        self._log.warning(
+                            "worker.periodic_flush.send_failed",
+                            error=str(exc),
+                            conv_key=event.conversation_key,
+                            transport=self.transport,
+                        )
+                        continue
+                    buffer.pending.clear()
+                    buffer.last_flush = loop.time()
+        except asyncio.CancelledError:
+            raise
+
     async def _handle(self, event: InboundEvent) -> None:
         if self._client is None:
             if event.completion_future is not None and not event.completion_future.done():
@@ -1150,15 +1285,34 @@ class ConversationWorker:
         # handlers), so the thinking signal is cleared even when the
         # SDK call fails or the run-loop is cancelled.
         #
-        # ``pending`` accumulates text since the last flush boundary so
-        # buffered transports (Slack, Telegram) receive narration as a
+        # ``buffer.pending`` accumulates text since the last flush boundary
+        # so buffered transports (Slack, Telegram) receive narration as a
         # sequence of messages keyed off the model's natural tool-use
-        # cadence instead of one consolidated end-of-turn blob. The
+        # cadence — and, when the timed-drip is active, off a wall-clock
+        # cadence — instead of one consolidated end-of-turn blob. The
         # scheduler-driven path (event.completion_future set) keeps the
         # old behavior — scheduled jobs want one return value, not a
-        # stream.
+        # stream. ``reply_chunks`` accumulates EVERY text block for the
+        # whole turn and is never cleared by any flush, so the cadence
+        # linter still sees the full reply regardless of drip count.
+        #
+        # ``buffer.lock`` serializes every append/flush of ``pending``
+        # between this consumer loop and the background timer task, so on
+        # the single-threaded event loop ordering is preserved and there is
+        # no concurrent-mutation race. ``pending`` is always mutated in
+        # place (extend/clear) — never rebound — so the timer sees writes.
         reply_chunks: list[str] = []
-        pending: list[str] = []
+        loop = asyncio.get_running_loop()
+        buffer = _FlushBuffer(last_flush=loop.time())
+        # Timed-drip timer (Inbox/2026-06-04 plan). Started ONLY for an
+        # interactive, non-voice-only turn on a buffered transport with a
+        # positive interval; cancelled-and-awaited in the ``finally`` below.
+        flush_task: asyncio.Task[None] | None = None
+        if self._periodic_flush_active(event):
+            flush_task = asyncio.create_task(
+                self._periodic_flush_loop(event, buffer),
+                name=f"worker.flush.{self.conversation_key}",
+            )
         try:
             # Send the user message into the SDK. NOTE: ``query_text``
             # (not ``event.text``) carries the cadence reminder when
@@ -1201,7 +1355,11 @@ class ConversationWorker:
                         for block in msg.content:
                             if TextBlock is not None and isinstance(block, TextBlock):
                                 reply_chunks.append(block.text)
-                                pending.append(block.text)
+                                # Append the narration to the shared flush
+                                # buffer under the lock so the timer task
+                                # never reads a half-written ``pending``.
+                                async with buffer.lock:
+                                    buffer.pending.append(block.text)
                                 # Phase 2 §5: emit streaming deltas to the
                                 # per-event subscriber (set by the CLI adapter)
                                 # before the buffered finalize lands. Exception
@@ -1230,14 +1388,35 @@ class ConversationWorker:
                                 # consolidated return value, not a stream.
                                 # Empty/whitespace pending buffers are
                                 # skipped (no point sending blank messages).
-                                if event.completion_future is None and pending:
-                                    txt = "\n".join(c for c in pending if c).strip()
-                                    if txt:
-                                        await self._send(OutboundMessage(
-                                            conversation_key=event.conversation_key,
-                                            text=txt,
-                                        ))
-                                    pending = []
+                                #
+                                # Taken under the lock and ``pending`` is
+                                # cleared in place so the timer task can't
+                                # race a concurrent drip; ``last_flush`` is
+                                # stamped on every flush (even an empty one)
+                                # so the timer measures its interval from the
+                                # last message of ANY kind (decision B) and
+                                # never re-fires on an already-emptied buffer.
+                                #
+                                # Send BEFORE clearing (mirrors the drip loop)
+                                # so the text is loss-safe: the lock is held
+                                # across the send, so ``pending`` cannot grow
+                                # during it, and only a successful return
+                                # clears/stamps. A cancel/exception inside the
+                                # send leaves the text in ``pending`` for the
+                                # final turn-end send.
+                                if event.completion_future is None:
+                                    async with buffer.lock:
+                                        if buffer.pending:
+                                            txt = "\n".join(
+                                                c for c in buffer.pending if c
+                                            ).strip()
+                                            if txt:
+                                                await self._send(OutboundMessage(
+                                                    conversation_key=event.conversation_key,
+                                                    text=txt,
+                                                ))
+                                            buffer.pending.clear()
+                                            buffer.last_flush = loop.time()
                     if ResultMessage is not None and isinstance(msg, ResultMessage):
                         break
             except Exception as exc:
@@ -1251,6 +1430,31 @@ class ConversationWorker:
                 ))
                 return
         finally:
+            # Tear down the timed-drip timer BEFORE the final send so no
+            # concurrent drip can race the residual-buffer send below.
+            # Cancel-and-await is the normal teardown path; the task only
+            # ever sends a message and holds no resource. Runs on every exit
+            # path (success, exception, cancellation, early return).
+            #
+            # Only the flush task's OWN cancellation (from our explicit
+            # ``flush_task.cancel()``) is suppressed. If the outer/current
+            # task is itself being cancelled (worker stop/restart), that
+            # cancellation must propagate — re-raise it rather than swallow.
+            if flush_task is not None:
+                flush_task.cancel()
+                try:
+                    await flush_task
+                except asyncio.CancelledError:
+                    current = asyncio.current_task()
+                    if current is not None and current.cancelling() > 0:
+                        raise
+                except Exception as exc:
+                    self._log.warning(
+                        "worker.periodic_flush.teardown_failed",
+                        error=str(exc),
+                        conv_key=event.conversation_key,
+                        transport=self.transport,
+                    )
             # ALWAYS clear, even on exception, cancellation, or early
             # return inside the try-block above. The clear callable is
             # itself exception-isolated — defense-in-depth keeps a
@@ -1295,11 +1499,13 @@ class ConversationWorker:
             return
 
         # Interactive path: send the trailing pending buffer (text after the
-        # last tool-use boundary, or the full reply if no tools were called).
-        # Earlier tool-use flushes already dispatched their slices of
-        # narration as separate OutboundMessages — sending the join of
-        # ``reply_chunks`` here would duplicate everything.
-        final_text = "\n".join(c for c in pending if c).strip()
+        # last flush boundary — tool-use OR timed drip — or the full reply if
+        # nothing flushed). Earlier tool-use and timed-drip flushes already
+        # dispatched their slices of narration as separate OutboundMessages,
+        # each clearing ``buffer.pending`` in place, so sending the join of
+        # ``reply_chunks`` here would duplicate everything. The timer task is
+        # cancelled in the ``finally`` above, so this read needs no lock.
+        final_text = "\n".join(c for c in buffer.pending if c).strip()
         if final_text:
             await self._send(OutboundMessage(
                 conversation_key=event.conversation_key,

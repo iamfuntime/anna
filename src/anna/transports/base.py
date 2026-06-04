@@ -23,6 +23,68 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+# Telegram rejects ``sendMessage`` payloads whose text exceeds 4096
+# characters. Slack's ``chat.postMessage`` tolerates much more but
+# truncates/degrades very long single messages, so we apply a
+# conservative practical cap there too. Both are enforced at the
+# transport send boundary via :func:`split_message_text` (per the
+# Inbox/2026-06-04 periodic-flush plan, decision C).
+TELEGRAM_MAX_CHARS = 4096
+SLACK_MAX_CHARS = 3900
+
+
+def split_message_text(text: str, limit: int) -> list[str]:
+    """Split ``text`` into chunks no longer than ``limit`` characters.
+
+    Used by the Slack and Telegram send paths so an oversized message
+    (a drip, the final flush, or a pre-existing long single reply) is
+    delivered as a sequence of messages instead of being rejected or
+    truncated by the upstream API.
+
+    Boundary preference, in order:
+
+    1. The whole string when it already fits within ``limit``.
+    2. The last newline at/under ``limit`` (keeps paragraphs intact).
+    3. The last whitespace at/under ``limit`` (avoids cutting a word).
+    4. A hard cut at exactly ``limit`` (last resort — a single token
+       longer than ``limit``, e.g. an URL or hash).
+
+    Chunk order is preserved. An empty / whitespace-only input returns a
+    single-element list containing the original string so callers keep
+    their existing "send exactly one message" behavior unchanged.
+    """
+    if limit <= 0:
+        raise ValueError("split_message_text limit must be > 0")
+    if len(text) <= limit:
+        return [text]
+
+    chunks: list[str] = []
+    remaining = text
+    while len(remaining) > limit:
+        # If the character just past the window is a boundary, the full
+        # ``limit``-char window fits cleanly and that boundary is consumed.
+        if remaining[limit] in (" ", "\n"):
+            cut = limit
+        else:
+            window = remaining[:limit]
+            # Prefer the last newline, then the last whitespace, then a hard
+            # cut (a single token longer than ``limit``: URL, hash, …).
+            cut = window.rfind("\n")
+            if cut <= 0:
+                cut = window.rfind(" ")
+            if cut <= 0:
+                cut = limit
+        chunks.append(remaining[:cut])
+        # Drop a single boundary whitespace char so it is not re-emitted as
+        # leading whitespace on the next chunk; a hard cut keeps every char.
+        if cut < len(remaining) and remaining[cut] in (" ", "\n"):
+            remaining = remaining[cut + 1 :]
+        else:
+            remaining = remaining[cut:]
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
 
 @dataclass(frozen=True)
 class ImageAttachment:

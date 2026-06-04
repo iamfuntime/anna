@@ -25,12 +25,14 @@ from anna.config import AnnaConfig
 from anna.log import get_logger
 from anna.transports.mrkdwn import normalize_to_slack_mrkdwn
 from anna.transports.base import (
+    SLACK_MAX_CHARS,
     ChannelAdapter,
     ImageAttachment,
     InboundEvent,
     InboundHandler,
     OutboundMessage,
     SignalHandle,
+    split_message_text,
 )
 from anna.transports.slack_thread_state import ThreadParticipation
 
@@ -161,18 +163,33 @@ class SlackAdapter(ChannelAdapter):
                 # the slack_post MCP tool also routes through, so report cards
                 # and skill posts are normalized here too.
                 mrkdwn_text = normalize_to_slack_mrkdwn(message.text)
-                kwargs: dict[str, Any] = {"channel": channel, "text": mrkdwn_text}
-                if thread_ts:
-                    kwargs["thread_ts"] = thread_ts
-                if message.structured and "blocks" in message.structured:
-                    kwargs["blocks"] = message.structured["blocks"]
-                response = await self._client.chat_postMessage(**kwargs)
+                # Length splitting (Inbox/2026-06-04 plan, decision C): a
+                # single oversized reply is posted as a sequence of messages
+                # under Slack's practical cap instead of being degraded. Most
+                # messages fit and yield exactly one chunk, preserving prior
+                # behavior. ``blocks`` (structured) attach to the FINAL chunk
+                # only so they are not duplicated across the split.
+                chunks = split_message_text(mrkdwn_text, SLACK_MAX_CHARS)
+                last_ts: str | None = None
+                for idx, chunk in enumerate(chunks):
+                    kwargs: dict[str, Any] = {"channel": channel, "text": chunk}
+                    if thread_ts:
+                        kwargs["thread_ts"] = thread_ts
+                    if (
+                        idx == len(chunks) - 1
+                        and message.structured
+                        and "blocks" in message.structured
+                    ):
+                        kwargs["blocks"] = message.structured["blocks"]
+                    response = await self._client.chat_postMessage(**kwargs)
+                    last_ts = response.get("ts")
                 self._log.debug(
                     "channel.message.sent",
                     channel="slack",
                     conv_key=message.conversation_key,
                     text_length=len(message.text),
-                    ts=response.get("ts"),
+                    chunks=len(chunks),
+                    ts=last_ts,
                 )
             except Exception as exc:
                 self._log.error(

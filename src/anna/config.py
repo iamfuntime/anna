@@ -59,6 +59,17 @@ class RuntimeVisibilityConfig(BaseModel):
     cadence_reminder: bool = True
     response_lint: bool = True
 
+    # Worker-level periodic "drip" flush (per Inbox/2026-06-04 plan). During a
+    # long single-turn run (sub-agent chains, multi-tool sequences) the worker
+    # flushes the pending narration buffer to buffered transports (Slack,
+    # Telegram) on this wall-clock cadence, layered on top of the existing
+    # tool-use-boundary flush, so the operator is not staring at dead air. The
+    # scheduler/``completion_future`` path and voice-only outbound stay
+    # consolidated and never drip. ``0`` disables the timer entirely (today's
+    # behavior); negatives are rejected at load. Slack/Telegram interactive
+    # only; no hot-reload — takes effect on restart.
+    periodic_flush_seconds: int = 30
+
     # Slack-specific knobs. Custom emojis may not exist on every workspace;
     # if reactions.add fails the worker logs a warning and the SDK turn
     # continues uninterrupted.
@@ -81,6 +92,17 @@ class RuntimeVisibilityConfig(BaseModel):
             r"backgrounded so\b",
         ]
     )
+
+    @field_validator("periodic_flush_seconds")
+    @classmethod
+    def _flush_seconds_non_negative(cls, v: int) -> int:
+        """Reject a negative drip interval; ``0`` is the explicit off switch."""
+        if v < 0:
+            raise ValueError(
+                "runtime.visibility.periodic_flush_seconds must be >= 0 "
+                "(0 disables the timed drip)"
+            )
+        return v
 
     @field_validator("lint_patterns")
     @classmethod
