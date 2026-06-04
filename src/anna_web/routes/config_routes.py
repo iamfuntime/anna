@@ -51,6 +51,52 @@ def _humanize(name: str) -> str:
     return " ".join(part.capitalize() for part in name.split("_"))
 
 
+def _first_line(text: str, *, limit: int = 120) -> str:
+    """First non-empty line of ``text``, whitespace-collapsed and truncated."""
+    for raw in text.splitlines():
+        line = " ".join(raw.split())
+        if line:
+            return line if len(line) <= limit else line[: limit - 1].rstrip() + "…"
+    return ""
+
+
+def _section_description(field: FormField) -> str:
+    """Human-readable blurb for a section card.
+
+    Prefers an explicit ``Field(description=...)`` on the top-level section
+    (rare today), then falls back to the section model's class docstring.
+    Returns "" when neither exists — the card then leads with its
+    field-label preview alone. Reuses existing metadata only; no new schema.
+    """
+    if field.description:
+        return _first_line(field.description)
+    model = type(field.value) if field.value is not None else None
+    doc = getattr(model, "__doc__", None)
+    if doc:
+        return _first_line(doc)
+    return ""
+
+
+def _preview_labels(labels: list[str], *, max_chars: int = 60) -> str:
+    """Comma-join child field labels, truncating overflow to ``+N more``.
+
+    Gives the operator a glance at what's inside a section (e.g.
+    ``Slack, Telegram, Cli``) instead of a bare ``3 fields`` count.
+    """
+    if not labels:
+        return ""
+    shown: list[str] = []
+    total = 0
+    for idx, label in enumerate(labels):
+        addition = len(label) + (2 if shown else 0)
+        if shown and total + addition > max_chars:
+            shown.append(f"+{len(labels) - idx} more")
+            break
+        shown.append(label)
+        total += addition
+    return ", ".join(shown)
+
+
 def _section_field(cfg: AnnaConfig, section: str) -> FormField:
     """Run ``describe(AnnaConfig, cfg)`` and pluck out the named section.
 
@@ -81,26 +127,29 @@ async def get_config_index(request: Request) -> Response:
 
     sections: list[dict[str, Any]] = []
     for field in describe(AnnaConfig, cfg):
-        # Field-count hint per the plan. For FIELDSET sections the
-        # child count is the natural number; for REPEATED_FIELDSET
-        # (identities) report the item count + " item(s)"; for the
-        # rare scalar top-level (none today, but future-proof)
-        # report 1.
+        # Card body tells the operator what's *inside* a section instead
+        # of a bare count they'd have to click to decode. FIELDSET cards
+        # preview their child field labels (e.g. "Slack, Telegram, Cli");
+        # REPEATED_FIELDSET (identities) reports an item count and leans
+        # on the template's edit affordance; both reuse existing schema
+        # metadata via describe(). An optional description from the
+        # section model's docstring leads the card when present.
+        entry: dict[str, Any] = {
+            "name": field.name,
+            "label": _humanize(field.name),
+            "description": _section_description(field),
+            "repeated": field.kind is FieldKind.REPEATED_FIELDSET,
+            "count": len(field.children),
+            "preview": "",
+        }
         if field.kind is FieldKind.FIELDSET:
-            count = len(field.children)
-            hint = f"{count} field{'' if count == 1 else 's'}"
-        elif field.kind is FieldKind.REPEATED_FIELDSET:
-            count = len(field.children)
-            hint = f"{count} item{'' if count == 1 else 's'}"
-        else:
-            hint = field.kind.value
-        sections.append(
-            {
-                "name": field.name,
-                "label": _humanize(field.name),
-                "hint": hint,
-            }
-        )
+            entry["preview"] = _preview_labels(
+                [child.label for child in field.children]
+            )
+        elif field.kind is not FieldKind.REPEATED_FIELDSET:
+            # Rare scalar top-level (none today, future-proof).
+            entry["preview"] = field.kind.value
+        sections.append(entry)
 
     templates = request.app.state.templates
     return templates.TemplateResponse(

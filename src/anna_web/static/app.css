@@ -36,6 +36,27 @@
   color: #d6e8ff;
 }
 
+/* Responsive card grid for the /config section index. Pico's classless
+ * .grid lays out N equal-width columns in a single non-wrapping row, which
+ * crushes ~20 sections into a few chars each and wraps labels one letter per
+ * line. This wraps into as many readable rows as the viewport allows; each
+ * card is at least 18rem (or full width on a narrow screen) so labels like
+ * "Transports" always render on one line. */
+.section-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 18rem), 1fr));
+  gap: 1rem;
+}
+
+/* Card body: optional section description above the field-label preview. */
+.section-grid .section-desc {
+  margin-bottom: 0.25rem;
+}
+
+.section-grid .section-preview {
+  color: var(--pico-muted-color, inherit);
+}
+
 /* Two-column label/input grid for form sections. Stacks on narrow screens. */
 .form-grid {
   display: grid;

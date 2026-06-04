@@ -104,6 +104,45 @@ def test_get_config_lists_all_sections(client: TestClient) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 1b. GET /config — cards preview section contents (subtask 6).
+# ---------------------------------------------------------------------------
+
+
+def test_config_index_previews_field_labels(client: TestClient) -> None:
+    """Section cards preview child field labels instead of an "N fields" count.
+
+    The transports section's children are slack / telegram / cli; their
+    humanized labels should surface in the card body so the operator learns
+    what's inside without clicking through.
+    """
+    response = client.get("/config")
+    assert response.status_code == 200
+    body = response.text
+
+    # Field-label preview is present...
+    assert "Slack" in body
+    assert "Telegram" in body
+    # ...and the old bare-count abstraction for transports is gone.
+    assert "3 fields" not in body
+    assert "fields</small>" not in body
+
+
+def test_config_index_identities_shows_count_and_edit(client: TestClient) -> None:
+    """The REPEATED_FIELDSET section reports an item count plus an edit link.
+
+    The identities card carries two links to /config/identities — the title
+    and a dedicated edit affordance — and an "item(s)" count in its body.
+    """
+    response = client.get("/config")
+    assert response.status_code == 200
+    body = response.text
+
+    assert "item" in body
+    # Title link + edit-affordance link both point at the section editor.
+    assert body.count('href="/config/identities"') >= 2
+
+
+# ---------------------------------------------------------------------------
 # 2. GET /config/web — form for one section.
 # ---------------------------------------------------------------------------
 

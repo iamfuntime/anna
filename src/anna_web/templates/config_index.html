@@ -5,13 +5,21 @@
 {% block content %}
   <h1>Config</h1>
   <p>Every top-level block in <code>anna.yaml</code>. Click a section to edit its fields.</p>
-  <div class="grid">
+  <div class="section-grid">
     {% for section in sections %}
       <article>
         <header>
           <strong><a href="/config/{{ section.name }}">{{ section.label }}</a></strong>
         </header>
-        <small>{{ section.hint }}</small>
+        {% if section.description %}
+          <p class="section-desc"><small>{{ section.description }}</small></p>
+        {% endif %}
+        {% if section.repeated %}
+          <small>{{ section.count }} item{{ '' if section.count == 1 else 's' }} ·
+            <a href="/config/{{ section.name }}">Edit</a></small>
+        {% elif section.preview %}
+          <small class="section-preview">{{ section.preview }}</small>
+        {% endif %}
       </article>
     {% endfor %}
   </div>
