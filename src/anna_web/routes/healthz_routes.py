@@ -62,6 +62,19 @@ async def get_healthz(request: Request) -> JSONResponse:
     flag. ``status`` stays ``"ok"`` per the plan; operators read
     ``anna_running``/``config_loaded`` for the actual signal.
     """
+    return JSONResponse(await gather_health(request))
+
+
+async def gather_health(request: Request) -> dict[str, Any]:
+    """Compute the health body dict consumed by ``/healthz`` and Home.
+
+    Factored out of :func:`get_healthz` so the dashboard's Home page
+    (subtask 8) can server-render the same ``anna_running`` /
+    ``config_loaded`` flags at load time, reusing the exact probe shape
+    the client-side poller later reads off ``/healthz`` — no second
+    source of truth. Same crash-tolerance contract: never raises; every
+    internal failure degrades to ``False`` on the affected flag.
+    """
     anna_running = False
     config_loaded = False
 
@@ -94,12 +107,11 @@ async def get_healthz(request: Request) -> JSONResponse:
             # perspective. Never 500 the probe.
             anna_running = False
 
-    body: dict[str, Any] = {
+    return {
         "status": "ok",
         "anna_running": anna_running,
         "config_loaded": config_loaded,
     }
-    return JSONResponse(body)
 
 
 def _probe_active(probe: Any) -> bool:

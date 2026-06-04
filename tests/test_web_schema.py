@@ -344,3 +344,30 @@ def test_web_dashboard_config_described_directly() -> None:
     assert by_name["target_unit"].kind is FieldKind.TEXT
     # Top-level call (no parent) → path is just the field name
     assert by_name["enabled"].path == "enabled"
+
+
+# ---------------------------------------------------------------------------
+# json_schema_extra propagation onto FormField.extra (subtask 10's metadata
+# channel for the bind-host warning).
+# ---------------------------------------------------------------------------
+
+
+def test_field_extra_propagates_json_schema_extra() -> None:
+    """A field's ``json_schema_extra`` lands on ``FormField.extra``."""
+
+    class M(BaseModel):
+        x: str = Field(default="", json_schema_extra={"warn_if_non_loopback": True})
+        y: str = "plain"
+
+    by_name = {f.name: f for f in describe(M, M())}
+    assert by_name["x"].extra.get("warn_if_non_loopback") is True
+    # A field without json_schema_extra gets an empty dict, not None.
+    assert by_name["y"].extra == {}
+
+
+def test_web_host_field_carries_warn_flag() -> None:
+    """The real ``web.host`` field flags itself for the non-loopback warning."""
+    fields = describe(AnnaConfig, AnnaConfig())
+    web = next(f for f in fields if f.name == "web")
+    host = next(c for c in web.children if c.name == "host")
+    assert host.extra.get("warn_if_non_loopback") is True

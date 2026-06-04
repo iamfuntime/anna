@@ -105,5 +105,18 @@
          name="{{ field.path }}"
          value="{{ field.value if field.value is not none else '' }}"
          {% if field.required %}required{% endif %}>
+  {# Bind-host safety affordance (subtask 10): a field flagged with
+     warn_if_non_loopback (today: web.host) renders a loud inline warning
+     when its value is a non-loopback bind. The dashboard ships no auth, so
+     this is operator-visible at the point of edit — but does not block the
+     change or refuse to start. #}
+  {% if field.extra.get("warn_if_non_loopback") and is_non_loopback_host(field.value) %}
+    <small class="field-warning" role="alert">
+      ⚠ <strong>Warning:</strong> the dashboard has no authentication. Binding to
+      <code>{{ field.value }}</code> (a non-loopback address) exposes these editors
+      to your LAN/network. Keep this at <code>127.0.0.1</code> unless it sits behind
+      a trusted reverse proxy or VPN.
+    </small>
+  {% endif %}
   <small class="error" data-field="{{ field.path }}">{% if errors and errors.get(field.path) %}{{ errors.get(field.path) }}{% endif %}</small>
 {% endif %}

@@ -354,3 +354,104 @@ def test_config_write_audit_payload_never_contains_value(
         assert not _has_canary(event), (
             f"config write value leaked into audit payload: {event!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Subtask 9: the dead static restart note is replaced by the real control.
+# ---------------------------------------------------------------------------
+
+
+def test_config_index_includes_restart_control(client: TestClient) -> None:
+    """The /config index ships the guarded Restart control, not the dead note."""
+    response = client.get("/config")
+    assert response.status_code == 200
+    body = response.text
+
+    # The reachable restart control (the form posts to /restart).
+    assert 'hx-post="/restart"' in body
+    assert "Restart anna.service" in body
+    # The old un-actionable systemctl note is gone.
+    assert "systemctl --user restart anna" not in body
+
+
+def test_config_section_includes_restart_control(client: TestClient) -> None:
+    """The per-section editor surfaces the Restart control to apply edits."""
+    response = client.get("/config/web")
+    assert response.status_code == 200
+    body = response.text
+
+    assert 'hx-post="/restart"' in body
+    assert "Restart anna.service" in body
+
+
+# ---------------------------------------------------------------------------
+# Subtask 10: bind-host safety affordance — inline warning on non-loopback host.
+# ---------------------------------------------------------------------------
+
+
+def test_config_web_loopback_host_renders_no_warning(client: TestClient) -> None:
+    """The default 127.0.0.1 bind renders the host field without a warning."""
+    response = client.get("/config/web")
+    assert response.status_code == 200
+    body = response.text
+
+    # Loopback default → no safety warning.
+    assert "field-warning" not in body
+
+
+def test_config_web_non_loopback_host_renders_warning(
+    client: TestClient, anna_home: Path
+) -> None:
+    """Saving a non-loopback host re-renders the form with a loud inline warning.
+
+    The change is NOT blocked (the write succeeds, 200) — the operator just
+    gets a prominent warning that the auth-less dashboard is now network-exposed.
+    """
+    response = client.post(
+        "/config/web",
+        data={
+            "web.enabled": "on",
+            "web.host": "0.0.0.0",
+            "web.port": "8765",
+            "web.target_unit": "anna.service",
+        },
+    )
+
+    # Write is allowed — warn-only, never refuse.
+    assert response.status_code == 200, response.text
+    body = response.text
+    # ``field-warning`` is the class on the warning element only (the field
+    # description renders unconditionally, so don't key on its prose).
+    assert "field-warning" in body
+    # Phrase unique to the warning block, not the always-on description.
+    assert "non-loopback address" in body
+    assert "0.0.0.0" in body
+
+    # And the change actually landed on disk.
+    after = (anna_home / "anna.yaml").read_text(encoding="utf-8")
+    assert "host: 0.0.0.0" in after
+
+
+@pytest.mark.parametrize(
+    ("host", "expected"),
+    [
+        ("127.0.0.1", False),
+        ("127.0.0.5", False),
+        ("::1", False),
+        ("[::1]", False),
+        ("localhost", False),
+        ("LOCALHOST", False),
+        ("", False),
+        (None, False),
+        ("0.0.0.0", True),
+        ("::", True),
+        ("192.168.1.10", True),
+        ("10.0.0.1", True),
+        ("example.com", True),
+    ],
+)
+def test_is_non_loopback_host(host: object, expected: bool) -> None:
+    """The loopback detector underpinning the warning classifies addresses."""
+    from anna_web.routes.config_routes import is_non_loopback_host
+
+    assert is_non_loopback_host(host) is expected

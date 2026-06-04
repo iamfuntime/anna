@@ -4,11 +4,74 @@
 
 {% block content %}
   <h1>ANNA Dashboard</h1>
-  <p>ANNA Dashboard is live. Use the nav above to edit config, secrets, and schedules.</p>
-  <ul>
-    <li><strong>Config</strong> — form-based editor for every section of <code>anna.yaml</code>.</li>
-    <li><strong>Secrets</strong> — masked editor for <code>.env</code> with a per-key reveal toggle.</li>
-    <li><strong>Schedules</strong> — list, create, edit, and delete entries in <code>schedules.yaml</code>.</li>
-  </ul>
-  <p><small>Routes for these nav targets land in later subtasks of the Phase 2.5 web dashboard buildout.</small></p>
+  <p>ANNA Dashboard is live. Edit config, secrets, and schedules below, then apply with Restart.</p>
+
+  {# (a) Live service status, server-rendered from /healthz's probe and kept
+     fresh by the inline poller at the bottom of this page. #}
+  <article class="status-panel">
+    <header><strong>Service status</strong></header>
+    <ul class="status-list">
+      <li>
+        <code>{{ restart_unit }}</code>:
+        <span id="anna-status"
+              class="status-badge"
+              data-state="{{ 'up' if anna_running else 'down' }}">{{ 'running' if anna_running else 'stopped' }}</span>
+      </li>
+      <li>
+        Config:
+        <span id="config-status"
+              class="status-badge"
+              data-state="{{ 'up' if config_loaded else 'down' }}">{{ 'loaded' if config_loaded else 'not loaded' }}</span>
+      </li>
+    </ul>
+  </article>
+
+  {# (b) Quick links to the three editors. #}
+  <article class="quick-links">
+    <header><strong>Editors</strong></header>
+    <ul>
+      <li><a href="/config"><strong>Config</strong></a> — form-based editor for every section of <code>anna.yaml</code>.</li>
+      <li><a href="/env"><strong>Secrets</strong></a> — masked editor for <code>.env</code> with a per-key reveal toggle.</li>
+      <li><a href="/schedules"><strong>Schedules</strong></a> — list, create, edit, and delete entries in <code>schedules.yaml</code>.</li>
+    </ul>
+  </article>
+
+  {# (c) The guarded Restart control — formerly orphaned, now reachable. #}
+  <article class="restart-panel">
+    <header><strong>Apply changes</strong></header>
+    <p><small>On-disk edits don't reach the running daemon until you restart it.</small></p>
+    {% include "restart_button.html" %}
+  </article>
+
+  <script>
+    // Keep the status badges live off /healthz. /healthz is GET-only and
+    // exempt from same-origin enforcement, so this works without a token.
+    // Mirrors the inline-poll approach the restart partial already uses.
+    (function () {
+      var INTERVAL_MS = 5000;
+
+      function setBadge(id, up, upText, downText) {
+        var el = document.getElementById(id);
+        if (!el) { return; }
+        el.textContent = up ? upText : downText;
+        el.setAttribute("data-state", up ? "up" : "down");
+      }
+
+      function paint(j) {
+        setBadge("anna-status", !!(j && j.anna_running === true), "running", "stopped");
+        setBadge("config-status", !!(j && j.config_loaded === true), "loaded", "not loaded");
+      }
+
+      function tick() {
+        fetch("/healthz", {headers: {"Accept": "application/json"}})
+          .then(function (r) { return r.ok ? r.json() : null; })
+          .then(paint)
+          .catch(function () { /* leave the last-known badge state */ });
+      }
+
+      setInterval(tick, INTERVAL_MS);
+      // Server-render seeds the first paint; refresh once shortly after load.
+      tick();
+    })();
+  </script>
 {% endblock %}

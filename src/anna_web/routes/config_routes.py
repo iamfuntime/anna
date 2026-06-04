@@ -26,6 +26,7 @@ reach the handlers in this module.
 
 from __future__ import annotations
 
+import ipaddress
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
@@ -49,6 +50,42 @@ def _allowed_sections() -> list[str]:
 def _humanize(name: str) -> str:
     """snake_case → ``Snake Case``. Mirrors :func:`anna_web.schema._humanize`."""
     return " ".join(part.capitalize() for part in name.split("_"))
+
+
+# Hostnames that resolve to the local machine and never reach the network.
+_LOOPBACK_HOSTNAMES: frozenset[str] = frozenset({"localhost"})
+
+
+def is_non_loopback_host(value: Any) -> bool:
+    """True when ``value`` is a bind address reachable from off-box.
+
+    Powers the ``web.host`` safety affordance (subtask 10): the config
+    editor renders a loud inline warning whenever the operator points the
+    (auth-less) dashboard at a non-loopback address. Registered as a Jinja
+    global in :func:`anna_web.app.create_app` so templates can branch on it.
+
+    Returns ``False`` for the loopback set (``127.0.0.0/8``, ``::1``,
+    ``localhost``) and for an empty/unset value. IP literals are classified
+    via :mod:`ipaddress`; ``0.0.0.0`` / ``::`` (all-interfaces binds) and any
+    routable literal return ``True``. A non-empty hostname other than
+    ``localhost`` is treated as non-loopback — it resolves through DNS and we
+    cannot assume it stays on-box, so we warn rather than guess.
+    """
+    if value is None:
+        return False
+    host = str(value).strip()
+    if not host:
+        return False
+    if host.lower() in _LOOPBACK_HOSTNAMES:
+        return False
+    # Tolerate bracketed IPv6 literals like ``[::1]``.
+    candidate = host[1:-1] if host.startswith("[") and host.endswith("]") else host
+    try:
+        return not ipaddress.ip_address(candidate).is_loopback
+    except ValueError:
+        # Not an IP literal — a bare hostname. It resolves off the loopback
+        # set above, so treat it as network-exposed and warn.
+        return True
 
 
 def _first_line(text: str, *, limit: int = 120) -> str:

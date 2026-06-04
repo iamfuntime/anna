@@ -101,6 +101,12 @@ def create_app(cfg: AnnaConfig) -> FastAPI:
     # route modules can pull it via request.app.state.templates without
     # re-instantiating per request.
     templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
+    # Globals so the orphaned-no-longer restart partial can be `{% include %}`d
+    # from any page (Home + Config) without each route threading the unit name
+    # through its context, and so the config editor can flag a non-loopback
+    # web.host bind inline. Both reuse cfg/metadata already on hand here.
+    templates.env.globals["restart_unit"] = cfg.web.target_unit
+    templates.env.globals["is_non_loopback_host"] = config_routes.is_non_loopback_host
     app.state.templates = templates
 
     # Vendored frontend assets (htmx + pico + app.css/app.js). Mounted
@@ -114,7 +120,19 @@ def create_app(cfg: AnnaConfig) -> FastAPI:
 
     @app.get("/")
     async def _index(request: Request) -> Response:
-        return templates.TemplateResponse(request, "index.html")
+        # Server-render the live service status from the same probe
+        # /healthz exposes, so the operator overview has a meaningful
+        # state on first paint (and in no-JS contexts). The page's inline
+        # poller then keeps the badges fresh off /healthz.
+        health = await healthz_routes.gather_health(request)
+        return templates.TemplateResponse(
+            request,
+            "index.html",
+            {
+                "anna_running": health["anna_running"],
+                "config_loaded": health["config_loaded"],
+            },
+        )
 
     app.include_router(config_routes.router)
     app.include_router(env_routes.router)

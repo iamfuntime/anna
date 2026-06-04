@@ -782,7 +782,19 @@ class WebDashboardConfig(BaseModel):
     """
 
     enabled: bool = True
-    host: str = "127.0.0.1"
+    host: str = Field(
+        default="127.0.0.1",
+        description=(
+            "Bind address. The dashboard ships no authentication, so keep this "
+            "at 127.0.0.1 unless it sits behind a trusted reverse proxy or VPN — "
+            "a non-loopback bind exposes the editors to your LAN/network."
+        ),
+        # Surfaced by the web config editor: a non-loopback value renders a
+        # loud inline warning next to this field (anna_web.config_field.html).
+        # Reuses the same json_schema_extra channel as the textarea widget hint
+        # rather than inventing a parallel metadata path.
+        json_schema_extra={"warn_if_non_loopback": True},
+    )
     port: int = 8765
     target_unit: str = "anna.service"
 

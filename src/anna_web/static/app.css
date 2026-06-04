@@ -81,6 +81,55 @@
   }
 }
 
+/* Home overview — service-status badges. The inline poller flips
+ * data-state between "up"/"down"; color follows the attribute so the
+ * operator gets an at-a-glance read on the daemon + config. */
+.status-list {
+  list-style: none;
+  padding-left: 0;
+}
+
+.status-badge {
+  display: inline-block;
+  padding: 0.1rem 0.6rem;
+  border-radius: 0.375rem;
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+.status-badge[data-state="up"] {
+  background-color: #1b4332;
+  color: #d8f3dc;
+}
+
+.status-badge[data-state="down"] {
+  background-color: #5a1a1a;
+  color: #ffd6d6;
+}
+
+/* Apply-changes panel housing the (formerly orphaned) restart control on
+ * Home and the Config editors. Visually separated so the destructive-ish
+ * Restart button reads as its own affordance. */
+.restart-panel {
+  margin-top: 1.5rem;
+}
+
+/* Inline bind-host safety warning (subtask 10). Loud, high-contrast, and
+ * adjacent to the offending web.host input — but non-blocking. */
+.field-warning {
+  display: block;
+  margin: 0.4rem 0;
+  padding: 0.6rem 0.8rem;
+  border-left: 4px solid #f4a259;
+  border-radius: 0.25rem;
+  background-color: #4a3410;
+  color: #ffe9c7;
+}
+
+.field-warning code {
+  background-color: rgba(0, 0, 0, 0.25);
+}
+
 /* Masked-input row for the .env reveal toggle. The button's click
  * behavior lives in app.js — styling is the only concern here. */
 .masked-input {

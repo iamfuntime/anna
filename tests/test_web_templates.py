@@ -20,7 +20,10 @@ covers).
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Iterator
+from unittest.mock import AsyncMock, MagicMock
 
+import pytest
 from fastapi.testclient import TestClient
 from jinja2 import Environment, FileSystemLoader
 
@@ -129,3 +132,95 @@ def test_base_block_overrides_land(tmp_path: Path) -> None:
     # rather than shadows.
     assert "/static/pico.min.css" in rendered
     assert "/static/htmx.min.js" in rendered
+
+
+# ---------------------------------------------------------------------------
+# Home page rebuild (subtask 8): operator overview surfaces the restart
+# control + live status derived from /healthz, plus the three editor links.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def home_client() -> Iterator[TestClient]:
+    """TestClient over the module-level app with a swappable restart_manager.
+
+    Mirrors the fixture in test_web_restart.py: individual tests overwrite
+    ``app.state.restart_manager`` with a per-test mock so the server-rendered
+    status is deterministic, then the original is restored.
+    """
+    from anna_web.app import app
+
+    original = getattr(app.state, "restart_manager", None)
+    try:
+        yield TestClient(app)
+    finally:
+        if original is not None:
+            app.state.restart_manager = original
+
+
+def _mock_manager(active_state: str) -> MagicMock:
+    mgr = MagicMock()
+    mgr.target_unit = "anna.service"
+    mgr.also_health_probe = AsyncMock(
+        return_value={"active_state": active_state, "method": "dbus"}
+    )
+    return mgr
+
+
+def test_home_surfaces_restart_control_and_editor_links(
+    home_client: TestClient,
+) -> None:
+    """GET / includes the (previously orphaned) restart control + quick links."""
+    from anna_web.app import app
+
+    app.state.restart_manager = _mock_manager("active")
+
+    response = home_client.get("/")
+    assert response.status_code == 200
+    body = response.text
+
+    # The restart control is now reachable from Home.
+    assert 'hx-post="/restart"' in body
+    assert "Restart anna.service" in body
+
+    # Quick links to the three editors.
+    assert 'href="/config"' in body
+    assert 'href="/env"' in body
+    assert 'href="/schedules"' in body
+
+    # The dead "later subtasks" placeholder is gone.
+    assert "land in later subtasks" not in body
+
+
+def test_home_status_reflects_running_daemon(home_client: TestClient) -> None:
+    """An ``active`` probe server-renders the anna badge as ``running`` / up."""
+    from anna_web.app import app
+
+    app.state.restart_manager = _mock_manager("active")
+
+    response = home_client.get("/")
+    assert response.status_code == 200
+    body = response.text
+
+    assert 'id="anna-status"' in body
+    # Daemon up + config loaded both render as "up" badges.
+    assert "running" in body
+    assert 'data-state="up"' in body
+    # Config flag is derived from app.state.cfg being a real AnnaConfig.
+    assert 'id="config-status"' in body
+    assert "loaded" in body
+
+
+def test_home_status_reflects_dead_daemon(home_client: TestClient) -> None:
+    """An ``inactive`` probe server-renders the anna badge as ``stopped`` / down."""
+    from anna_web.app import app
+
+    app.state.restart_manager = _mock_manager("inactive")
+
+    response = home_client.get("/")
+    assert response.status_code == 200
+    body = response.text
+
+    # anna badge flips to stopped/down; config stays loaded/up (independent).
+    assert "stopped" in body
+    assert 'data-state="down"' in body

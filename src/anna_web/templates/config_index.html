@@ -23,5 +23,10 @@
       </article>
     {% endfor %}
   </div>
-  <p><small>Changes take effect after <code>systemctl --user restart anna</code>.</small></p>
+  <article class="restart-panel">
+    <header><strong>Apply changes</strong></header>
+    <p><small>Edits land on disk immediately, but the running daemon keeps its
+      in-memory config until you restart it.</small></p>
+    {% include "restart_button.html" %}
+  </article>
 {% endblock %}

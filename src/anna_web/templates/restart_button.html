@@ -32,7 +32,13 @@
     last_restart           — datetime or None (idle, post-restart)
     last_restart_relative  — "5s ago" style string or None
     toast                  — {"level": "success"|"error", "message": str} or None
+
+  When `{% include %}`d as a static control from a page that doesn't build
+  the restart context (Home, Config), `unit` is absent — fall back to the
+  `restart_unit` Jinja global wired in anna_web.app.create_app. The /restart
+  routes always pass `unit` explicitly, so this only fires for static includes.
 #}
+{% set unit = unit if unit is defined else restart_unit %}
 {% if state == "restarting" %}
 <div class="restart-status"
      data-restart-partial="restarting"

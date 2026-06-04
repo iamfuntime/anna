@@ -106,6 +106,11 @@ class FormField:
         item_template: For ``REPEATED_FIELDSET`` only — the shape of a
             single empty item. The template uses this for the "+ add
             row" UX so the new row has the right inputs.
+        extra: The field's ``json_schema_extra`` dict (empty when unset).
+            Carries opt-in rendering hints that travel with the pydantic
+            field — e.g. ``{"widget": "textarea"}`` or
+            ``{"warn_if_non_loopback": True}`` for the web.host safety
+            affordance — without overloading ``description``.
     """
 
     name: str
@@ -118,6 +123,7 @@ class FormField:
     options: list[str] = field(default_factory=list)
     children: list["FormField"] = field(default_factory=list)
     item_template: list["FormField"] | None = None
+    extra: dict[str, Any] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -200,6 +206,7 @@ def _describe_field(
             description=description,
             required=required,
             children=children,
+            extra=extra,
         )
 
     # Literal[...] → SELECT
@@ -214,6 +221,7 @@ def _describe_field(
             description=description,
             required=required,
             options=options,
+            extra=extra,
         )
 
     # list[X]
@@ -252,6 +260,7 @@ def _describe_field(
                 required=required,
                 children=children,
                 item_template=item_template,
+                extra=extra,
             )
         # list[str] (or any scalar list) → REPEATED_TEXT
         return FormField(
@@ -262,6 +271,7 @@ def _describe_field(
             value=current if isinstance(current, list) else [],
             description=description,
             required=required,
+            extra=extra,
         )
 
     # Scalar types — order matters because bool is a subclass of int.
@@ -274,6 +284,7 @@ def _describe_field(
             value=current,
             description=description,
             required=required,
+            extra=extra,
         )
     if annotation in (int, float):
         return FormField(
@@ -284,6 +295,7 @@ def _describe_field(
             value=current,
             description=description,
             required=required,
+            extra=extra,
         )
     if annotation is str:
         kind = (
@@ -299,6 +311,7 @@ def _describe_field(
             value=current,
             description=description,
             required=required,
+            extra=extra,
         )
 
     # Anything else — fall back to TEXT and let the operator type
@@ -312,6 +325,7 @@ def _describe_field(
         value=current,
         description=description,
         required=required,
+        extra=extra,
     )
 
 
