@@ -32,6 +32,7 @@ full design.
 
 from __future__ import annotations
 
+import ipaddress
 import uuid
 from urllib.parse import urlparse
 
@@ -42,6 +43,35 @@ from starlette.types import ASGIApp
 
 
 _MUTATING_METHODS: frozenset[str] = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+
+def is_wildcard_host(value: str | None) -> bool:
+    """True when ``value`` is an all-interfaces wildcard bind (``0.0.0.0`` / ``::``).
+
+    A wildcard bind has no single canonical origin: the browser reaches
+    the dashboard at whatever concrete address routes to the box
+    (``192.168.x.y``, a tailscale IP, a LAN hostname), so the literal
+    ``http://0.0.0.0:8765`` origin string the app factory would otherwise
+    build never matches a real ``Origin`` header. The app factory passes
+    the result of this check to :class:`SameOriginMiddleware` so the
+    same-origin comparison anchors to the request ``Host`` header for
+    wildcard binds instead of the un-matchable static origin.
+
+    Returns ``False`` for ``None``/empty and for any concrete literal or
+    hostname (those keep the strict static-origin path). Tolerates a
+    bracketed IPv6 literal like ``[::]``.
+    """
+    if value is None:
+        return False
+    host = str(value).strip()
+    if not host:
+        return False
+    candidate = host[1:-1] if host.startswith("[") and host.endswith("]") else host
+    try:
+        return ipaddress.ip_address(candidate).is_unspecified
+    except ValueError:
+        # Not an IP literal — a bare hostname is never a wildcard bind.
+        return False
 
 
 def _origin_tuple(origin: str) -> tuple[str, str, int | None] | None:
@@ -74,6 +104,18 @@ class SameOriginMiddleware(BaseHTTPMiddleware):
     builds this from ``cfg.web.host`` + ``cfg.web.port``; tests can
     pass anything.
 
+    ``wildcard_host`` handles the all-interfaces bind case. When the
+    operator points ``cfg.web.host`` at ``0.0.0.0`` / ``::`` (the
+    intended LAN-bind path), the static ``allowed_origin`` becomes
+    ``http://0.0.0.0:8765`` — an origin no browser ever sends, so a
+    strict static match would 403 every POST and silently turn the
+    dashboard read-only. With ``wildcard_host=True`` the same-origin
+    check instead anchors to the request's own ``Host`` header (the
+    concrete address the browser actually used to reach the server),
+    which a cross-site attacker still cannot forge. The static-origin
+    path is left byte-for-byte unchanged for the loopback / concrete
+    bind case.
+
     Scope:
 
     * Methods: POST, PUT, PATCH, DELETE.
@@ -87,14 +129,22 @@ class SameOriginMiddleware(BaseHTTPMiddleware):
     * Read the request's ``Origin`` header.
     * If absent and method is mutating: 403 with ``"missing Origin"``.
     * If present, parse and compare scheme + hostname + port against
-      the configured allowed origin.
+      the expected origin — the configured static origin normally, or
+      the request ``Host`` header when ``wildcard_host`` is set.
     * Mismatch: 403.
     * Match: pass through.
     """
 
-    def __init__(self, app: ASGIApp, *, allowed_origin: str) -> None:
+    def __init__(
+        self,
+        app: ASGIApp,
+        *,
+        allowed_origin: str,
+        wildcard_host: bool = False,
+    ) -> None:
         super().__init__(app)
         self._allowed_origin_raw = allowed_origin
+        self._wildcard_host = wildcard_host
         parsed = _origin_tuple(allowed_origin)
         if parsed is None:
             # Caller blew up before we could enforce anything. Fail
@@ -126,16 +176,44 @@ class SameOriginMiddleware(BaseHTTPMiddleware):
             )
 
         requested = _origin_tuple(origin)
-        if requested is None or self._allowed_tuple is None:
+        # For a wildcard bind the static origin is un-matchable, so the
+        # expected origin is derived from the request's own Host header
+        # (the concrete address the browser used). For every other bind
+        # it's the static origin parsed at construction time.
+        expected = (
+            self._host_origin_tuple(request)
+            if self._wildcard_host
+            else self._allowed_tuple
+        )
+        if requested is None or expected is None:
             return PlainTextResponse(
                 "invalid Origin header",
                 status_code=403,
             )
 
-        if requested != self._allowed_tuple:
+        if requested != expected:
             return PlainTextResponse(
                 "Origin mismatch",
                 status_code=403,
             )
 
         return await call_next(request)
+
+    def _host_origin_tuple(
+        self, request: Request
+    ) -> tuple[str, str, int | None] | None:
+        """Build the expected origin tuple from the request ``Host`` header.
+
+        Used only for wildcard binds. The browser sends ``Host`` (the
+        address it dialed) and ``Origin`` (scheme + that same address)
+        consistently for a same-origin request, so comparing the
+        ``Origin`` against ``scheme://<Host>`` enforces same-origin
+        without a single canonical bind URL. A cross-site request still
+        carries the attacker's ``Origin`` against the dashboard's
+        ``Host`` and fails the comparison. Returns ``None`` (→ 403,
+        fail-closed) when no ``Host`` header is present.
+        """
+        host_header = request.headers.get("host")
+        if not host_header:
+            return None
+        return _origin_tuple(f"{request.url.scheme}://{host_header}")

@@ -90,7 +90,11 @@ class ScheduleStore:
                 )
             cache[schedule.id] = schedule
         self._cache = cache
-        self._log.info("scheduler.store.loaded", count=len(self._cache), path=str(self._path))
+        # DEBUG, not INFO: the web adapter reloads on every read (every
+        # /schedules view), so an INFO line here floods journald during
+        # normal operation. Keep normal operation silent; an operator
+        # debugging the store can still see it at DEBUG.
+        self._log.debug("scheduler.store.loaded", count=len(self._cache), path=str(self._path))
 
     async def save(self) -> None:
         """Atomically persist the cache to ``schedules.yaml``.

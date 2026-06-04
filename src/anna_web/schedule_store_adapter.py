@@ -25,16 +25,26 @@ expects.
 
 Concurrency: the daemon and the dashboard each hold their own
 in-process ``Supervisor`` lock. Per-process serialization is
-guaranteed inside each. Cross-process safety relies on
-``os.replace`` atomicity on save and the fact that the daemon only
-mutates *state* fields (``state.last_fired_at``,
-``state.consecutive_failures``, ``enabled`` on auto-disable) while
-the dashboard only mutates *definition* fields (``cron``, ``prompt``,
-``destination``, ``timezone``, ``timeout_seconds``,
-``natural_language``, ``enabled`` on operator toggle). The
-non-overlapping write sets keep the race documented in the plan an
-"at worst, dashboard write loses if daemon races on the *same* field"
-edge case rather than a correctness hole.
+guaranteed inside each, and ``os.replace`` atomicity on save keeps a
+reader from ever seeing a torn file. What atomicity does *not* buy is
+freedom from lost updates. ``ScheduleStore.save`` serializes the
+*entire* in-memory cache — every row, definition and state fields
+alike — from whatever snapshot the adapter's last :meth:`_reload`
+loaded. The two processes do touch disjoint field sets (the daemon
+writes *state*: ``state.last_fired_at``, ``state.consecutive_failures``,
+``enabled`` on auto-disable; the dashboard writes *definition*:
+``cron``, ``prompt``, ``destination``, ``timezone``,
+``timeout_seconds``, ``natural_language``, ``enabled`` on operator
+toggle), but because each save rewrites the whole file, a daemon state
+write that lands in the window between the dashboard's reload and its
+save is clobbered back to the reloaded snapshot — across *all* rows,
+not just the row the operator edited. Reloading immediately before
+every read-modify-write (see :meth:`_reload`) shrinks that window to
+the span of a single mutation but does not eliminate it. This is an
+accepted edge case for v1 — the file is tiny and writes are
+infrequent, so the collision window is small, and the daemon
+re-persists current state on its next poll — not a correctness
+guarantee.
 
 See ``Inbox/2026-06-02-ANNA-Web-Dashboard-Plan.md``, "Architecture →
 Schedule UI — direct ScheduleStore use" for the full design.

@@ -29,7 +29,7 @@ from anna.log import get_logger
 from anna_web import audit as web_audit
 from anna_web.config_store import ConfigStore
 from anna_web.env_store import EnvStore
-from anna_web.middleware import SameOriginMiddleware
+from anna_web.middleware import SameOriginMiddleware, is_wildcard_host
 from anna_web.restart import RestartManager
 from anna_web.routes import (
     config_routes,
@@ -145,9 +145,17 @@ def create_app(cfg: AnnaConfig) -> FastAPI:
     # it runs first in the request pipeline (Starlette layers middleware
     # in reverse-registration order). The healthz endpoint is GET-only
     # and therefore unrestricted by the middleware itself.
+    #
+    # A wildcard bind (0.0.0.0 / ::) has no single canonical origin —
+    # the static "http://0.0.0.0:8765" never matches a real browser's
+    # Origin, which would silently 403 every POST and leave the LAN-bind
+    # dashboard read-only. In that case the middleware anchors the
+    # same-origin check to the request's Host header instead. Concrete /
+    # loopback binds keep the strict static-origin match unchanged.
     app.add_middleware(
         SameOriginMiddleware,
         allowed_origin=f"http://{cfg.web.host}:{cfg.web.port}",
+        wildcard_host=is_wildcard_host(cfg.web.host),
     )
 
     return app

@@ -24,10 +24,17 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
-from anna_web.middleware import SameOriginMiddleware
+from anna_web.middleware import SameOriginMiddleware, is_wildcard_host
 
 
 ALLOWED_ORIGIN = "http://127.0.0.1:8765"
+
+# Concrete LAN address a wildcard (0.0.0.0) bind is actually reached at.
+# The wildcard probe app's TestClient dials this, so the browser-style
+# Host/Origin headers carry it and the Host-anchored same-origin check
+# has something real to match against.
+WILDCARD_BASE_URL = "http://192.168.1.50:8765"
+WILDCARD_ORIGIN = "http://192.168.1.50:8765"
 
 # Sentinel that signals the conftest's auto-Origin patch to NOT
 # inject the default Origin header on this request. Tests that
@@ -36,11 +43,19 @@ ALLOWED_ORIGIN = "http://127.0.0.1:8765"
 NO_ORIGIN: dict[str, str] = {"x-test-omit-origin": "1"}
 
 
-def _build_probe_app() -> FastAPI:
+def _build_probe_app(
+    *,
+    allowed_origin: str = ALLOWED_ORIGIN,
+    wildcard_host: bool = False,
+) -> FastAPI:
     """Construct a minimal FastAPI app wired with the middleware.
 
     The probe route returns ``request.state.request_id`` so the
     request_id-tagging assertion can read it back through HTTP.
+
+    ``allowed_origin`` / ``wildcard_host`` mirror the middleware's
+    constructor so the wildcard-bind cases can exercise the
+    Host-header-anchored path.
     """
     app = FastAPI()
 
@@ -70,7 +85,11 @@ def _build_probe_app() -> FastAPI:
             {"options": True, "request_id": request.state.request_id}
         )
 
-    app.add_middleware(SameOriginMiddleware, allowed_origin=ALLOWED_ORIGIN)
+    app.add_middleware(
+        SameOriginMiddleware,
+        allowed_origin=allowed_origin,
+        wildcard_host=wildcard_host,
+    )
     return app
 
 
@@ -237,3 +256,107 @@ def test_request_id_is_short() -> None:
     # uuid4().hex[:12] is exactly 12 lowercase hex chars.
     assert len(request_id) == 12
     int(request_id, 16)  # parseable as hex; raises ValueError if not
+
+
+# ---------------------------------------------------------------------------
+# 8. Wildcard bind (0.0.0.0 / ::) anchors the same-origin check to the
+#    request Host header instead of the un-matchable static origin.
+#
+#    Regression guard: building allowed_origin as "http://0.0.0.0:8765"
+#    for a LAN bind used to 403 every POST (no browser sends that Origin),
+#    silently making the dashboard read-only. With wildcard_host=True the
+#    middleware compares the Origin against the address the browser
+#    actually dialed (the Host header), so a real same-origin POST passes
+#    while cross-site and missing-Origin requests still 403.
+# ---------------------------------------------------------------------------
+
+
+def _wildcard_client() -> TestClient:
+    """TestClient for a 0.0.0.0-bound probe app, dialed at a LAN address.
+
+    ``base_url`` drives the ``Host`` header TestClient sends, so the
+    Host-anchored same-origin check has a concrete address to match.
+    """
+    app = _build_probe_app(allowed_origin="http://0.0.0.0:8765", wildcard_host=True)
+    return TestClient(app, base_url=WILDCARD_BASE_URL)
+
+
+def test_wildcard_bind_accepts_same_origin_post() -> None:
+    """A same-origin POST (Origin == the dialed Host) is NOT 403."""
+    client = _wildcard_client()
+    response = client.post(
+        "/config/web",
+        json={},
+        headers={"Origin": WILDCARD_ORIGIN},
+    )
+    assert response.status_code == 200
+    assert response.json()["posted"] is True
+
+
+def test_wildcard_bind_rejects_cross_origin_post() -> None:
+    """Cross-site Origin against a wildcard bind still 403s."""
+    client = _wildcard_client()
+    response = client.post(
+        "/config/web",
+        json={},
+        headers={"Origin": "http://evil.example"},
+    )
+    assert response.status_code == 403
+    assert "Origin" in response.text
+
+
+def test_wildcard_bind_rejects_missing_origin_post() -> None:
+    """Missing Origin on a mutating request still 403s under a wildcard bind."""
+    client = _wildcard_client()
+    response = client.post("/config/web", json={}, headers=NO_ORIGIN)
+    assert response.status_code == 403
+    assert "missing Origin" in response.text
+
+
+def test_wildcard_bind_rejects_mismatched_port_post() -> None:
+    """The Host-anchored check still enforces an exact port match."""
+    client = _wildcard_client()
+    response = client.post(
+        "/config/web",
+        json={},
+        headers={"Origin": "http://192.168.1.50:9999"},
+    )
+    assert response.status_code == 403
+
+
+def test_loopback_bind_unchanged_with_static_origin() -> None:
+    """Non-wildcard (loopback) behavior is byte-for-byte the strict match.
+
+    A matching static Origin passes; a host that merely *looks* like the
+    box but isn't the configured bind still 403s. This pins that the
+    wildcard branch did not leak into the default path.
+    """
+    client = TestClient(_build_probe_app())  # wildcard_host defaults False
+    ok = client.post("/config/web", json={}, headers={"Origin": ALLOWED_ORIGIN})
+    assert ok.status_code == 200
+    # Same bare request the wildcard path would accept off its Host header
+    # must NOT pass the strict loopback static match.
+    bad = client.post(
+        "/config/web", json={}, headers={"Origin": "http://testserver"}
+    )
+    assert bad.status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# 9. is_wildcard_host classifier.
+# ---------------------------------------------------------------------------
+
+
+def test_is_wildcard_host_true_for_unspecified_binds() -> None:
+    assert is_wildcard_host("0.0.0.0") is True
+    assert is_wildcard_host("::") is True
+    assert is_wildcard_host("[::]") is True  # bracketed IPv6 literal
+
+
+def test_is_wildcard_host_false_for_concrete_and_empty() -> None:
+    assert is_wildcard_host("127.0.0.1") is False
+    assert is_wildcard_host("::1") is False
+    assert is_wildcard_host("192.168.1.50") is False
+    assert is_wildcard_host("localhost") is False
+    assert is_wildcard_host("") is False
+    assert is_wildcard_host(None) is False
