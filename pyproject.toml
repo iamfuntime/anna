@@ -122,6 +122,11 @@ packages = ["src/anna", "src/anna_web"]
 [tool.hatch.build.targets.wheel.force-include]
 "src/anna/setup/templates/anna.service" = "anna/setup/templates/anna.service"
 "src/anna/setup/templates/anna-web.service" = "anna/setup/templates/anna-web.service"
+# Ship the repo-root .env.example INTO the wheel, colocated with the
+# anna_web package, so the deployed dashboard can resolve it at runtime
+# via importlib.resources (see anna_web.env_store._resolve_env_example).
+# Single source of truth: the repo-root file, not a second copy.
+".env.example" = "anna_web/.env.example"
 
 [tool.hatch.build.targets.sdist]
 include = [

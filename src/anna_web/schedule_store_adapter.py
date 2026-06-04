@@ -86,24 +86,27 @@ class ScheduleStoreAdapter:
         self._config = config
         self._supervisor = Supervisor(config=config)
         self._store = ScheduleStore(config=config, supervisor=self._supervisor)
-        self._loaded = False
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
-    async def _ensure_loaded(self) -> None:
-        """Lazy-load the schedules cache on first use.
+    async def _reload(self) -> None:
+        """Rebuild the in-memory cache from ``schedules.yaml`` on every read.
 
-        The underlying store leaves the cache empty until :meth:`load`
-        runs; we defer until the first route call so app construction
-        stays synchronous (FastAPI's lifespan hook is async but the
-        scaffold keeps it minimal).
+        The dashboard is one of several writers to ``schedules.yaml``:
+        the daemon mutates state fields on its poll cycle, the MCP
+        ``schedule_create`` tool adds rows, and the operator may
+        hand-edit the file. An earlier ``_loaded`` latch cached the
+        first load forever, so out-of-band changes never surfaced until
+        the web process restarted. We now reload before every read and
+        before every read-modify-write mutation — the same
+        re-read-every-call discipline :meth:`ConfigStore.load_validated`
+        and :meth:`EnvStore.load` already follow. The underlying
+        ``ScheduleStore.load`` is idempotent (it rebuilds the cache from
+        disk) and the file is tiny, so no mtime gating is warranted.
         """
-        if self._loaded:
-            return
         await self._store.load()
-        self._loaded = True
 
     # ------------------------------------------------------------------
     # Read surface
@@ -117,11 +120,11 @@ class ScheduleStoreAdapter:
         the in-memory cache; callers must not mutate the returned
         models in place.
         """
-        await self._ensure_loaded()
+        await self._reload()
         return self._store.list()
 
     async def get(self, schedule_id: str) -> Schedule | None:
-        await self._ensure_loaded()
+        await self._reload()
         return self._store.get(schedule_id)
 
     # ------------------------------------------------------------------
@@ -134,7 +137,7 @@ class ScheduleStoreAdapter:
         Raises :class:`ScheduleValidationError` for duplicate id,
         invalid cron, or a reserved (admin) destination channel.
         """
-        await self._ensure_loaded()
+        await self._reload()
         return await self._store.create(schedule, actor_conv="web:operator")
 
     async def update(self, schedule_id: str, schedule: Schedule) -> Schedule:
@@ -146,7 +149,7 @@ class ScheduleStoreAdapter:
         dict the underlying store understands. ``id`` is immutable
         and ``state`` is owned by the daemon, so neither is forwarded.
         """
-        await self._ensure_loaded()
+        await self._reload()
         existing = self._store.get(schedule_id)
         if existing is None:
             raise ScheduleValidationError(
@@ -180,5 +183,5 @@ class ScheduleStoreAdapter:
         Raises :class:`ScheduleValidationError` if the id does not
         exist; the route layer maps that to a 404.
         """
-        await self._ensure_loaded()
+        await self._reload()
         await self._store.delete(schedule_id, actor_conv="web:operator")

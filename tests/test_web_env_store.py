@@ -22,6 +22,7 @@ from pathlib import Path
 
 import pytest
 
+from anna_web import env_store
 from anna_web.env_store import DOCUMENTED_VARS, DocumentedVar, EnvStore
 
 
@@ -260,3 +261,77 @@ def test_set_audit_payload_never_contains_value() -> None:
     the test stub here keeps the obligation visible in the suite's
     skip count instead of in a TODO that nobody greps for.
     """
+
+
+# ---------------------------------------------------------------------------
+# 9. .env.example path resolution (subtasks 2-3).
+# ---------------------------------------------------------------------------
+#
+# In the deployed uv-tool wheel the old ``parent.parent.parent``
+# heuristic overshot to a nonexistent path, so DOCUMENTED_VARS came up
+# empty and the Secrets page showed zero Documented rows. The resolver
+# now prefers the copy packaged alongside the ``anna_web`` package
+# (force-included into the wheel) and falls back to the repo-root file
+# only when the packaged copy is absent. These two tests pin both
+# branches; they fail against the pre-fix code, which has no
+# ``_resolve_env_example`` to import at all.
+
+
+def test_resolve_env_example_prefers_packaged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Simulate the installed-wheel layout: a packaged copy is preferred.
+
+    We stub ``importlib.resources.files("anna_web")`` to point at a tmp
+    directory holding our own ``.env.example``. The resolver must pick
+    that packaged copy (not the dev-tree fallback), and parsing it must
+    yield the documented vars we seeded — proving the deployed wheel
+    populates the Secrets page instead of emptying it.
+    """
+    pkg_dir = tmp_path / "site-packages" / "anna_web"
+    pkg_dir.mkdir(parents=True)
+    (pkg_dir / ".env.example").write_text(
+        "# Bot token\nSLACK_BOT_TOKEN=\n# A plain setting\nANNA_LOG_LEVEL=INFO\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        env_store.importlib_resources, "files", lambda _name: pkg_dir
+    )
+
+    resolved = env_store._resolve_env_example()
+    assert resolved == pkg_dir / ".env.example"
+
+    documented = env_store._parse_env_example(resolved)
+    by_name = {v.name: v for v in documented}
+    assert set(by_name) == {"SLACK_BOT_TOKEN", "ANNA_LOG_LEVEL"}
+    assert by_name["SLACK_BOT_TOKEN"].kind == "secret"
+    assert by_name["ANNA_LOG_LEVEL"].kind == "text"
+
+
+def test_resolve_env_example_falls_back_to_dev_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When no packaged copy exists, fall back to the repo-root file.
+
+    Stub the package location at an empty directory (no ``.env.example``)
+    to mimic an editable install where the wheel data was never staged.
+    The resolver must fall back to the dev-tree repo-root file, which
+    exists and parses to the real ~19-var documented list.
+    """
+    empty_pkg = tmp_path / "editable" / "anna_web"
+    empty_pkg.mkdir(parents=True)
+    assert not (empty_pkg / ".env.example").exists()  # sanity: no packaged copy
+
+    monkeypatch.setattr(
+        env_store.importlib_resources, "files", lambda _name: empty_pkg
+    )
+
+    resolved = env_store._resolve_env_example()
+    assert resolved == env_store._DEV_ENV_EXAMPLE
+    assert resolved.name == ".env.example"
+    assert resolved.is_file()
+
+    documented = env_store._parse_env_example(resolved)
+    assert documented, "dev-tree fallback must populate the documented list"
+    assert any(v.name == "SLACK_BOT_TOKEN" for v in documented)

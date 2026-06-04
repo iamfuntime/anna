@@ -33,6 +33,7 @@ EnvStore — secrets handling" for the full design.
 
 from __future__ import annotations
 
+import importlib.resources as importlib_resources
 import os
 import re
 from dataclasses import dataclass
@@ -40,16 +41,53 @@ from pathlib import Path
 
 from dotenv import dotenv_values, set_key, unset_key
 
+from anna.log import get_logger
+
+# Operational logger, same structlog surface the rest of the web
+# package uses (see anna_web.restart / anna_web.audit). Used only for
+# the empty-documented-vars regression guard below; normal operation
+# stays silent.
+_log = get_logger("anna.web.env_store")
+
 # Tokens in the env-var KEY that flip the rendered row to a masked
 # input. Anything that smells like a credential gets a reveal-toggle;
 # everything else is plain text. Conservative on purpose — better to
 # mask a non-secret than to leak one.
 _SECRET_TOKENS = ("TOKEN", "KEY", "SECRET", "PASSWORD", "PASS", "WEBHOOK")
 
-# Resolve the canonical .env.example once at import time. The
-# package lives at ``src/anna_web/env_store.py``; the example sits at
-# the repo root, two parents up from this file.
-_ENV_EXAMPLE = Path(__file__).resolve().parent.parent.parent / ".env.example"
+# Repo-root fallback for the editable dev tree. The package lives at
+# ``src/anna_web/env_store.py``; the example sits at the repo root,
+# three parents up from this file.
+_DEV_ENV_EXAMPLE = Path(__file__).resolve().parent.parent.parent / ".env.example"
+
+
+def _resolve_env_example() -> Path:
+    """Locate ``.env.example`` in both the installed wheel and dev tree.
+
+    The deployed dashboard runs from a uv-tool wheel where the old
+    ``parent.parent.parent`` heuristic overshoots to a nonexistent
+    path, leaving :data:`DOCUMENTED_VARS` empty and the Secrets page
+    with zero Documented rows. We now prefer the copy packaged
+    alongside the ``anna_web`` package (force-included by pyproject's
+    wheel build), and fall back to the repo-root file only when the
+    packaged copy is absent — i.e. an editable install off the source
+    tree, where no wheel data was staged.
+    """
+    try:
+        packaged = importlib_resources.files("anna_web") / ".env.example"
+        candidate = Path(str(packaged))
+        if candidate.is_file():
+            return candidate
+    except (ModuleNotFoundError, FileNotFoundError, TypeError):
+        # ModuleNotFoundError: anna_web not importable (shouldn't happen
+        # from inside it). FileNotFoundError/TypeError: defensive against
+        # non-filesystem resource backends. Fall through to the dev tree.
+        pass
+    return _DEV_ENV_EXAMPLE
+
+
+# Resolve the canonical .env.example once at import time.
+_ENV_EXAMPLE = _resolve_env_example()
 
 # Matches a ``KEY=`` or ``KEY=value`` line. We deliberately accept
 # the dotenv-comment-prefix form (``# KEY=...``) as well, because
@@ -184,6 +222,23 @@ def _parse_env_example(path: Path) -> list[DocumentedVar]:
 # :meth:`EnvStore.delete`.
 DOCUMENTED_VARS: list[DocumentedVar] = _parse_env_example(_ENV_EXAMPLE)
 _DOCUMENTED_NAMES: frozenset[str] = frozenset(v.name for v in DOCUMENTED_VARS)
+
+# Loud regression guard. An empty documented list means the Secrets
+# page renders zero Documented rows — almost always a packaging
+# regression (``.env.example`` not shipped in the wheel) rather than an
+# intentional state. Surface it at WARNING so it shows up in journald
+# instead of silently emptying the page. Normal operation, where the
+# file resolves and parses, stays silent.
+if not DOCUMENTED_VARS:
+    _log.warning(
+        "anna.web.env.documented_vars_empty",
+        env_example_path=str(_ENV_EXAMPLE),
+        hint=(
+            "No documented env vars parsed from .env.example; the Secrets "
+            "page will show zero Documented rows. Check that .env.example is "
+            "packaged into the wheel (pyproject force-include)."
+        ),
+    )
 
 
 class EnvStore:
