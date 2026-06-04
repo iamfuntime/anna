@@ -939,6 +939,62 @@ class VoiceConfig(BaseModel):
     outbound: VoiceOutboundConfig = Field(default_factory=VoiceOutboundConfig)
 
 
+class ImagesInboundConfig(BaseModel):
+    """Inbound image-understanding config.
+
+    A dragged-in image on Slack arrives as a ``files[]`` entry. When
+    ``enabled`` the adapter downloads each accepted image and carries the
+    raw bytes on the ``InboundEvent`` so the worker can hand them to the
+    model as base64 image content blocks.
+
+    * ``max_images`` — cap on images attached to a single turn; overflow
+      is skipped with an operator-facing marker.
+    * ``max_image_size_bytes`` — per-image hard cap (checked against the
+      Slack ``size`` field before download and against the downloaded
+      byte length after).
+    * ``max_total_bytes`` — aggregate cap across all images on the turn.
+    """
+
+    enabled: bool = True
+    max_images: int = 8
+    max_image_size_bytes: int = 5_242_880  # 5 MB per image
+    max_total_bytes: int = 20_971_520  # 20 MB total per turn
+
+    @field_validator("max_images")
+    @classmethod
+    def _max_images_positive(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError("images.inbound.max_images must be > 0")
+        return v
+
+    @field_validator("max_image_size_bytes")
+    @classmethod
+    def _image_size_positive(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError("images.inbound.max_image_size_bytes must be > 0")
+        return v
+
+    @field_validator("max_total_bytes")
+    @classmethod
+    def _total_bytes_positive(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError("images.inbound.max_total_bytes must be > 0")
+        return v
+
+
+class ImagesConfig(BaseModel):
+    """Top-level image-understanding block.
+
+    Like voice, images are a runtime-level capability the Slack adapter
+    consumes upstream of the router. A config without an ``images:``
+    section validates with image understanding on; the operator flips
+    ``inbound.enabled`` to opt out. Telegram and the CLI transport are
+    image-agnostic for now and unaffected.
+    """
+
+    inbound: ImagesInboundConfig = Field(default_factory=ImagesInboundConfig)
+
+
 class IdentityAliasEntry(BaseModel):
     """Phase 2 §5 identity alias.
 
@@ -999,6 +1055,7 @@ class AnnaConfig(BaseModel):
     subagents: SubagentsConfig = Field(default_factory=SubagentsConfig)
     web: WebDashboardConfig = Field(default_factory=WebDashboardConfig)
     voice: VoiceConfig = Field(default_factory=VoiceConfig)
+    images: ImagesConfig = Field(default_factory=ImagesConfig)
     identities: list[IdentityAliasEntry] = Field(default_factory=list)
 
     # Derived runtime paths. Not in the YAML file. ANNA_HOME from .env wins,

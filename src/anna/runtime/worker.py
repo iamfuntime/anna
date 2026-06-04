@@ -9,6 +9,8 @@ checkpoint when it idles out.
 from __future__ import annotations
 
 import asyncio
+import base64
+from collections.abc import AsyncIterator
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
@@ -31,7 +33,13 @@ from anna.tools.vault_tools import VaultTools
 from anna.tools.web_server import WEB_TOOL_NAMES, build_web_server
 from anna.tools.web_tools import WebTools
 from anna.runtime.visibility import NULL_VISIBILITY, VisibilityCallbacks
-from anna.transports.base import ChannelAdapter, InboundEvent, OutboundMessage, SignalHandle
+from anna.transports.base import (
+    ChannelAdapter,
+    ImageAttachment,
+    InboundEvent,
+    OutboundMessage,
+    SignalHandle,
+)
 from anna.vault.checkpoint import list_recent_checkpoints, write_checkpoint
 from anna.vault.transcript_resume import (
     latest_checkpoint_mtime,
@@ -1040,6 +1048,36 @@ class ConversationWorker:
         finally:
             self._client = None
 
+    async def _build_image_prompt(
+        self, query_text: str, images: list[ImageAttachment]
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Yield a single stream-json user message carrying images.
+
+        The SDK's ``query`` accepts ``str | AsyncIterable[dict]``. The
+        string branch wraps text as a user message; the AsyncIterable
+        branch writes each yielded dict verbatim to the CLI stdin. We
+        yield exactly one dict whose content is the text block followed by
+        one base64 image block per attachment, so the model receives the
+        operator's caption and the dragged-in images in the same turn.
+        """
+        content: list[dict[str, Any]] = [{"type": "text", "text": query_text}]
+        for image in images:
+            content.append(
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": image.media_type,
+                        "data": base64.b64encode(image.data).decode(),
+                    },
+                }
+            )
+        yield {
+            "type": "user",
+            "message": {"role": "user", "content": content},
+            "parent_tool_use_id": None,
+        }
+
     async def _handle(self, event: InboundEvent) -> None:
         if self._client is None:
             if event.completion_future is not None and not event.completion_future.done():
@@ -1126,7 +1164,16 @@ class ConversationWorker:
             # (not ``event.text``) carries the cadence reminder when
             # one was loaded.
             try:
-                await self._client.query(query_text)  # type: ignore[attr-defined]
+                # Image inbound (Slack drag-and-drop): hand the SDK an
+                # AsyncIterable yielding one stream-json user message with
+                # base64 image blocks. All text and voice turns keep the
+                # byte-for-byte string path.
+                prompt = (
+                    self._build_image_prompt(query_text, event.images)
+                    if event.images
+                    else query_text
+                )
+                await self._client.query(prompt)  # type: ignore[attr-defined]
             except Exception as exc:
                 self._log.error("worker.sdk_query_failed", error=str(exc))
                 if event.completion_future is not None and not event.completion_future.done():

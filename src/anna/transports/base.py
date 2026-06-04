@@ -25,6 +25,22 @@ from typing import Any
 
 
 @dataclass(frozen=True)
+class ImageAttachment:
+    """A single inbound image carried on an :class:`InboundEvent`.
+
+    ``media_type`` is the Anthropic-viewable MIME type (one of
+    image/jpeg, image/png, image/gif, image/webp) and ``data`` is the
+    raw image bytes as downloaded from the transport. The worker
+    base64-encodes ``data`` into an SDK image content block at query
+    time. Kept deliberately tiny — transports build these only after the
+    subtype allow-set and size caps have passed.
+    """
+
+    media_type: str
+    data: bytes
+
+
+@dataclass(frozen=True)
 class InboundEvent:
     """Normalized event from any transport.
 
@@ -57,6 +73,13 @@ class InboundEvent:
     constructor; subsequent events on the same conv_key reuse the
     already-flagged worker.
 
+    ``images`` carries inbound image attachments (Slack drag-and-drop)
+    as :class:`ImageAttachment` records the worker base64-encodes into
+    SDK image content blocks. Empty for every text and voice turn; voice
+    inbound is exclusive and never co-carries images. Like the callable
+    fields it is excluded from compare / hash / repr so the dataclass
+    stays hashable and the raw bytes never bloat logs.
+
     Both callable / future fields are excluded from compare / hash so
     the dataclass remains hashable and equality compares on the
     semantic payload only. ``ephemeral`` is similarly excluded so a
@@ -80,6 +103,9 @@ class InboundEvent:
     )
     ephemeral: bool = field(
         default=False, compare=False, hash=False, repr=False
+    )
+    images: list[ImageAttachment] = field(
+        default_factory=list, compare=False, hash=False, repr=False
     )
 
 

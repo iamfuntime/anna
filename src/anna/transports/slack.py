@@ -17,13 +17,16 @@ import asyncio
 import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlparse
 
 import httpx
 
 from anna.config import AnnaConfig
 from anna.log import get_logger
+from anna.transports.mrkdwn import normalize_to_slack_mrkdwn
 from anna.transports.base import (
     ChannelAdapter,
+    ImageAttachment,
     InboundEvent,
     InboundHandler,
     OutboundMessage,
@@ -33,6 +36,17 @@ from anna.transports.slack_thread_state import ThreadParticipation
 
 if TYPE_CHECKING:  # pragma: no cover - import-only for typing
     from anna.runtime.voice import VoiceProcessor
+
+# Anthropic-viewable raster image types. Slack also delivers svg+xml,
+# heic/heif, tiff, and bmp as ``image/*`` files; those are NOT accepted
+# by the model's image block, so we reject them with an operator-facing
+# marker rather than shipping bytes the API will refuse.
+_SUPPORTED_IMAGE_MIMES = {
+    "image/jpeg",
+    "image/png",
+    "image/gif",
+    "image/webp",
+}
 
 
 class SlackAdapter(ChannelAdapter):
@@ -137,7 +151,17 @@ class SlackAdapter(ChannelAdapter):
         # operator still gets a reply.
         if not (audio_sent and self._config.voice.outbound.voice_only):
             try:
-                kwargs: dict[str, Any] = {"channel": channel, "text": message.text}
+                # Normalize GitHub-flavored Markdown to Slack mrkdwn at the
+                # transport boundary — the model emits ``**bold**``, ``##
+                # headings``, ``[text](url)`` links, and ```` ```lang ````
+                # fences that Slack renders as literal characters otherwise.
+                # Applied ONLY to the posted text; the voice-synth path above
+                # uses the raw ``message.text``, and ``blocks`` (structured)
+                # pass through untouched. This is the single shared send path
+                # the slack_post MCP tool also routes through, so report cards
+                # and skill posts are normalized here too.
+                mrkdwn_text = normalize_to_slack_mrkdwn(message.text)
+                kwargs: dict[str, Any] = {"channel": channel, "text": mrkdwn_text}
                 if thread_ts:
                     kwargs["thread_ts"] = thread_ts
                 if message.structured and "blocks" in message.structured:
@@ -370,6 +394,13 @@ class SlackAdapter(ChannelAdapter):
         # with mode == "audio" / mimetype == "audio/webm". When present,
         # rewrite the inbound text to the transcript (or a polite error
         # one-liner) before dispatch so the worker sees a normal turn.
+        #
+        # Voice takes precedence and is EXCLUSIVE: a turn carrying a voice
+        # note never also carries images (image detection is skipped). Only
+        # a non-voice turn runs image detection. Both branches clear the
+        # voice-inbound mark for text-like turns so the outbound path does
+        # not treat an image-only turn as a rolling voice window.
+        images: list[ImageAttachment] = []
         voice_file = self._detect_voice_file(event)
         if voice_file is not None:
             text = await self._handle_voice_inbound(
@@ -377,11 +408,20 @@ class SlackAdapter(ChannelAdapter):
                 voice_file=voice_file,
                 conv_key=conv_key,
             )
-        elif self._voice is not None:
-            # Text (non-voice) inbound: clear any prior voice-inbound mark so
-            # the outbound path treats the literal most-recent inbound as
-            # text, not a rolling 10-minute voice window.
-            self._voice.clear_voice_inbound(conv_key=conv_key)
+        else:
+            image_files = self._detect_image_files(event, voice_file=voice_file)
+            if image_files:
+                text, images = await self._handle_image_inbound(
+                    event=event,
+                    image_files=image_files,
+                    conv_key=conv_key,
+                    caption=text,
+                )
+            if self._voice is not None:
+                # Text / image (non-voice) inbound: clear any prior
+                # voice-inbound mark so the outbound path treats the literal
+                # most-recent inbound as text, not a rolling voice window.
+                self._voice.clear_voice_inbound(conv_key=conv_key)
 
         return InboundEvent(
             transport="slack",
@@ -392,6 +432,7 @@ class SlackAdapter(ChannelAdapter):
             is_dm=is_dm,
             is_thread=is_thread,
             raw=event,
+            images=images,
         )
 
     # ------------------------------------------------------------------
@@ -516,24 +557,83 @@ class SlackAdapter(ChannelAdapter):
         when ``keep_audio_files`` is true; otherwise to a tempfile the
         VoiceProcessor unlinks after transcribe.
         """
-        url = voice_file.get("url_private_download") or voice_file.get("url_private")
-        if not url:
-            raise RuntimeError("slack voice file has no download URL")
-
-        bot_token = os.environ.get("SLACK_BOT_TOKEN", "")
         ext = self._voice_extension(voice_file)
         dest = self._voice_dest_path(
             conv_key=conv_key, message_id=message_id, ext=ext
         )
+        content = await self._download_slack_file(voice_file)
+        dest.write_bytes(content)
+        return dest
 
-        async with httpx.AsyncClient() as client:
+    async def _download_slack_file(
+        self, file_entry: dict[str, Any], *, max_bytes: int | None = None
+    ) -> bytes:
+        """Download a Slack ``files[]`` entry and return its raw bytes.
+
+        Uses ``url_private_download`` (falling back to ``url_private``)
+        with a ``Bearer <bot_token>`` header — the Slack file CDN
+        requires bot-token auth. Shared by the voice and image inbound
+        paths; the voice wrapper writes the bytes to a dest path, the
+        image path keeps them in memory for base64 encoding.
+
+        Hardening (code-review fast-follow):
+
+        * The download host is validated to be a Slack host BEFORE the
+          ``Bearer`` token is attached, so the bot token is never leaked to
+          an attacker-controlled URL smuggled into a ``files[]`` entry.
+        * Redirects are not followed (``follow_redirects=False``) and a
+          non-200 status raises, so a redirect cannot silently return a
+          non-image body under an otherwise-valid image MIME.
+        * When ``max_bytes`` is provided (the image path passes the
+          per-image cap), a ``Content-Length`` larger than the cap aborts
+          before the body is returned. The voice path passes ``None`` and
+          keeps its prior behavior; the image handler's post-download length
+          check remains the authoritative guard.
+        """
+        url = file_entry.get("url_private_download") or file_entry.get("url_private")
+        if not url:
+            raise RuntimeError("slack file has no download URL")
+
+        # Never send the bot token to a non-Slack host. Slack serves files
+        # from ``files.slack.com`` (and other ``*.slack.com`` CDN hosts).
+        host = (urlparse(url).hostname or "").lower()
+        if not (host == "files.slack.com" or host.endswith(".slack.com")):
+            self._log.warning(
+                "channel.download.bad_host", channel="slack", host=host
+            )
+            raise RuntimeError(
+                f"refusing to send bot token to non-Slack host: {host!r}"
+            )
+
+        bot_token = os.environ.get("SLACK_BOT_TOKEN", "")
+        async with httpx.AsyncClient(follow_redirects=False) as client:
             resp = await client.get(
                 url,
                 headers={"Authorization": f"Bearer {bot_token}"},
             )
             resp.raise_for_status()
-            dest.write_bytes(resp.content)
-        return dest
+            # raise_for_status does not fire on 3xx; with redirects disabled a
+            # redirect would otherwise return a redirect body. Require 200.
+            status = getattr(resp, "status_code", 200)
+            if status != 200:
+                raise RuntimeError(f"unexpected status {status} downloading slack file")
+
+            if max_bytes is not None:
+                headers = getattr(resp, "headers", {}) or {}
+                content_length = headers.get("Content-Length") or headers.get(
+                    "content-length"
+                )
+                if content_length is not None:
+                    try:
+                        declared = int(content_length)
+                    except (TypeError, ValueError):
+                        declared = None
+                    if declared is not None and declared > max_bytes:
+                        raise RuntimeError(
+                            f"content-length {declared} exceeds cap {max_bytes}"
+                        )
+
+            return resp.content
 
     @staticmethod
     def _voice_extension(voice_file: dict[str, Any]) -> str:
@@ -558,6 +658,219 @@ class SlackAdapter(ChannelAdapter):
         fd, name = tempfile.mkstemp(suffix=f".{ext}", prefix="anna-voice-")
         os.close(fd)
         return Path(name)
+
+    # ------------------------------------------------------------------
+    # Phase 2.6 image inbound
+    # ------------------------------------------------------------------
+
+    def _detect_image_files(
+        self,
+        event: dict[str, Any],
+        *,
+        voice_file: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Classify every ``image/*`` ``files[]`` entry for this event.
+
+        Returns a list of decision records, one per image attachment, in
+        delivery order. Each record is ``{"entry", "mime", "status"}``
+        where ``status`` is:
+
+        * ``"ok"`` — supported subtype within the per-turn image count;
+        * ``"unsupported"`` — an ``image/*`` subtype the model cannot
+          view (svg+xml, heic/heif, tiff, bmp, …);
+        * ``"overflow"`` — supported but beyond ``max_images``.
+
+        The entry matched as the voice file (if any) is skipped — voice
+        is exclusive, so in practice this is defensive. Size and total
+        caps are NOT applied here; :meth:`_handle_image_inbound` owns
+        those (it needs the downloaded byte length).
+        """
+        files = event.get("files")
+        if not isinstance(files, list):
+            return []
+
+        voice_id = (
+            voice_file.get("id") if isinstance(voice_file, dict) else None
+        )
+        max_images = self._config.images.inbound.max_images
+
+        records: list[dict[str, Any]] = []
+        accepted = 0
+        for entry in files:
+            if not isinstance(entry, dict):
+                continue
+            mimetype = entry.get("mimetype", "")
+            if not (isinstance(mimetype, str) and mimetype.startswith("image/")):
+                continue
+            if voice_id is not None and entry.get("id") == voice_id:
+                continue
+            if mimetype not in _SUPPORTED_IMAGE_MIMES:
+                records.append(
+                    {"entry": entry, "mime": mimetype, "status": "unsupported"}
+                )
+                continue
+            if accepted >= max_images:
+                records.append(
+                    {"entry": entry, "mime": mimetype, "status": "overflow"}
+                )
+                continue
+            accepted += 1
+            records.append({"entry": entry, "mime": mimetype, "status": "ok"})
+        return records
+
+    async def _handle_image_inbound(
+        self,
+        *,
+        event: dict[str, Any],
+        image_files: list[dict[str, Any]],
+        conv_key: str,
+        caption: str,
+    ) -> tuple[str, list[ImageAttachment]]:
+        """Download accepted inbound images and build the carried text.
+
+        Mirrors the voice graceful-failure pattern: every skip or failure
+        appends an operator-facing marker to the text so the model still
+        gets a turn and the operator gets feedback — images are never
+        silently dropped. Returns ``(text, images)`` where ``text`` is the
+        caption (or ``"[image]"`` when a caption-less turn carried at least
+        one accepted image) with any markers appended, and ``images`` is the
+        list of successfully downloaded attachments.
+        """
+        cfg = self._config.images.inbound
+
+        # Failure mode: images arrive but image understanding is off. No
+        # download — return the marker only.
+        if not cfg.enabled:
+            self._log.info(
+                "image.inbound.disabled",
+                channel="slack",
+                conv_key=conv_key,
+                count=len(image_files),
+            )
+            return (
+                self._compose_image_text(
+                    caption,
+                    ["[image received — image understanding is off]"],
+                    accepted=0,
+                ),
+                [],
+            )
+
+        markers: list[str] = []
+        images: list[ImageAttachment] = []
+        total = 0
+
+        for record in image_files:
+            status = record["status"]
+            entry = record["entry"]
+            mime = record["mime"]
+
+            if status == "unsupported":
+                self._log.warning(
+                    "image.unsupported",
+                    channel="slack",
+                    conv_key=conv_key,
+                    mime=mime,
+                )
+                markers.append(
+                    f"[unsupported image type: {mime} — please send "
+                    "PNG/JPG/GIF/WebP]"
+                )
+                continue
+
+            if status == "overflow":
+                markers.append("[some images were skipped (limit reached)]")
+                continue
+
+            # Pre-check the Slack-reported size BEFORE downloading so a
+            # wildly oversize image never hits the CDN.
+            size = entry.get("size")
+            if isinstance(size, int) and size > cfg.max_image_size_bytes:
+                self._log.warning(
+                    "image.oversize",
+                    channel="slack",
+                    conv_key=conv_key,
+                    size=size,
+                    stage="pre",
+                )
+                markers.append(f"[image too large ({size} bytes) — skipped]")
+                continue
+
+            try:
+                data = await self._download_slack_file(
+                    entry, max_bytes=cfg.max_image_size_bytes
+                )
+            except Exception as exc:
+                self._log.warning(
+                    "image.download_failed",
+                    channel="slack",
+                    conv_key=conv_key,
+                    error=str(exc),
+                )
+                markers.append("[couldn't download an image — please try again]")
+                continue
+
+            # Post-check the actual byte length (Slack's ``size`` field can
+            # be absent or stale).
+            n = len(data)
+            if n > cfg.max_image_size_bytes:
+                self._log.warning(
+                    "image.oversize",
+                    channel="slack",
+                    conv_key=conv_key,
+                    size=n,
+                    stage="post",
+                )
+                markers.append(f"[image too large ({n} bytes) — skipped]")
+                continue
+
+            # Aggregate cap across all accepted images on this turn.
+            if total + n > cfg.max_total_bytes:
+                self._log.warning(
+                    "image.oversize",
+                    channel="slack",
+                    conv_key=conv_key,
+                    size=n,
+                    total=total,
+                    stage="total",
+                )
+                markers.append("[some images were skipped (limit reached)]")
+                continue
+
+            total += n
+            images.append(ImageAttachment(media_type=mime, data=data))
+
+        return (
+            self._compose_image_text(caption, markers, accepted=len(images)),
+            images,
+        )
+
+    @staticmethod
+    def _compose_image_text(
+        caption: str, markers: list[str], *, accepted: int
+    ) -> str:
+        """Build the inbound text for an image turn.
+
+        A present caption is preserved as the lead line. A caption-less
+        turn that still landed at least one image gets a ``"[image]"``
+        placeholder so both the transcript line and the SDK text block are
+        non-empty. Markers (deduped, order-preserved) follow on their own
+        lines so the operator sees any skip/failure feedback.
+        """
+        parts: list[str] = []
+        caption = (caption or "").strip()
+        if caption:
+            parts.append(caption)
+        elif accepted >= 1:
+            parts.append("[image]")
+
+        seen: set[str] = set()
+        for marker in markers:
+            if marker not in seen:
+                seen.add(marker)
+                parts.append(marker)
+
+        return "\n".join(p for p in parts if p)
 
     @classmethod
     def conversation_key_for(cls, event: Any) -> str:

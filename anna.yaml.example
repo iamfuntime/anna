@@ -538,6 +538,30 @@ voice:
     timeout_seconds: 30
 
 # ============================================================
+# images: inbound image understanding.
+#
+# A dragged-in image on Slack arrives as a files[] entry. When
+# enabled, the adapter downloads each accepted image and hands the
+# raw bytes to the model as a base64 image content block in the same
+# turn as the caption (or a "[image]" placeholder when caption-less).
+# Only Anthropic-viewable raster types are accepted (PNG, JPG, GIF,
+# WebP); svg/heic/tiff/bmp are skipped with an operator-facing note.
+# Voice takes precedence and is exclusive — a voice note never also
+# carries images. Telegram and the CLI transport are image-agnostic.
+# ============================================================
+images:
+  inbound:
+    enabled: true
+    # Max images attached to a single turn; extras are skipped with a
+    # "limit reached" marker.
+    max_images: 8
+    # 5 MB per-image hard cap; checked against the Slack-reported size
+    # before download and the actual byte length after.
+    max_image_size_bytes: 5242880
+    # 20 MB aggregate cap across all images on one turn.
+    max_total_bytes: 20971520
+
+# ============================================================
 # identities: Phase 2 §5 cross-transport identity aliasing.
 #
 # DO NOT UNCOMMENT. Identity aliasing across slack/telegram/cli is

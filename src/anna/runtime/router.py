@@ -185,6 +185,7 @@ class ConversationRouter:
             "router.dispatch",
             conv_key=event.conversation_key,
             transport=event.transport,
+            image_count=len(event.images),
         )
         await worker.submit(event)
 
