@@ -3,7 +3,9 @@
 Subtask 10 of the Phase 2.5 buildout. This module owns the operator's
 "Restart anna.service" button: a small async manager that talks to the
 operator's user systemd over dbus when it can, and falls back to
-shelling out to ``systemctl --user restart <unit>`` when it can't.
+shelling out to a *cgroup-detached* ``systemd-run --user --scope
+systemctl --user restart <unit>`` when it can't (see
+:func:`build_restart_argv` for why the detach is mandatory).
 
 The whole point of having ``dbus-next`` installed (subtask 1) is to
 avoid forking a subprocess for the common path. dbus is in-process,
@@ -39,6 +41,46 @@ _SYSTEMD_MANAGER_IFACE = "org.freedesktop.systemd1.Manager"
 _SYSTEMD_UNIT_IFACE = "org.freedesktop.systemd1.Unit"
 
 RestartMethod = Literal["dbus", "subprocess"]
+
+
+def build_restart_argv(unit: str) -> list[str]:
+    """Build the argv for the subprocess restart fallback.
+
+    Returns the command that restarts ``unit`` *detached from the
+    caller's cgroup*::
+
+        systemd-run --user --scope systemctl --user restart <unit>
+
+    The ``--user --scope`` prefix is load-bearing. When the daemon
+    restarts its **own** unit, a bare ``systemctl --user restart <unit>``
+    forks the systemctl/bash child *inside anna.service's own cgroup*.
+    The restart's stop phase then SIGKILLs the whole cgroup — including
+    the systemctl process that was supposed to issue the subsequent
+    start. Net result: the service stops cleanly but never comes back
+    (two outages on 2026-06-05 traced to exactly this).
+
+    ``systemd-run --user --scope`` launches the restart in a fresh
+    transient scope unit with its own cgroup, which outlives
+    anna.service's cgroup, so the start phase survives the stop.
+
+    The detach is applied uniformly (not just for the self-unit). Only
+    the self-restart strictly needs it, but the detached form is a no-op
+    for restarting a *different* unit — it just runs the same systemctl
+    in a transient scope — so applying it everywhere keeps one code path
+    instead of branching on "is this our own unit?", which would itself
+    be fragile (unit-name aliasing, anna.service vs anna). Cheaper and
+    safer to detach unconditionally.
+    """
+    return [
+        "systemd-run",
+        "--user",
+        "--scope",
+        "--collect",
+        "systemctl",
+        "--user",
+        "restart",
+        unit,
+    ]
 
 
 @dataclass(frozen=True)
@@ -151,12 +193,16 @@ class RestartManager:
         return str(job_path)
 
     async def _restart_via_subprocess(self) -> None:
-        """Run ``systemctl --user restart <unit>`` and await its exit."""
+        """Run the detached restart command and await its exit.
+
+        Uses :func:`build_restart_argv`, which wraps ``systemctl --user
+        restart <unit>`` in ``systemd-run --user --scope`` so the restart
+        survives the SIGKILL of anna.service's cgroup during the stop
+        phase. See :func:`build_restart_argv` for the full rationale.
+        """
+        argv = build_restart_argv(self._unit)
         proc = await asyncio.create_subprocess_exec(
-            "systemctl",
-            "--user",
-            "restart",
-            self._unit,
+            *argv,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -164,7 +210,8 @@ class RestartManager:
         if proc.returncode != 0:
             err = (stderr or b"").decode("utf-8", errors="replace").strip()
             raise RuntimeError(
-                f"systemctl exited {proc.returncode}: {err or '(no stderr)'}"
+                f"systemd-run/systemctl exited {proc.returncode}: "
+                f"{err or '(no stderr)'}"
             )
 
     # ------------------------------------------------------------------

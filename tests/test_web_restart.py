@@ -37,7 +37,48 @@ import pytest
 from fastapi.testclient import TestClient
 
 from anna_web.app import app
-from anna_web.restart import RestartManager, RestartResult
+from anna_web.restart import RestartManager, RestartResult, build_restart_argv
+
+
+# ---------------------------------------------------------------------------
+# build_restart_argv() — the detached restart command construction.
+# ---------------------------------------------------------------------------
+
+
+def test_build_restart_argv_detaches_via_systemd_run() -> None:
+    """The restart fallback wraps systemctl in a transient systemd scope.
+
+    A bare ``systemctl --user restart anna.service`` issued from inside
+    anna.service's own cgroup gets SIGKILLed mid-restart (the stop phase
+    kills the whole cgroup, including the systemctl that would start the
+    service back up). ``systemd-run --user --scope`` runs the restart in
+    a fresh cgroup that outlives anna.service's, so the start survives.
+    """
+    assert build_restart_argv("anna.service") == [
+        "systemd-run",
+        "--user",
+        "--scope",
+        "--collect",
+        "systemctl",
+        "--user",
+        "restart",
+        "anna.service",
+    ]
+
+
+def test_build_restart_argv_parameterized_on_unit() -> None:
+    """The unit name flows through to the tail of the argv unchanged."""
+    argv = build_restart_argv("anna-web.service")
+    assert argv[:7] == [
+        "systemd-run",
+        "--user",
+        "--scope",
+        "--collect",
+        "systemctl",
+        "--user",
+        "restart",
+    ]
+    assert argv[-1] == "anna-web.service"
 
 
 # ---------------------------------------------------------------------------
@@ -142,10 +183,18 @@ async def test_restart_falls_back_to_subprocess() -> None:
     assert result.method == "subprocess"
     assert result.error is None
     assert result.job_id is None
-    # Subprocess invocation shape: systemctl --user restart <unit>.
+    # Subprocess invocation shape: the restart is detached from anna's
+    # own cgroup via ``systemd-run --user --scope`` so it survives the
+    # SIGKILL of the cgroup during the stop phase.
     call_args = p.await_args.args
-    assert call_args[:3] == ("systemctl", "--user", "restart")
-    assert call_args[3] == "anna.service"
+    assert call_args[:5] == (
+        "systemd-run",
+        "--user",
+        "--scope",
+        "--collect",
+        "systemctl",
+    )
+    assert call_args[5:8] == ("--user", "restart", "anna.service")
 
 
 # ---------------------------------------------------------------------------
