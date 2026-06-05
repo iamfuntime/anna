@@ -82,16 +82,19 @@ async def _run(config: AnnaConfig) -> None:
     # spins up. The bundled Claude CLI discovers host CLAUDE.md / skills /
     # plugins / local MCP from CLAUDE_CONFIG_DIR (defaults to $HOME/.claude);
     # the daemon inherits the operator's HOME, so without this every worker
-    # leaks the operator's entire Claude Code environment. The helper seeds the
-    # isolated dir with only a symlink to the real .credentials.json so
-    # max-mode auth survives.
+    # leaks the operator's entire Claude Code environment. Credentials are NOT
+    # seeded into this dir — workers point the CLI at the operator's real
+    # ~/.claude via CLAUDE_SECURESTORAGE_CONFIG_DIR (in max mode) so OAuth reads
+    # and the refresh-write share the operator's .credentials.json directly.
     runtime_dir = ensure_isolated_config_dir(
         config.claude_runtime_dir, config.auth.mode
     )
+    securestorage_dir = config.claude_securestorage_dir
     log.info(
         "anna.claude_runtime.ready",
         dir=str(runtime_dir),
-        credentials_linked=(runtime_dir / ".credentials.json").is_symlink(),
+        securestorage_dir=str(securestorage_dir),
+        credentials_present=(securestorage_dir / ".credentials.json").exists(),
     )
 
     # Defensive cwd-walk scan. Even with CLAUDE_CONFIG_DIR relocated, the CLI

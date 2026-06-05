@@ -388,6 +388,24 @@ class ConversationWorker:
     def _build_slack_alert_tools(self) -> SlackAlertTools:
         return SlackAlertTools(self._config, self._adapters)
 
+    def _build_claude_env(self) -> dict[str, str]:
+        """Env overrides for the spawned bundled-CLI subprocess.
+
+        ``CLAUDE_CONFIG_DIR`` relocates host CLAUDE.md / skills / plugins /
+        local-MCP discovery onto ANNA's isolated runtime dir. In max mode we
+        ALSO set ``CLAUDE_SECURESTORAGE_CONFIG_DIR`` to the operator's real
+        ~/.claude so credential reads and the OAuth refresh-write share the
+        operator's ``.credentials.json``. In api_key mode the key comes from
+        the inherited env, so the securestorage knob is left unset (mirroring
+        how the old credentials symlink was max-mode-only).
+        """
+        env = {"CLAUDE_CONFIG_DIR": str(self._config.claude_runtime_dir)}
+        if self._config.auth.mode == "max":
+            env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] = str(
+                self._config.claude_securestorage_dir
+            )
+        return env
+
     def _build_options(self) -> Any:
         """Construct the ClaudeAgentOptions for this worker.
 
@@ -563,10 +581,13 @@ class ConversationWorker:
             # Relocate the bundled CLI's host discovery off the operator's
             # ~/.claude. CLAUDE_CONFIG_DIR is what the CLI walks for memory
             # (CLAUDE.md), skills, plugins, and local MCP; pointing it at the
-            # isolated runtime dir (seeded with only a .credentials.json
-            # symlink for max-mode auth) stops ANNA inheriting the operator's
-            # entire Claude Code environment.
-            env={"CLAUDE_CONFIG_DIR": str(self._config.claude_runtime_dir)},
+            # isolated runtime dir stops ANNA inheriting the operator's entire
+            # Claude Code environment. CLAUDE_SECURESTORAGE_CONFIG_DIR is a
+            # SEPARATE knob the CLI uses to resolve the credentials dir; in
+            # max mode we point it at the operator's real ~/.claude so OAuth
+            # reads and the refresh-write (temp-file + rename) land directly on
+            # the shared .credentials.json instead of clobbering a symlink.
+            env=self._build_claude_env(),
             # ANNA runs as a headless systemd service with no operator at a
             # terminal to approve tool calls. The default permission_mode is
             # interactive prompting, which means every tool call hangs forever

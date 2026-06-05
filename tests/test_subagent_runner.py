@@ -458,9 +458,21 @@ def test_build_subagent_options_setting_sources_empty(tmp_path: Path) -> None:
     assert options.setting_sources == []
 
 
-def test_build_subagent_options_sets_claude_config_dir_env(tmp_path: Path) -> None:
-    """Sub-agents get the same isolated CLAUDE_CONFIG_DIR as the main loop."""
+def test_build_subagent_options_sets_claude_config_dir_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Sub-agents get the same isolated CLAUDE_CONFIG_DIR as the main loop.
+
+    In max mode they ALSO get CLAUDE_SECURESTORAGE_CONFIG_DIR pointing at the
+    operator's real ~/.claude so OAuth reads / refresh-writes share the
+    operator's .credentials.json (no symlink seeded).
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+
     runner = _make_runner_with_tools(tmp_path, tools_enabled=True)
+    assert runner._config.auth.mode == "max"  # noqa: SLF001
     options = runner._build_subagent_options(  # noqa: SLF001
         system_prompt="system",
         conv_key="subagent:slug:abc",
@@ -468,7 +480,33 @@ def test_build_subagent_options_sets_claude_config_dir_env(tmp_path: Path) -> No
     assert options.env["CLAUDE_CONFIG_DIR"] == str(
         runner._config.claude_runtime_dir  # noqa: SLF001
     )
+    assert options.env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] == str(
+        home / ".claude"
+    )
+    assert options.env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] == str(
+        runner._config.claude_securestorage_dir  # noqa: SLF001
+    )
     assert options.setting_sources == []
+
+
+def test_build_subagent_options_omits_securestorage_in_api_key_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """api_key mode does not set CLAUDE_SECURESTORAGE_CONFIG_DIR for sub-agents."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+
+    runner = _make_runner_with_tools(tmp_path, tools_enabled=True)
+    runner._config.auth.mode = "api_key"  # noqa: SLF001
+    options = runner._build_subagent_options(  # noqa: SLF001
+        system_prompt="system",
+        conv_key="subagent:slug:abc",
+    )
+    assert options.env["CLAUDE_CONFIG_DIR"] == str(
+        runner._config.claude_runtime_dir  # noqa: SLF001
+    )
+    assert "CLAUDE_SECURESTORAGE_CONFIG_DIR" not in options.env
 
 
 def test_build_subagent_options_cwd_is_vault_root(tmp_path: Path) -> None:

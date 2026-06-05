@@ -674,6 +674,24 @@ class SubAgentRunner:
     # Sub-agent ClaudeAgentOptions builder (subtask 5)
     # ------------------------------------------------------------------
 
+    def _build_claude_env(self) -> dict[str, str]:
+        """Env overrides for the spawned sub-agent CLI subprocess.
+
+        ``CLAUDE_CONFIG_DIR`` relocates host CLAUDE.md / skills / plugins /
+        local-MCP discovery onto ANNA's isolated runtime dir. In max mode we
+        ALSO set ``CLAUDE_SECURESTORAGE_CONFIG_DIR`` to the operator's real
+        ~/.claude so credential reads and the OAuth refresh-write share the
+        operator's ``.credentials.json``. In api_key mode the key comes from
+        the inherited env, so the securestorage knob is left unset (mirroring
+        the main-session worker and the old max-mode-only credentials symlink).
+        """
+        env = {"CLAUDE_CONFIG_DIR": str(self._config.claude_runtime_dir)}
+        if self._config.auth.mode == "max":
+            env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] = str(
+                self._config.claude_securestorage_dir
+            )
+        return env
+
     def _build_subagent_options(
         self,
         system_prompt: str,
@@ -760,7 +778,7 @@ class SubAgentRunner:
             # CLI's memory/skills/plugins/local-MCP discovery off the
             # operator's ~/.claude so no host Claude Code env leaks in.
             setting_sources=[],
-            env={"CLAUDE_CONFIG_DIR": str(self._config.claude_runtime_dir)},
+            env=self._build_claude_env(),
             permission_mode=permission_mode,
             # Resolved MCP servers only. Never anna_self_edit, anna_google,
             # or anna_delegate — build_mcp_servers enforces that.

@@ -410,3 +410,55 @@ def test_build_options_no_external_servers_by_default(tmp_path: Path) -> None:
     for server in options.mcp_servers.values():
         assert server.get("type") != "stdio"
         assert server.get("type") != "http"
+
+
+def test_build_options_env_isolates_config_and_securestorage_max(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Max mode env relocates CLAUDE_CONFIG_DIR and shares ~/.claude credentials.
+
+    CLAUDE_CONFIG_DIR points at the isolated runtime dir (host discovery off the
+    operator's tree); CLAUDE_SECURESTORAGE_CONFIG_DIR points at the operator's
+    real ~/.claude so OAuth reads and the refresh-write share the operator's
+    .credentials.json. No credentials symlink is involved.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+
+    worker = _make_worker(tmp_path)
+    assert worker._config.auth.mode == "max"
+    options = worker._build_options()
+
+    assert options.env["CLAUDE_CONFIG_DIR"] == str(
+        worker._config.claude_runtime_dir
+    )
+    assert options.env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] == str(
+        home / ".claude"
+    )
+    # The securestorage dir is exactly the operator's real ~/.claude.
+    assert options.env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] == str(
+        worker._config.claude_securestorage_dir
+    )
+
+
+def test_build_options_env_omits_securestorage_in_api_key_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """api_key mode does not set CLAUDE_SECURESTORAGE_CONFIG_DIR.
+
+    The key comes from the inherited env; sharing the operator's credentials
+    dir is a max-mode-only behavior (mirroring the old credentials symlink).
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+
+    worker = _make_worker(tmp_path)
+    worker._config.auth.mode = "api_key"
+    options = worker._build_options()
+
+    assert options.env["CLAUDE_CONFIG_DIR"] == str(
+        worker._config.claude_runtime_dir
+    )
+    assert "CLAUDE_SECURESTORAGE_CONFIG_DIR" not in options.env

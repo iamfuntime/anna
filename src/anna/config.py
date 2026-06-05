@@ -1151,10 +1151,29 @@ class AnnaConfig(BaseModel):
         """Isolated CLAUDE_CONFIG_DIR for ANNA's spawned CLI subprocesses.
 
         Relocates host Claude Code discovery (CLAUDE.md / skills / plugins /
-        local MCP under ~/.claude) off the operator's dir. Seeded with only a
-        symlink to the real .credentials.json so max-mode auth survives.
+        local MCP under ~/.claude) off the operator's dir. Credentials are NOT
+        seeded here; they are resolved separately via
+        ``CLAUDE_SECURESTORAGE_CONFIG_DIR`` (see
+        :meth:`claude_securestorage_dir`) so max-mode OAuth refresh writes land
+        on the operator's shared ~/.claude/.credentials.json.
         """
         return self.anna_home / ".claude-runtime"
+
+    @property
+    def claude_securestorage_dir(self) -> Path:
+        """Operator's real ``~/.claude`` dir for ``CLAUDE_SECURESTORAGE_CONFIG_DIR``.
+
+        The bundled CLI resolves the credentials directory from this env var
+        independently of ``CLAUDE_CONFIG_DIR``. Pointing it at the operator's
+        real ~/.claude lets max-mode credential reads and the OAuth refresh
+        (temp-file + rename) operate directly on the shared
+        ``.credentials.json`` rather than a relocated symlink. Derived from the
+        same source of truth as the auth layer so the value is never
+        duplicated.
+        """
+        from anna.auth import operator_securestorage_dir
+
+        return operator_securestorage_dir()
 
     @property
     def google_state_dir(self) -> Path:

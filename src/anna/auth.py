@@ -28,6 +28,31 @@ _log = get_logger("anna.auth")
 AuthMode = Literal["max", "api_key"]
 
 
+def operator_credentials_path() -> Path:
+    """Resolve the operator's real Claude Code credentials file.
+
+    The bundled Claude CLI persists its OAuth session to
+    ``<credentials dir>/.credentials.json``. ANNA shares that file with the
+    operator's primary ``claude login`` so max-mode auth resolves and survives
+    token rotation. This is the single source of truth for both the credentials
+    file and (via :func:`operator_securestorage_dir`) the directory ANNA hands
+    the CLI as ``CLAUDE_SECURESTORAGE_CONFIG_DIR``.
+    """
+    return Path(os.path.expanduser("~/.claude/.credentials.json"))
+
+
+def operator_securestorage_dir() -> Path:
+    """Resolve the operator's real ``~/.claude`` directory.
+
+    This is the directory the bundled CLI reads/writes credentials in. ANNA
+    passes it as ``CLAUDE_SECURESTORAGE_CONFIG_DIR`` so OAuth token refresh
+    (a temp-file + rename) lands directly on the shared ``.credentials.json``
+    instead of clobbering a symlink. Derived as the parent of
+    :func:`operator_credentials_path` so the value is never duplicated.
+    """
+    return operator_credentials_path().parent
+
+
 @dataclass(frozen=True)
 class AuthResult:
     mode: AuthMode
@@ -94,14 +119,18 @@ def ensure_isolated_config_dir(runtime_dir: Path, mode: AuthMode) -> Path:
     subprocess leaks all of that. Pointing the subprocess at this isolated dir
     relocates that discovery off the operator's tree.
 
-    The only thing seeded into the dir is a symlink to the real
-    ``~/.claude/.credentials.json`` so that max-mode OAuth still resolves. In
-    ``api_key`` mode the dir is created empty (the key comes from the env).
+    Credentials are NOT seeded here. The bundled CLI resolves the credentials
+    directory from a separate env var, ``CLAUDE_SECURESTORAGE_CONFIG_DIR``
+    (see :func:`operator_securestorage_dir`), so both credential reads and the
+    OAuth refresh-write land directly on the operator's shared
+    ``~/.claude/.credentials.json``. There is no longer a credentials symlink to
+    seed (or to be clobbered by the refresh's temp-file + rename).
 
-    Idempotent: safe to call on every boot. An existing link/file at the
-    target is replaced so the symlink self-heals if the source rotates. A
-    directory squatting at the target is removed first, and any seeding failure
-    downgrades to a WARNING rather than failing boot.
+    Idempotent: safe to call on every boot. Any stale ``.credentials.json``
+    left in the runtime dir from the previous (symlink-seeding) design is
+    removed so a previously-clobbered real file there cannot shadow the
+    securestorage-resolved credentials. Cleanup failures downgrade to a WARNING
+    rather than failing boot.
 
     Args:
         runtime_dir: The isolated dir to ready (typically
@@ -109,49 +138,28 @@ def ensure_isolated_config_dir(runtime_dir: Path, mode: AuthMode) -> Path:
         mode: The configured :data:`AuthMode`.
 
     Returns:
-        ``runtime_dir`` (created, 0700, optionally seeded).
+        ``runtime_dir`` (created, 0700).
     """
     runtime_dir.mkdir(parents=True, exist_ok=True)
     os.chmod(runtime_dir, 0o700)
 
-    if mode != "max":
-        # api_key mode: the SDK reads ANTHROPIC_API_KEY from the env, so there
-        # is nothing to seed. The empty isolated dir is enough to relocate
-        # host discovery.
-        return runtime_dir
-
-    source = Path(os.path.expanduser("~/.claude/.credentials.json"))
-    target = runtime_dir / ".credentials.json"
-
-    if not source.exists():
-        # Max mode but no host credentials. The SDK may still find credentials
-        # elsewhere; warn and continue rather than failing boot.
-        _log.warning(
-            "auth.isolated_config.credentials_missing",
-            source=str(source),
-            runtime_dir=str(runtime_dir),
-        )
-        return runtime_dir
-
-    # Replace any stale link/file so the symlink self-heals across credential
-    # rotations and across a switch from a previously-copied file. Seeding must
-    # never fail boot: a directory squatting at the target, a permission error,
-    # or any other OSError downgrades to a WARNING and leaves credentials
-    # unlinked (the caller derives credentials_linked from is_symlink()).
+    # Remove any leftover .credentials.json (symlink, real file, or even a
+    # directory) seeded by the previous design. With credentials now resolved
+    # via CLAUDE_SECURESTORAGE_CONFIG_DIR, anything at this path in the runtime
+    # dir is stale and could shadow the shared credentials. Tolerate its
+    # absence and never fail boot.
+    stale = runtime_dir / ".credentials.json"
     try:
-        if target.is_dir() and not target.is_symlink():
-            # A real directory at the credential path cannot be unlink()'d;
-            # remove the tree so the symlink can take its place.
-            shutil.rmtree(target)
-        if target.is_symlink() or target.exists():
-            target.unlink()
-        target.symlink_to(source)
+        if stale.is_dir() and not stale.is_symlink():
+            shutil.rmtree(stale)
+        elif stale.is_symlink() or stale.exists():
+            stale.unlink()
     except OSError as exc:
         _log.warning(
-            "auth.isolated_config.seed_failed",
-            source=str(source),
-            target=str(target),
+            "auth.isolated_config.stale_credentials_cleanup_failed",
+            target=str(stale),
             runtime_dir=str(runtime_dir),
             error=str(exc),
         )
+
     return runtime_dir
