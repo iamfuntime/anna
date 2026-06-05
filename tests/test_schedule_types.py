@@ -63,6 +63,27 @@ def test_schedule_minimum_fields() -> None:
     assert s.enabled is True
     assert s.natural_language is None
     assert s.state.consecutive_failures == 0
+    assert s.ephemeral is False
+
+
+def test_schedule_ephemeral_opt_in() -> None:
+    s = _make_schedule(ephemeral=True)
+    assert s.ephemeral is True
+
+
+def test_schedule_ephemeral_defaults_false_when_omitted() -> None:
+    """A record with no ``ephemeral`` key (legacy schedules.yaml) loads as
+    non-ephemeral, preserving the existing behavior."""
+    rebuilt = Schedule.model_validate(
+        {
+            "id": "legacy",
+            "cron": "0 6 * * *",
+            "prompt": "x",
+            "destination": {"transport": "slack", "channel": "C1"},
+            "created_at": datetime(2026, 6, 1, 6, 0, 0, tzinfo=timezone.utc),
+        }
+    )
+    assert rebuilt.ephemeral is False
 
 
 def test_schedule_with_natural_language_preserves_both() -> None:

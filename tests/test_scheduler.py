@@ -125,6 +125,7 @@ def _make_schedule(
     channel: str = "CMORN",
     timeout_seconds: int = 300,
     enabled: bool = True,
+    ephemeral: bool = False,
     state: ScheduleState | None = None,
 ) -> Schedule:
     return Schedule(
@@ -134,6 +135,7 @@ def _make_schedule(
         destination=ScheduleDestination(transport=transport, channel=channel),  # type: ignore[arg-type]
         timeout_seconds=timeout_seconds,
         enabled=enabled,
+        ephemeral=ephemeral,
         created_at=datetime(2026, 6, 1, 6, 0, 0, tzinfo=timezone.utc),
         state=state or ScheduleState(),
     )
@@ -181,6 +183,29 @@ async def test_fire_builds_event_with_completion_future(tmp_path: Path) -> None:
     assert event.conversation_key.startswith("schedule:morning-brief:")
     assert event.text == "Compose a morning brief."
     assert event.completion_future is not None
+    # Default schedule is non-ephemeral.
+    assert event.ephemeral is False
+
+
+@pytest.mark.asyncio
+async def test_fire_ephemeral_schedule_dispatches_ephemeral_event(tmp_path: Path) -> None:
+    """A schedule with ephemeral=True must dispatch an InboundEvent whose
+    ephemeral flag is True so the worker runs with fresh context."""
+    cfg, store = await _make_store_with_schedule(
+        tmp_path, schedule=_make_schedule(ephemeral=True)
+    )
+    router = FakeRouter()
+    sched = Scheduler(
+        config=cfg,
+        store=store,
+        router=router,  # type: ignore[arg-type]
+        adapters={"slack": FakeAdapter()},
+        alerter=FakeAlerter(),  # type: ignore[arg-type]
+    )
+
+    await sched.fire("morning-brief")
+    assert len(router.dispatched) == 1
+    assert router.dispatched[0].ephemeral is True
 
 
 @pytest.mark.asyncio

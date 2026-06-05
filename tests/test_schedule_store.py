@@ -273,6 +273,66 @@ async def test_round_trip_load_after_save(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_ephemeral_round_trips_through_yaml(tmp_path: Path) -> None:
+    """A schedule with ephemeral=True survives save -> load unchanged."""
+    cfg = _make_config(tmp_path)
+    store = ScheduleStore(config=cfg, supervisor=Supervisor(config=cfg))
+    await store.create(
+        Schedule(
+            id="heartbeat",
+            cron="*/30 * * * *",
+            prompt="heartbeat",
+            destination=ScheduleDestination(transport="slack", channel="C1"),
+            created_at=datetime(2026, 6, 1, 0, 0, 0, tzinfo=timezone.utc),
+            ephemeral=True,
+        )
+    )
+
+    on_disk = yaml.safe_load((tmp_path / "schedules.yaml").read_text(encoding="utf-8"))
+    assert on_disk["schedules"][0]["ephemeral"] is True
+
+    store2 = ScheduleStore(config=cfg, supervisor=Supervisor(config=cfg))
+    await store2.load()
+    reloaded = store2.get("heartbeat")
+    assert reloaded is not None
+    assert reloaded.ephemeral is True
+
+
+@pytest.mark.asyncio
+async def test_legacy_yaml_without_ephemeral_defaults_false(tmp_path: Path) -> None:
+    """A schedules.yaml entry predating the ephemeral field (no ``ephemeral``
+    key) loads as non-ephemeral, preserving backward compatibility."""
+    cfg = _make_config(tmp_path)
+    path = tmp_path / "schedules.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "version": 1,
+                "schedules": [
+                    {
+                        "id": "legacy",
+                        "cron": "0 6 * * *",
+                        "timezone": "America/New_York",
+                        "prompt": "x",
+                        "destination": {"transport": "slack", "channel": "C1"},
+                        "timeout_seconds": 300,
+                        "enabled": True,
+                        "created_at": "2026-06-01T06:00:00+00:00",
+                    }
+                ],
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    store = ScheduleStore(config=cfg, supervisor=Supervisor(config=cfg))
+    await store.load()
+    legacy = store.get("legacy")
+    assert legacy is not None
+    assert legacy.ephemeral is False
+
+
+@pytest.mark.asyncio
 async def test_atomic_save_writes_through_tmpfile(tmp_path: Path) -> None:
     """Confirm save writes via the .tmp + os.replace pattern."""
     cfg = _make_config(tmp_path)

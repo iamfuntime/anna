@@ -56,6 +56,15 @@ class Schedule(BaseModel):
     dispatches each as a synthetic ``InboundEvent`` through the
     conversation router. The worker's final reply routes to
     ``destination`` via the corresponding ChannelAdapter.
+
+    ``ephemeral`` (default False) opts the schedule into ephemeral
+    fires: the dispatched event sets ``InboundEvent.ephemeral`` so the
+    worker skips the resume-context injection (recent-checkpoints block
+    and unsaved conversation tail) that otherwise accumulates across the
+    per-day conv_key of a frequent heartbeat schedule. Omitted in legacy
+    ``schedules.yaml`` entries, where it defaults to False — preserving
+    the existing non-ephemeral behavior for every schedule that does not
+    opt in.
     """
 
     id: str
@@ -66,5 +75,6 @@ class Schedule(BaseModel):
     destination: ScheduleDestination
     timeout_seconds: int = 300
     enabled: bool = True
+    ephemeral: bool = False
     created_at: datetime
     state: ScheduleState = Field(default_factory=ScheduleState)

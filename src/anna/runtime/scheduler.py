@@ -186,6 +186,7 @@ class Scheduler:
             is_thread=False,
             raw={"schedule_id": schedule.id},
             completion_future=completion,
+            ephemeral=schedule.ephemeral,
         )
 
         await self._router.dispatch(event)
