@@ -37,6 +37,19 @@ if TYPE_CHECKING:
     from anna.runtime.router import ConversationRouter
 
 
+# Sentinel a scheduled skill can return verbatim as its final reply to opt out
+# of posting. When ``fire()`` produces exactly this string (after stripping),
+# the scheduler records the run as a normal success (updates last_fired_at,
+# resets consecutive_failures, marks complete) but sends NOTHING to the
+# destination transport. This enables a "quiet by default" heartbeat schedule.
+# The worker coerces empty/whitespace replies to "(no response)" before
+# resolving the completion future, so the sentinel must be a non-empty literal
+# the skill returns exactly.
+QUIET_SENTINEL = "[[ANNA_NO_OUTPUT]]"
+
+__all__ = ["QUIET_SENTINEL", "Scheduler"]
+
+
 class Scheduler:
     """Owns the scheduled-fire loop."""
 
@@ -209,6 +222,24 @@ class Scheduler:
                 await self._handle_failure(schedule, reason=f"error: {exc}", kind="fail")
                 return
 
+            # Quiet sentinel: the skill opted out of posting. Record the run as
+            # a normal success (identical bookkeeping minus the actual send) so
+            # last_fired_at advances and consecutive_failures resets. Do NOT
+            # count this as a failure.
+            if reply is not None and reply.strip() == QUIET_SENTINEL:
+                self._log.info(
+                    "scheduler.quiet_suppress",
+                    schedule_id=schedule.id,
+                )
+                self._log.info(
+                    f"schedule {schedule.id} returned quiet sentinel — "
+                    f"suppressing post"
+                )
+                await self._record_success(
+                    schedule, reply, started_at=started_at, suppressed=True
+                )
+                return
+
             # Route the reply to the destination.
             try:
                 await self._send_to_destination(schedule, reply)
@@ -218,26 +249,45 @@ class Scheduler:
                 )
                 return
 
-            completed_at = datetime.now(timezone.utc)
-            duration = (completed_at - started_at).total_seconds()
-            await self._store.mark_fired(
-                schedule.id, status="complete", when=completed_at
-            )
-            audit_event(
-                "audit.schedule.complete",
-                audit_dir=self._audit_dir,
-                actor="anna",
-                fsync_on_write=self._fsync,
-                schedule_id=schedule.id,
-                duration_seconds=duration,
-                output_length=len(reply),
-            )
-            self._log.info(
-                "scheduler.complete",
-                schedule_id=schedule.id,
-                duration_seconds=duration,
-                output_length=len(reply),
-            )
+            await self._record_success(schedule, reply, started_at=started_at)
+
+    async def _record_success(
+        self,
+        schedule: Schedule,
+        reply: str,
+        *,
+        started_at: datetime,
+        suppressed: bool = False,
+    ) -> None:
+        """Record a successful fire: mark_fired (resets failures, sets
+        last_fired_at + last_status="complete"), audit, and log.
+
+        Shared by the normal-send path and the quiet-sentinel path so both
+        use identical bookkeeping. ``suppressed`` only affects telemetry; the
+        persisted success state is the same in both cases.
+        """
+        completed_at = datetime.now(timezone.utc)
+        duration = (completed_at - started_at).total_seconds()
+        await self._store.mark_fired(
+            schedule.id, status="complete", when=completed_at
+        )
+        audit_event(
+            "audit.schedule.complete",
+            audit_dir=self._audit_dir,
+            actor="anna",
+            fsync_on_write=self._fsync,
+            schedule_id=schedule.id,
+            duration_seconds=duration,
+            output_length=len(reply),
+            suppressed=suppressed,
+        )
+        self._log.info(
+            "scheduler.complete",
+            schedule_id=schedule.id,
+            duration_seconds=duration,
+            output_length=len(reply),
+            suppressed=suppressed,
+        )
 
     async def _send_to_destination(self, schedule: Schedule, text: str) -> None:
         """Push the worker's reply to the schedule's declared destination."""

@@ -12,7 +12,7 @@ import pytest
 from anna.config import AnnaConfig
 from anna.runtime.schedule_store import ScheduleStore
 from anna.runtime.schedule_types import Schedule, ScheduleDestination, ScheduleState
-from anna.runtime.scheduler import Scheduler
+from anna.runtime.scheduler import QUIET_SENTINEL, Scheduler
 from anna.runtime.supervisor import Supervisor
 from anna.transports.base import ChannelAdapter, InboundEvent, OutboundMessage
 
@@ -221,6 +221,71 @@ async def test_guarded_fire_happy_path(tmp_path: Path) -> None:
     assert _events(audits, "audit.schedule.fire")
     assert _events(audits, "audit.schedule.complete")
     assert not _events(audits, "audit.schedule.fail")
+
+    state = store.get("morning-brief").state  # type: ignore[union-attr]
+    assert state.last_status == "complete"
+    assert state.consecutive_failures == 0
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [QUIET_SENTINEL, f"  {QUIET_SENTINEL}  ", f"\n{QUIET_SENTINEL}\n"],
+)
+@pytest.mark.asyncio
+async def test_guarded_fire_quiet_sentinel_suppresses_post_but_records_success(
+    tmp_path: Path, reply: str
+) -> None:
+    """A reply equal to QUIET_SENTINEL (incl. whitespace-surrounded variants)
+    must skip the send entirely while still recording a normal success."""
+    cfg, store = await _make_store_with_schedule(tmp_path, schedule=_make_schedule())
+    router = FakeRouter()
+    router.reply = reply
+    adapter = FakeAdapter()
+    sched = Scheduler(
+        config=cfg,
+        store=store,
+        router=router,  # type: ignore[arg-type]
+        adapters={"slack": adapter},
+        alerter=FakeAlerter(),  # type: ignore[arg-type]
+    )
+
+    await sched._guarded_fire(store.get("morning-brief"))  # type: ignore[arg-type]
+
+    # Nothing was sent to the destination transport.
+    assert adapter.sent == []
+
+    # The run was recorded as a success, identical to the normal-send path.
+    audits = _read_audit_records(cfg.audit_dir)
+    assert _events(audits, "audit.schedule.fire")
+    assert _events(audits, "audit.schedule.complete")
+    assert not _events(audits, "audit.schedule.fail")
+
+    state = store.get("morning-brief").state  # type: ignore[union-attr]
+    assert state.last_status == "complete"
+    assert state.consecutive_failures == 0
+    assert state.last_fired_at is not None
+
+
+@pytest.mark.asyncio
+async def test_guarded_fire_non_sentinel_reply_still_sends(tmp_path: Path) -> None:
+    """Regression guard: a normal (non-sentinel) reply still posts exactly
+    once, even one that merely contains the sentinel as a substring."""
+    cfg, store = await _make_store_with_schedule(tmp_path, schedule=_make_schedule())
+    router = FakeRouter()
+    router.reply = f"Heartbeat OK {QUIET_SENTINEL} (not exactly the sentinel)"
+    adapter = FakeAdapter()
+    sched = Scheduler(
+        config=cfg,
+        store=store,
+        router=router,  # type: ignore[arg-type]
+        adapters={"slack": adapter},
+        alerter=FakeAlerter(),  # type: ignore[arg-type]
+    )
+
+    await sched._guarded_fire(store.get("morning-brief"))  # type: ignore[arg-type]
+
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0].text == router.reply
 
     state = store.get("morning-brief").state  # type: ignore[union-attr]
     assert state.last_status == "complete"
