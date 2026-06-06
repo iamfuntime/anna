@@ -227,7 +227,19 @@ class Scheduler:
             # a normal success (identical bookkeeping minus the actual send) so
             # last_fired_at advances and consecutive_failures resets. Do NOT
             # count this as a failure.
-            if reply is not None and reply.strip() == QUIET_SENTINEL:
+            #
+            # Match the sentinel per-LINE, not by exact equality of the whole
+            # reply. A skill is supposed to return the bare sentinel on a quiet
+            # tick, but the model occasionally prefixes a stray narration line
+            # ("I'll re-read the skill...") before it. Exact-equality on the
+            # whole reply let that blob post, leaking both the narration and the
+            # literal sentinel token to the operator. If ANY line is exactly the
+            # sentinel, the skill signaled "stay quiet" — honor it and suppress,
+            # matching the quiet-by-default bias. A sentinel embedded mid-line in
+            # genuine alert prose is NOT a quiet signal and still posts.
+            if reply is not None and any(
+                line.strip() == QUIET_SENTINEL for line in reply.splitlines()
+            ):
                 self._log.info(
                     "scheduler.quiet_suppress",
                     schedule_id=schedule.id,

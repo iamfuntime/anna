@@ -291,6 +291,42 @@ async def test_guarded_fire_quiet_sentinel_suppresses_post_but_records_success(
     assert state.last_fired_at is not None
 
 
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "I'll re-read the skill and run the checks.\n[[ANNA_NO_OUTPUT]]",
+        "starting Step 0\nnow running checks A-D\n[[ANNA_NO_OUTPUT]]",
+        "[[ANNA_NO_OUTPUT]]\ntrailing narration after the sentinel",
+    ],
+)
+@pytest.mark.asyncio
+async def test_guarded_fire_narration_prefixed_sentinel_suppresses(
+    tmp_path: Path, reply: str
+) -> None:
+    """The real-world failure: the model emits stray narration on its own
+    line(s) plus the bare sentinel on its own line. The sentinel-bearing line
+    is an unambiguous quiet signal, so the whole reply must be suppressed
+    rather than posting the narration + literal token to the operator."""
+    cfg, store = await _make_store_with_schedule(tmp_path, schedule=_make_schedule())
+    router = FakeRouter()
+    router.reply = reply
+    adapter = FakeAdapter()
+    sched = Scheduler(
+        config=cfg,
+        store=store,
+        router=router,  # type: ignore[arg-type]
+        adapters={"slack": adapter},
+        alerter=FakeAlerter(),  # type: ignore[arg-type]
+    )
+
+    await sched._guarded_fire(store.get("morning-brief"))  # type: ignore[arg-type]
+
+    assert adapter.sent == []
+    state = store.get("morning-brief").state  # type: ignore[union-attr]
+    assert state.last_status == "complete"
+    assert state.consecutive_failures == 0
+
+
 @pytest.mark.asyncio
 async def test_guarded_fire_non_sentinel_reply_still_sends(tmp_path: Path) -> None:
     """Regression guard: a normal (non-sentinel) reply still posts exactly
