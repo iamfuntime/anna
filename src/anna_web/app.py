@@ -38,6 +38,7 @@ from anna_web.routes import (
     activity_routes,
     config_routes,
     dashboard_routes,
+    delegation_routes,
     env_routes,
     healthz_routes,
     restart_routes,
@@ -137,6 +138,7 @@ def create_app(cfg: AnnaConfig) -> FastAPI:
     # index.html stays on disk unrouted until the rebuild completes.
     app.include_router(dashboard_routes.router)
     app.include_router(activity_routes.router)
+    app.include_router(delegation_routes.router)
     app.include_router(config_routes.router)
     app.include_router(env_routes.router)
     app.include_router(schedule_routes.router)

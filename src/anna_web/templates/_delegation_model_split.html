@@ -1,0 +1,28 @@
+{# Per-model cost split (MC-07). One row per normalized tier
+   (fable / opus / sonnet / haiku / unknown / other), ordered by
+   descending cost (DelegationReader.model_split's ordering). The raw
+   model IDs behind a tier — including A/B variants — surface in the
+   row's title attr; the bar is pure CSS, its fill width an inline
+   percentage of the costliest tier. Only rendered when has_data. #}
+<table id="model-split-table">
+  <thead>
+    <tr>
+      <th>Model</th>
+      <th>Runs</th>
+      <th>Cost</th>
+      <th>Share</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for row in model_split %}
+    <tr title="{{ row.models_title }}" data-tier="{{ row.tier }}">
+      <td><span class="mono">{{ row.tier }}</span></td>
+      <td class="mono">{{ row.runs }}</td>
+      <td class="mono">${{ '%.2f' | format(row.cost_usd) }}</td>
+      <td class="cost-bar-cell">
+        <div class="cost-bar"><div class="cost-bar-fill" style="width: {{ row.pct }}%"></div></div>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>

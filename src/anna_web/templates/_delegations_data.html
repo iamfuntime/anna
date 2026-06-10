@@ -1,0 +1,102 @@
+{# Delegation data sections partial (MC-07). Rendered inline on first
+   paint and re-fetched whole by the page's htmx poll
+   (GET /delegations/panels/data, every 30s). Four sections, each
+   degrading to _panel_empty.html on a fresh install: summary strip,
+   per-model cost split (own partial), per-agent run history, and the
+   14-day daily cost strip. All bars are pure CSS — fill widths/heights
+   arrive as inline percentages computed in delegation_routes._gather. #}
+
+{# (1) Summary strip — today / this week / window run count / busiest. #}
+<article class="panel" id="panel-delegation-summary">
+  <header><strong>Cost summary</strong></header>
+  {% if has_data %}
+  <div class="summary-strip">
+    <div class="summary-item">
+      <span class="summary-label">Today</span>
+      <span class="summary-value mono" id="summary-today-cost">${{ '%.2f' | format(summary.today_cost) }}</span>
+    </div>
+    <div class="summary-item">
+      <span class="summary-label">This week</span>
+      <span class="summary-value mono" id="summary-week-cost">${{ '%.2f' | format(summary.week_cost) }}</span>
+    </div>
+    <div class="summary-item">
+      <span class="summary-label">Runs ({{ window_days }}d)</span>
+      <span class="summary-value mono" id="summary-run-count">{{ summary.run_count }}</span>
+    </div>
+    <div class="summary-item">
+      <span class="summary-label">Busiest agent</span>
+      <span class="summary-value"><code id="summary-busiest">{{ summary.busiest }}</code></span>
+    </div>
+  </div>
+  {% else %}
+  {% include "_panel_empty.html" %}
+  {% endif %}
+</article>
+
+{# (2) Per-model cost split — one row per tier, CSS-only bars. #}
+<article class="panel" id="panel-model-split">
+  <header><strong>Cost by model</strong></header>
+  {% if has_data %}
+  {% include "_delegation_model_split.html" %}
+  {% else %}
+  {% include "_panel_empty.html" %}
+  {% endif %}
+</article>
+
+{# (3) Per-agent run history — newest first, capped server-side. The
+   transcript path is plain mono text: the dashboard does not serve
+   transcript files, so there is nothing to link to. #}
+<article class="panel" id="panel-delegation-history">
+  <header><strong>Run history</strong></header>
+  {% if has_data %}
+  <table id="delegation-history-table">
+    <thead>
+      <tr>
+        <th>Agent</th>
+        <th>Model</th>
+        <th>When</th>
+        <th>Duration</th>
+        <th>Cost</th>
+        <th>Tools</th>
+        <th>Transcript</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in history %}
+      <tr data-audit-id="{{ row.audit_id }}">
+        <td><code>{{ row.slug }}</code></td>
+        <td><span class="mono" title="{{ row.model }}">{{ row.tier }}</span></td>
+        <td class="mono">{{ row.ts or row.date }}</td>
+        <td class="mono">{{ '%.1f' | format(row.duration_seconds) }}s</td>
+        <td class="mono">${{ '%.2f' | format(row.cost_usd) }}</td>
+        <td class="mono">{{ row.tool_call_count }}</td>
+        <td><span class="mono transcript-path">{{ row.transcript_path }}</span></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% if history_total > history_limit %}
+  <small class="muted">Showing the newest {{ history_limit }} of {{ history_total }} runs in the {{ window_days }}-day window.</small>
+  {% endif %}
+  {% else %}
+  {% include "_panel_empty.html" %}
+  {% endif %}
+</article>
+
+{# (4) Daily cost strip — one bar per day of the window, oldest on the
+   left. Each cell's title carries the exact figures. #}
+<article class="panel" id="panel-daily-cost">
+  <header><strong>Daily cost ({{ window_days }} days)</strong></header>
+  {% if has_data %}
+  <div class="day-strip">
+    {% for d in daily %}
+    <div class="day-col" title="{{ d.date }} — ${{ '%.2f' | format(d.cost_usd) }} across {{ d.runs }} run{{ '' if d.runs == 1 else 's' }}">
+      <div class="day-bar"><div class="day-bar-fill" style="height: {{ d.pct }}%"></div></div>
+      <span class="day-label">{{ d.label }}</span>
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  {% include "_panel_empty.html" %}
+  {% endif %}
+</article>
