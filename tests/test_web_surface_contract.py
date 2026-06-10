@@ -179,11 +179,21 @@ def test_gated_paths_absent_under_default_config(anna_home: Path) -> None:
 
 
 def test_observability_paths_answer_only_get_and_head(anna_home: Path) -> None:
-    """No observability path registers a mutating (or OPTIONS) handler."""
+    """No observability path registers a mutating (or OPTIONS) handler.
+
+    One carve-out: a path may be shared with a PRE-EXISTING editor route
+    (e.g. GET /schedules is the run board while POST /schedules is the
+    Phase 2.5 create endpoint). Those pairs are already pinned exactly by
+    ALLOWED_MUTATING_ROUTES, so they are exempted here rather than
+    re-counted as offenders — the allowlist test still fails loudly if a
+    NEW mutating route appears on any path, observability or otherwise.
+    """
     app = create_app(_make_cfg(anna_home, tasks_enabled=True))
     offenders = {
         (method, path)
         for method, path in _method_path_pairs(app)
-        if path in OBSERVABILITY_PATHS and method not in {"GET", "HEAD"}
+        if path in OBSERVABILITY_PATHS
+        and method not in {"GET", "HEAD"}
+        and (method, path) not in ALLOWED_MUTATING_ROUTES
     }
     assert not offenders, f"non-GET methods on observability paths: {sorted(offenders)}"
