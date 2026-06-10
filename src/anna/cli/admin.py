@@ -23,23 +23,11 @@ import click
 
 from anna.config import load_config
 from anna.log import audit_event, configure_logging
+from anna.vault.paths import safe_conv_key
 
 
 def _anna_home() -> Path:
     return Path(os.path.expanduser(os.environ.get("ANNA_HOME", "~/anna")))
-
-
-def _safe_conv_key(conv_key: str) -> str:
-    """Convert a conv_key into the filesystem-safe directory-name form.
-
-    Mirrors the inline conversion in ``anna.vault.checkpoint`` (both
-    ``write_checkpoint`` and ``list_recent_checkpoints``) and
-    ``anna.log._transcript_dir_for``. Kept in lockstep with those call
-    sites so the merge command writes to the same path the worker writes
-    to. (See punted note in subtask 12 about folding the three inline
-    copies into a single named helper.)
-    """
-    return conv_key.replace(":", "-").replace("/", "_")
 
 
 @click.group()
@@ -155,9 +143,9 @@ def merge_checkpoints(
     vault_root = config.vault.resolved_path
     audit_dir = config.audit_dir
 
-    source_dir = vault_root / "Conversations" / _safe_conv_key(from_key)
+    source_dir = vault_root / "Conversations" / safe_conv_key(from_key)
     dest_key = f"user:{canonical}"
-    dest_dir = vault_root / "Conversations" / _safe_conv_key(dest_key)
+    dest_dir = vault_root / "Conversations" / safe_conv_key(dest_key)
 
     if not source_dir.is_dir():
         click.secho(

@@ -10,6 +10,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 
+from anna.vault.paths import safe_conv_key
+
 
 def write_checkpoint(
     *,
@@ -36,7 +38,7 @@ def write_checkpoint(
     defaults to ``"closeout"`` for backward compatibility; periodic
     checkpoints pass ``"periodic"``.
     """
-    safe_key = conversation_key.replace(":", "-").replace("/", "_")
+    safe_key = safe_conv_key(conversation_key)
     base_dir = vault_root / "Conversations" / safe_key
     base_dir.mkdir(parents=True, exist_ok=True)
 
@@ -69,7 +71,7 @@ def list_recent_checkpoints(
     conversation_key: str,
     limit: int = 2,
 ) -> list[Path]:
-    safe_key = conversation_key.replace(":", "-").replace("/", "_")
+    safe_key = safe_conv_key(conversation_key)
     base_dir = vault_root / "Conversations" / safe_key
     if not base_dir.is_dir():
         return []

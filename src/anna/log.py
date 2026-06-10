@@ -28,6 +28,8 @@ from typing import Any
 
 import structlog
 
+from anna.vault.paths import safe_conv_key
+
 
 # ---------------------------------------------------------------------------
 # Operational stream
@@ -178,7 +180,7 @@ def audit_event(
 def _transcript_dir_for(transcripts_dir: Path, channel: str, conv_key: str) -> Path:
     # The conv_key embeds the channel for cross-process clarity, but we keep
     # them both for filesystem readability per v3 section 7.
-    safe = conv_key.replace(":", "-").replace("/", "_")
+    safe = safe_conv_key(conv_key)
     return transcripts_dir / safe
 
 
