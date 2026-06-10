@@ -87,12 +87,17 @@ class ResolvedGrant:
             ``allowed_tools`` with (MCP tool additions are appended later by
             :func:`build_mcp_servers`).
         permission_mode: SDK permission mode for the delegation.
+        model: Claude model for the delegation, or ``None`` to inherit the
+            CLI/account default. Free-form (tier alias or full ID); NOT
+            resolved against an operator pool — a model choice cannot escalate
+            capability, so there is no clamp (contrast ``permission_mode``).
     """
 
     write_dirs: list[str] = field(default_factory=list)
     mcp_specs: list[tuple[str, McpServerSpec]] = field(default_factory=list)
     allowed_tools: list[str] = field(default_factory=list)
     permission_mode: str = "acceptEdits"
+    model: str | None = None
 
 
 @dataclass
@@ -108,6 +113,7 @@ class _GrantLayer:
     mcp_servers: list[str] | None = None
     allowed_tools: list[str] | None = None
     permission_mode: str | None = None
+    model: str | None = None
 
 
 def _layer_from_grants(grants: AgentGrants | None) -> _GrantLayer:
@@ -133,6 +139,7 @@ def _layer_from_grants(grants: AgentGrants | None) -> _GrantLayer:
             else None
         ),
         permission_mode=grants.permission_mode,
+        model=grants.model,
     )
 
 
@@ -143,6 +150,9 @@ def _fallback_layer(config: AnnaConfig) -> _GrantLayer:
     * mcp_servers <- the builtin ``anna_web`` when ``tools.enabled``, else none
     * allowed_tools <- ``subagents.allowed_tools``
     * permission_mode <- ``"acceptEdits"`` (the sub-agent default today)
+    * model <- ``config.runtime.model`` (the global default; ``None`` =
+      inherit the CLI/account default, today's behavior). This is what makes
+      every override-less sub-agent inherit the main loop's model.
     """
     mcp = [_FALLBACK_BUILTIN] if config.tools.enabled else []
     return _GrantLayer(
@@ -150,6 +160,7 @@ def _fallback_layer(config: AnnaConfig) -> _GrantLayer:
         mcp_servers=mcp or None,
         allowed_tools=list(config.subagents.allowed_tools),
         permission_mode="acceptEdits",
+        model=config.runtime.model,
     )
 
 
@@ -175,6 +186,11 @@ def _merge(lower: _GrantLayer, higher: _GrantLayer) -> _GrantLayer:
             higher.permission_mode
             if higher.permission_mode is not None
             else lower.permission_mode
+        ),
+        model=(
+            higher.model
+            if higher.model is not None
+            else lower.model
         ),
     )
 
@@ -286,6 +302,12 @@ def resolve_effective_grant(
         mcp_specs=resolved_specs,
         allowed_tools=list(merged.allowed_tools or []),
         permission_mode=merged.permission_mode or "acceptEdits",
+        # ``model`` is free-form: passed through verbatim, NOT resolved against
+        # an operator pool. A model choice carries no capability-escalation
+        # risk (the grant security model gates dir/server reachability, not
+        # which model executes), so there is no clamp like the bypassPermissions
+        # one above. ``None`` = inherit the CLI/account default.
+        model=merged.model,
     )
 
 

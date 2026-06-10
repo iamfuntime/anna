@@ -458,6 +458,29 @@ def test_build_subagent_options_setting_sources_empty(tmp_path: Path) -> None:
     assert options.setting_sources == []
 
 
+def test_build_subagent_options_model_defaults_to_none(tmp_path: Path) -> None:
+    """With no grant + no runtime.model, the SDK model is None (CLI default)."""
+    runner = _make_runner_with_tools(tmp_path, tools_enabled=True)
+    options = runner._build_subagent_options(  # noqa: SLF001
+        system_prompt="system",
+        conv_key="subagent:slug:abc",
+    )
+    assert options.model is None
+
+
+def test_build_subagent_options_model_from_resolved_grant(tmp_path: Path) -> None:
+    """A resolved grant's model is threaded into ClaudeAgentOptions.model."""
+    from anna.runtime.grants import ResolvedGrant
+
+    runner = _make_runner_with_tools(tmp_path, tools_enabled=True)
+    options = runner._build_subagent_options(  # noqa: SLF001
+        system_prompt="system",
+        conv_key="subagent:slug:abc",
+        resolved=ResolvedGrant(model="haiku"),
+    )
+    assert options.model == "haiku"
+
+
 def test_build_subagent_options_sets_claude_config_dir_env(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

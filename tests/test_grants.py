@@ -310,3 +310,67 @@ def test_builtin_dropped_when_tools_disabled() -> None:
     servers, additions = build_mcp_servers(cfg, [("anna_web", spec)], "conv:1")
     assert servers == {}
     assert additions == []
+
+
+# ---------------------------------------------------------------------------
+# model resolution — global default vs per-agent vs frontmatter (most wins)
+# ---------------------------------------------------------------------------
+
+
+def test_model_defaults_to_none_when_unset_everywhere() -> None:
+    """No model anywhere → resolved model is None (inherit CLI default)."""
+    cfg = _cfg()
+    rg = resolve_effective_grant(cfg, "r", None)
+    assert rg.model is None
+
+
+def test_model_global_default_inherited_by_overrideless_agent() -> None:
+    """runtime.model is the fallback layer → every override-less agent gets it."""
+    cfg = AnnaConfig.model_validate({"runtime": {"model": "opus"}})
+    rg = resolve_effective_grant(cfg, "anyone", None)
+    assert rg.model == "opus"
+
+
+def test_model_per_agent_overrides_global_default() -> None:
+    """subagents.agents.<slug>.model replaces runtime.model for that slug."""
+    cfg = AnnaConfig.model_validate(
+        {
+            "runtime": {"model": "opus"},
+            "subagents": {"agents": {"r": {"model": "sonnet"}}},
+        }
+    )
+    rg = resolve_effective_grant(cfg, "r", None)
+    assert rg.model == "sonnet"
+    # A different slug with no override still inherits the global default.
+    assert resolve_effective_grant(cfg, "other", None).model == "opus"
+
+
+def test_model_frontmatter_overrides_per_agent() -> None:
+    """Frontmatter grants.model is most-specific and wins over the rest."""
+    cfg = AnnaConfig.model_validate(
+        {
+            "runtime": {"model": "opus"},
+            "subagents": {"agents": {"r": {"model": "sonnet"}}},
+        }
+    )
+    fm = AgentGrants(model="haiku")
+    rg = resolve_effective_grant(cfg, "r", fm)
+    assert rg.model == "haiku"
+
+
+def test_model_frontmatter_absent_passes_per_agent_through() -> None:
+    """Frontmatter with no model leaves the per-agent override in place."""
+    cfg = AnnaConfig.model_validate(
+        {"subagents": {"agents": {"r": {"model": "sonnet"}}}}
+    )
+    fm = AgentGrants(write_dirs=[])  # no model field
+    rg = resolve_effective_grant(cfg, "r", fm)
+    assert rg.model == "sonnet"
+
+
+def test_model_is_not_clamped_for_untrusted_frontmatter() -> None:
+    """Unlike permission_mode, a frontmatter model is free-form (no clamp)."""
+    cfg = _cfg()
+    fm = AgentGrants(model="opus")
+    rg = resolve_effective_grant(cfg, "r", fm)
+    assert rg.model == "opus"

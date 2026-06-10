@@ -666,3 +666,64 @@ def test_checkpoint_rejects_non_positive_int(field: str) -> None:
         CheckpointConfig(**{field: 0})
     with pytest.raises(ValueError):
         CheckpointConfig(**{field: -1})
+
+
+# ---------------------------------------------------------------------------
+# Configurable model — light validator (shared by RuntimeConfig + AgentGrants)
+# ---------------------------------------------------------------------------
+
+
+def test_runtime_model_defaults_to_none() -> None:
+    """Unset model is the no-op default (inherit CLI/account default)."""
+    cfg = AnnaConfig.model_validate({"auth": {"mode": "max"}})
+    assert cfg.runtime.model is None
+
+
+@pytest.mark.parametrize("alias", ["opus", "sonnet", "haiku", "inherit"])
+def test_runtime_model_accepts_tier_aliases(alias: str) -> None:
+    cfg = AnnaConfig.model_validate({"runtime": {"model": alias}})
+    assert cfg.runtime.model == alias
+
+
+@pytest.mark.parametrize(
+    "model_id",
+    [
+        "claude-sonnet-4-5",
+        "claude-opus-4-8",
+        "anthropic.claude-3-5-sonnet-20241022-v2:0",
+        "us.anthropic.claude-3-5-sonnet-20241022-v2:0",
+        "eu.anthropic.claude-3-5-sonnet-20241022-v2:0",
+    ],
+)
+def test_runtime_model_accepts_well_formed_ids(model_id: str) -> None:
+    cfg = AnnaConfig.model_validate({"runtime": {"model": model_id}})
+    assert cfg.runtime.model == model_id
+
+
+@pytest.mark.parametrize("garbage", ["Fable 5", "Opus 4.8", "gpt-4o", "", "claude"])
+def test_runtime_model_rejects_garbage(garbage: str) -> None:
+    with pytest.raises(ValueError):
+        AnnaConfig.model_validate({"runtime": {"model": garbage}})
+
+
+def test_agent_grants_model_defaults_to_none() -> None:
+    from anna.config import AgentGrants
+
+    assert AgentGrants().model is None
+
+
+@pytest.mark.parametrize(
+    "value", ["opus", "sonnet", "haiku", "inherit", "claude-sonnet-4-5"]
+)
+def test_agent_grants_model_accepts_valid(value: str) -> None:
+    from anna.config import AgentGrants
+
+    assert AgentGrants(model=value).model == value
+
+
+@pytest.mark.parametrize("garbage", ["Fable 5", "Opus 4.8", "gpt-4o"])
+def test_agent_grants_model_rejects_garbage(garbage: str) -> None:
+    from anna.config import AgentGrants
+
+    with pytest.raises(ValueError):
+        AgentGrants(model=garbage)

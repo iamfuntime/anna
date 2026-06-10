@@ -567,6 +567,15 @@ class ConversationWorker:
         except OSError as exc:
             self._log.warning("worker.vault_mkdir_failed", error=str(exc))
 
+        # Record the resolved main-loop model once so the operator can verify
+        # which model the conversation runs on. Plain structured INFO log, not
+        # a formal audit event — this is observational, not a security record.
+        # None resolves to "<cli-default>" (the SDK's account default).
+        self._log.info(
+            "worker.model.resolved",
+            model=self._config.runtime.model or "<cli-default>",
+        )
+
         return ClaudeAgentOptions(
             system_prompt=system_prompt,
             # setting_sources=[] disables inheriting the operator's user /
@@ -594,6 +603,11 @@ class ConversationWorker:
             # waiting for an OK that never comes. The config default is
             # bypassPermissions; tighten in anna.yaml if needed.
             permission_mode=self._config.runtime.permission_mode,
+            # Global-default Claude model for the main conversation loop. The
+            # main loop does not go through resolve_effective_grant (it reads
+            # runtime.* directly), so it takes the model straight off config.
+            # None inherits the CLI/account default — today's behavior exactly.
+            model=self._config.runtime.model,
             # In-process MCP servers. Dict keys become the MCP server
             # prefixes in the SDK's allowed_tools naming convention
             # (``mcp__<server>__<tool>``). anna_self_edit is always

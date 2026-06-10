@@ -119,6 +119,21 @@ def test_build_options_includes_default_fs_self_edit_and_web_tools(tmp_path: Pat
     assert "anna_web" in options.mcp_servers
 
 
+def test_build_options_model_defaults_to_none(tmp_path: Path) -> None:
+    """Unset runtime.model → options.model is None (inherit CLI default)."""
+    worker = _make_worker(tmp_path)
+    options = worker._build_options()
+    assert options.model is None
+
+
+def test_build_options_passes_runtime_model_through(tmp_path: Path) -> None:
+    """A set runtime.model is wired into ClaudeAgentOptions.model."""
+    worker = _make_worker(tmp_path)
+    worker._config.runtime.model = "opus"
+    options = worker._build_options()
+    assert options.model == "opus"
+
+
 def test_build_options_mounts_google_server_when_enabled(tmp_path: Path) -> None:
     worker = _make_worker(tmp_path, with_google=True)
     options = worker._build_options()

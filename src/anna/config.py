@@ -25,6 +25,51 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 # ---------------------------------------------------------------------------
+# Shared validators
+# ---------------------------------------------------------------------------
+
+# SDK tier aliases accepted verbatim by ClaudeAgentOptions.model.
+_MODEL_ALIASES: frozenset[str] = frozenset({"opus", "sonnet", "haiku", "inherit"})
+
+# Shape check for a full model ID. Deliberately loose so it does not rot as
+# new model versions ship: covers Anthropic-direct ``claude-...`` IDs and
+# Bedrock-style ``anthropic.claude-...`` / ``us.anthropic.claude-...`` /
+# ``eu.anthropic.claude-...`` forms. We do NOT pin specific version strings.
+# Requires a non-empty suffix after ``claude-`` and is end-anchored with ``\Z``
+# (not ``$``) so a bare ``claude-`` or an embedded-newline value cannot slip through.
+_MODEL_ID_RE = re.compile(r"^(us\.|eu\.)?(anthropic\.)?claude-[\w.:-]+\Z")
+
+
+def validate_model_string(value: str | None) -> str | None:
+    """Light validator for a configurable Claude model string.
+
+    ``None``/unset is always valid and means "inherit the CLI/account
+    default" (today's behavior — no ``model=`` passed to the SDK). A set
+    value must be either a known SDK tier alias
+    (``opus``/``sonnet``/``haiku``/``inherit``) or a well-formed full model
+    ID matching :data:`_MODEL_ID_RE`. Anything else (e.g. ``"Fable 5"`` or
+    ``"Opus 4.8"`` with a space) is rejected at config load with a clear
+    error listing the accepted forms.
+
+    This is a SHAPE check, not an allowlist of specific version IDs — the
+    set of valid models drifts as new versions ship, so a hardcoded table
+    would rot. The value is passed through to the SDK unchanged; an
+    otherwise-well-formed-but-nonexistent ID still fails loudly at the SDK
+    boundary.
+    """
+    if value is None:
+        return None
+    if value in _MODEL_ALIASES or _MODEL_ID_RE.match(value):
+        return value
+    raise ValueError(
+        f"model must be a tier alias {sorted(_MODEL_ALIASES)} or a "
+        f"well-formed model ID matching {_MODEL_ID_RE.pattern!r} "
+        f"(e.g. 'claude-sonnet-4-5', 'us.anthropic.claude-...'); "
+        f"got {value!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Sub-models
 # ---------------------------------------------------------------------------
 
@@ -138,7 +183,22 @@ class RuntimeConfig(BaseModel):
     permission_mode: Literal[
         "default", "acceptEdits", "bypassPermissions", "plan"
     ] = "bypassPermissions"
+
+    # Global-default Claude model for the main conversation loop and, via the
+    # grant fallback layer, every sub-agent without an override. ``None``
+    # (unset) means "inherit the CLI/account default" — today's behavior, no
+    # ``model=`` passed to the SDK. A set value is either a tier alias
+    # (``opus``/``sonnet``/``haiku``/``inherit``) or a full model ID; the light
+    # validator below rejects garbage at load. Restart-gated: anna.yaml has no
+    # hot-reload, so a change here takes effect on the next daemon restart.
+    model: str | None = None
+
     visibility: RuntimeVisibilityConfig = Field(default_factory=RuntimeVisibilityConfig)
+
+    @field_validator("model")
+    @classmethod
+    def _validate_model(cls, v: str | None) -> str | None:
+        return validate_model_string(v)
 
 
 class SlackTransportConfig(BaseModel):
@@ -617,6 +677,22 @@ class AgentGrants(BaseModel):
     permission_mode: Literal[
         "default", "acceptEdits", "bypassPermissions", "plan"
     ] | None = None
+
+    # Per-agent Claude model override. ``None``/unset passes the lower layer
+    # through (inherit ``runtime.model`` / CLI default). A set value REPLACES
+    # the lower layer (same scalar-override semantics as ``permission_mode``)
+    # and is either a tier alias or a full model ID — the same light validator
+    # as ``RuntimeConfig.model``. Unlike the name-list fields, ``model`` is
+    # free-form: it is NOT resolved against an operator-blessed pool, because a
+    # model choice cannot escalate capability (the grant security model is
+    # about dir/server reachability, not which model executes), so there is no
+    # clamp here.
+    model: str | None = None
+
+    @field_validator("model")
+    @classmethod
+    def _validate_model(cls, v: str | None) -> str | None:
+        return validate_model_string(v)
 
 
 class SubagentsConfig(BaseModel):

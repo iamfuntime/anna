@@ -27,6 +27,14 @@ runtime:
   #   plan               read-only planning mode, no writes
   #   default            interactive prompts (do not use in a service)
   permission_mode: bypassPermissions
+  # Global-default Claude model for the main conversation loop and, by
+  # inheritance, every sub-agent without an override. Accepts either a tier
+  # alias (opus | sonnet | haiku | inherit) or a full model ID
+  # (e.g. claude-sonnet-4-5, us.anthropic.claude-...). Unset (the default)
+  # means inherit the CLI/account default — no model is pinned, today's
+  # behavior. Restart-gated: anna.yaml has no hot-reload, so a change here
+  # only takes effect after a daemon restart.
+  # model: opus
   # ----------------------------------------------------------
   # Cadence-visibility hooks (Inbox/2026-06-02 plan).
   #
@@ -442,7 +450,7 @@ subagents:
   #
   # agents: per-slug grants. Each value may reference dir_pool /
   # mcp_registry names ONLY. write_dirs and mcp_servers are name lists;
-  # allowed_tools / permission_mode are optional overrides.
+  # allowed_tools / permission_mode / model are optional overrides.
   agents:
     threat-researcher:
       mcp_servers: [security-detections]
@@ -453,6 +461,11 @@ subagents:
   #     write_dirs: [brain]
   #     mcp_servers: [security-detections]
   #     permission_mode: acceptEdits
+  #     # Per-agent Claude model override. Tier alias (opus|sonnet|haiku|
+  #     # inherit) or a full model ID (e.g. claude-sonnet-4-5). Unset =
+  #     # inherit runtime.model / CLI default. Restart-gated like the rest of
+  #     # this file — takes effect on the next daemon restart.
+  #     model: sonnet
   #
   # The same grant shape can live in a persona file's frontmatter, where
   # it REPLACES the agents.<slug> layer for that field:
@@ -461,6 +474,12 @@ subagents:
   #     write_dirs: [brain]
   #     mcp_servers: [playwright]
   #     permission_mode: acceptEdits
+  #     # Frontmatter model override (alias or full ID, same as above). This
+  #     # is the most-specific layer and wins over runtime.model and the
+  #     # agents.<slug> override. Frontmatter is read fresh on every
+  #     # delegation (no restart needed) — it applies on the NEXT delegation,
+  #     # unlike anna.yaml model changes which require a restart.
+  #     model: haiku
   #   ---
   #   # Persona body...
 

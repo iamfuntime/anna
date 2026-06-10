@@ -724,7 +724,10 @@ class SubAgentRunner:
                 pre-chunk-A behavior exactly: ``anna_web`` only (when
                 ``tools.enabled``), ``add_dirs`` from
                 ``subagents.extra_dirs``, ``allowed_tools`` from
-                ``subagents.allowed_tools``.
+                ``subagents.allowed_tools``. The synthesized fallback grant
+                now also carries ``model=config.runtime.model`` (the global
+                default; ``None`` = inherit the CLI default) — desired, so an
+                override-less sub-agent runs the same model as the main loop.
 
         Returns:
             ``ClaudeAgentOptions`` ready to feed into ``ClaudeSDKClient``.
@@ -780,6 +783,10 @@ class SubAgentRunner:
             setting_sources=[],
             env=self._build_claude_env(),
             permission_mode=permission_mode,
+            # Claude model for this sub-agent, resolved across the three grant
+            # layers (runtime.model fallback → anna.yaml agents.<slug>.model →
+            # frontmatter grants.model). None inherits the CLI/account default.
+            model=resolved.model,
             # Resolved MCP servers only. Never anna_self_edit, anna_google,
             # or anna_delegate — build_mcp_servers enforces that.
             mcp_servers=mcp_servers,
@@ -1027,6 +1034,9 @@ class SubAgentRunner:
                 audit_id=audit_id,
                 task=truncated_task,
                 timeout_seconds=effective_timeout,
+                # Record the resolved model so the operator can verify which
+                # model a delegation ran on. None = inherited CLI default.
+                model=resolved.model or "<cli-default>",
             )
 
             # Write the task transcript line up front so a crashing
