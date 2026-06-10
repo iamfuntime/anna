@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 
 import pytest
+import structlog
 from click.testing import CliRunner
 
 from anna.cli import admin as admin_module
@@ -32,19 +33,16 @@ def anna_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     ``~/anna/audit`` (via ``anna_home / "audit"``). Setting HOME to
     tmp_path keeps both inside the test sandbox.
 
-    Also no-ops ``configure_logging`` for the duration of the test. The
-    click group's callback calls it on every invocation, which mutates
-    global structlog state in a way that subsequent worker tests in the
-    same process trip over (PrintLogger has no .name, etc). The wizard
-    tests deliberately avoid configure_logging for the same reason — see
-    ``src/anna/setup/wizard.py`` module docstring.
+    No ``configure_logging`` monkeypatch is needed: the admin subcommands
+    guard their logging configuration with ``_is_test_run()`` (detects
+    ``PYTEST_CURRENT_TEST``), so test invocations never mutate global
+    structlog state. See the regression test at the bottom of this file.
     """
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("ANNA_HOME", str(tmp_path / "anna"))
     # Make sure no operator anna.yaml at $PWD gets picked up.
     monkeypatch.delenv("ANNA_CONFIG_PATH", raising=False)
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(admin_module, "configure_logging", lambda **_: None)
     home = tmp_path / "anna"
     home.mkdir(parents=True, exist_ok=True)
     (home / "vault" / "Conversations").mkdir(parents=True, exist_ok=True)
@@ -296,3 +294,79 @@ def test_merge_missing_source_dir_is_idempotent(anna_home: Path) -> None:
     assert merge_events == [], (
         "no audit event should land when there was no work to do"
     )
+
+
+# ---------------------------------------------------------------------------
+# 6. Regression: admin invocation must not poison worker logging.
+#
+# The admin click group's callback used to call ``configure_logging``
+# unconditionally, mutating global structlog state on every CliRunner
+# invocation and breaking later worker tests in the same pytest process
+# (PrintLogger has no ``.name``, etc.). The fix moved the call into each
+# subcommand behind an ``_is_test_run()`` guard. This test locks that in:
+# invoke a subcommand, then build a worker and exercise structlog defaults.
+# ---------------------------------------------------------------------------
+
+
+def test_admin_invocation_does_not_poison_worker_logging(
+    anna_home: Path, tmp_path: Path
+) -> None:
+    from anna.config import AnnaConfig
+    from anna.runtime.supervisor import Supervisor
+    from anna.runtime.worker import ConversationWorker
+
+    vault = anna_home / "vault"
+    source = vault / "Conversations" / "slack-dm-USP2QLB41"
+    _write_checkpoint(source, "2026-05-30-0900.md", "morning")
+
+    structlog.reset_defaults()
+    try:
+        runner = CliRunner()
+        result = runner.invoke(
+            admin_module.main,
+            [
+                "merge-checkpoints",
+                "--canonical",
+                "seth",
+                "--from",
+                "slack:dm:USP2QLB41",
+            ],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0, result.output
+
+        # The subcommand ran under pytest, so the _is_test_run() guard must
+        # have kept structlog on its package defaults.
+        assert not structlog.is_configured(), (
+            "admin subcommand reconfigured structlog during a test run"
+        )
+
+        # A worker constructed in the same process logs fine on the default
+        # (PrintLogger-backed) configuration — this is the exact shape that
+        # used to break (add_logger_name on a PrintLogger, etc.).
+        cfg = AnnaConfig()
+        object.__setattr__(cfg, "anna_home", tmp_path / "worker_home")
+        cfg.vault.path = str(tmp_path / "worker_vault")
+        cfg.core_dir.mkdir(parents=True, exist_ok=True)
+        supervisor = Supervisor(config=cfg)
+
+        async def _noop_send(_msg):
+            return None
+
+        worker = ConversationWorker(
+            conversation_key="slack:dm:UTEST",
+            transport="slack",
+            config=cfg,
+            supervisor=supervisor,
+            send=_noop_send,
+        )
+        assert worker is not None
+
+        # Emitting through structlog defaults must not raise.
+        structlog.get_logger("anna.runtime.worker").info(
+            "post_admin_worker_logging_ok", conv_key="slack:dm:UTEST"
+        )
+        assert not structlog.is_configured()
+    finally:
+        # Leave the process on structlog defaults for whatever test runs next.
+        structlog.reset_defaults()

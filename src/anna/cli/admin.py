@@ -30,10 +30,37 @@ def _anna_home() -> Path:
     return Path(os.path.expanduser(os.environ.get("ANNA_HOME", "~/anna")))
 
 
+def _is_test_run() -> bool:
+    """True when running under pytest.
+
+    pytest sets ``PYTEST_CURRENT_TEST`` for the duration of each test, so
+    this is true exactly when a ``CliRunner`` (or any in-process call) hits
+    an admin command from inside the test suite.
+    """
+    return "PYTEST_CURRENT_TEST" in os.environ
+
+
+def _configure_cli_logging() -> None:
+    """Configure operational logging for a real operator invocation.
+
+    Called at the top of each subcommand rather than in the group callback:
+    click runs the group callback on ANY subcommand invocation, including
+    ``CliRunner`` calls inside tests, and ``configure_logging`` mutates
+    global structlog state in a way that breaks subsequent worker tests in
+    the same pytest process (PrintLogger has no ``.name``, etc.). The guard
+    keeps test runs on structlog defaults; real ``anna-admin`` invocations
+    are unaffected.
+    """
+    if not _is_test_run():
+        configure_logging(level="INFO", format="json")
+
+
 @click.group()
 def main() -> None:
     """ANNA operator administration."""
-    configure_logging(level="INFO", format="json")
+    # Deliberately a no-op: side effects (logging configuration) live in
+    # the individual subcommands so importing or test-invoking the group
+    # never mutates global state. See _configure_cli_logging.
 
 
 @main.command()
@@ -45,6 +72,7 @@ def unpoison(file: str) -> None:
     audit event. The running process picks up the change on its next core
     write attempt because it reloads the state file each time.
     """
+    _configure_cli_logging()
     home = _anna_home()
     state_path = home / "supervisor-state.json"
     audit_dir = home / "audit"
@@ -81,6 +109,7 @@ def unpoison(file: str) -> None:
 @main.command()
 def status() -> None:
     """Show the supervisor's poison state."""
+    _configure_cli_logging()
     home = _anna_home()
     state_path = home / "supervisor-state.json"
     if not state_path.exists():
@@ -139,6 +168,7 @@ def merge_checkpoints(
     Refuses to run if any filename in the source directory already
     exists at the destination; the operator must resolve manually.
     """
+    _configure_cli_logging()
     config = load_config()
     vault_root = config.vault.resolved_path
     audit_dir = config.audit_dir
