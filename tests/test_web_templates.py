@@ -4,7 +4,7 @@ The plan calls for five cases that pin the shape the rest of pass 2/3
 will build on:
 
 1. Index renders via Jinja2 (200, HTML, brand + nav targets present).
-2. Vendored CSS reachable (pico + app.css).
+2. CSS reachable (anna.css — the hand-rolled design system, MC-01).
 3. Vendored JS reachable (htmx already covered in test_web_scaffold,
    add an explicit /static/app.js check).
 4. The ``_toast.html`` partial renders the level class + message.
@@ -62,21 +62,22 @@ def test_index_renders_via_jinja() -> None:
 
 
 def test_static_css_reachable() -> None:
-    """Both pico.min.css and app.css resolve via the /static mount."""
+    """anna.css (the linked design system, MC-01) resolves via the
+    /static mount. pico.min.css / app.css remain on disk but unlinked
+    until the deploy subtask removes them, so they aren't asserted."""
     from anna_web.app import app
 
     client = TestClient(app)
 
-    pico = client.get("/static/pico.min.css")
-    assert pico.status_code == 200
-    assert "css" in pico.headers.get("content-type", "").lower()
-
-    app_css = client.get("/static/app.css")
-    assert app_css.status_code == 200
-    assert "css" in app_css.headers.get("content-type", "").lower()
-    # Spot-check that the file actually contains an override the plan
-    # called out — not just a 200 from a misconfigured mount.
-    assert ".toast" in app_css.text
+    anna_css = client.get("/static/anna.css")
+    assert anna_css.status_code == 200
+    assert "css" in anna_css.headers.get("content-type", "").lower()
+    # Spot-check load-bearing contents — not just a 200 from a
+    # misconfigured mount: dark-default tokens, the light override
+    # block, the status palette, and the toast region app.js/HTMX rely on.
+    assert '[data-theme="light"]' in anna_css.text
+    assert "--status-ok" in anna_css.text
+    assert ".toast" in anna_css.text
 
 
 def test_static_js_reachable() -> None:
@@ -130,7 +131,7 @@ def test_base_block_overrides_land(tmp_path: Path) -> None:
     assert '<p id="custom">custom body copy</p>' in rendered
     # Base scaffolding still present — confirms the child extends
     # rather than shadows.
-    assert "/static/pico.min.css" in rendered
+    assert "/static/anna.css" in rendered
     assert "/static/htmx.min.js" in rendered
 
 

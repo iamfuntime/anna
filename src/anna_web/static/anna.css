@@ -1,0 +1,886 @@
+/* ============================================================================
+ * anna.css — ANNA Mission Control design system (MC-01).
+ *
+ * Hand-rolled replacement for Pico.css + app.css. No build step; this file
+ * ships verbatim in the wheel. Every color / spacing / typography decision
+ * lives in a custom property on :root (dark defaults) with a light override
+ * under [data-theme="light"]. base.html seeds data-theme on <html> before
+ * first paint (localStorage, falling back to prefers-color-scheme).
+ *
+ * Existing templates lean on bare elements (Pico's classless heritage), so
+ * element selectors here are load-bearing: body, nav, article, table, form
+ * controls, buttons, code. Class primitives (badges, panels, feed rows)
+ * are the vocabulary later MC subtasks build on.
+ *
+ * Aesthetic: dense SOC-ops console. Compact rows, mono for machine values
+ * (timestamps, slugs, cron, costs), restrained chrome, status color
+ * discipline via --status-* tokens.
+ * ========================================================================= */
+
+/* ---------------------------------------------------------------------------
+ * 1. Tokens — dark defaults
+ * ------------------------------------------------------------------------ */
+
+:root {
+  color-scheme: dark;
+
+  /* Surfaces */
+  --bg: #0b0e14;             /* page background */
+  --surface: #11151d;        /* panel / card body */
+  --surface-2: #171c26;      /* panel header strip, code, table head */
+  --surface-3: #1f2530;      /* hover rows, input wells */
+  --border: #242b38;
+  --border-strong: #323b4c;
+
+  /* Text */
+  --text: #d7dce4;
+  --text-muted: #8b94a5;
+  --text-faint: #5d6678;
+
+  /* Accent (links, focus, primary buttons) */
+  --accent: #4da3ff;
+  --accent-hover: #79bbff;
+  --accent-contrast: #07101c; /* text on accent-filled controls */
+  --accent-glow: rgba(77, 163, 255, 0.3); /* input focus halo */
+
+  /* Status palette */
+  --status-ok: #3fb950;
+  --status-warn: #d29922;
+  --status-fail: #f85149;
+  --status-idle: #8b949e;
+  --status-ok-bg: #12261a;
+  --status-warn-bg: #2a2008;
+  --status-fail-bg: #2d1215;
+  --status-idle-bg: #1c2128;
+
+  /* Typography */
+  --font-ui: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue",
+    Arial, sans-serif;
+  --font-mono: ui-monospace, "SFMono-Regular", "JetBrains Mono", Menlo,
+    Consolas, "Liberation Mono", monospace;
+  --text-xs: 0.72rem;
+  --text-sm: 0.8125rem;
+  --text-md: 0.875rem;       /* dense base size */
+  --text-lg: 1.0625rem;
+  --text-xl: 1.3125rem;
+  --leading: 1.45;
+
+  /* Spacing scale */
+  --space-1: 0.125rem;       /*  2px */
+  --space-2: 0.25rem;        /*  4px */
+  --space-3: 0.5rem;         /*  8px */
+  --space-4: 0.75rem;        /* 12px */
+  --space-5: 1rem;           /* 16px */
+  --space-6: 1.5rem;         /* 24px */
+
+  /* Chrome */
+  --radius: 4px;
+  --radius-lg: 6px;
+  --focus-ring: 0 0 0 2px var(--bg), 0 0 0 4px var(--accent);
+  --shadow-toast: 0 4px 16px rgba(0, 0, 0, 0.45);
+}
+
+[data-theme="light"] {
+  color-scheme: light;
+
+  --bg: #f3f5f8;
+  --surface: #ffffff;
+  --surface-2: #eaedf2;
+  --surface-3: #dfe3ea;
+  --border: #d3d9e2;
+  --border-strong: #b8c0cd;
+
+  --text: #1d2433;
+  --text-muted: #5b6575;
+  --text-faint: #8a93a3;
+
+  --accent: #1565d8;
+  --accent-hover: #0d4fb0;
+  --accent-contrast: #ffffff;
+  --accent-glow: rgba(21, 101, 216, 0.25);
+
+  --status-ok: #1a7f37;
+  --status-warn: #9a6700;
+  --status-fail: #cf222e;
+  --status-idle: #59636e;
+  --status-ok-bg: #dcf2e2;
+  --status-warn-bg: #f8eccb;
+  --status-fail-bg: #fbe2e4;
+  --status-idle-bg: #e6e9ed;
+
+  --focus-ring: 0 0 0 2px var(--bg), 0 0 0 4px var(--accent);
+  --shadow-toast: 0 4px 16px rgba(20, 30, 50, 0.2);
+}
+
+/* ---------------------------------------------------------------------------
+ * 2. Reset + document
+ * ------------------------------------------------------------------------ */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: var(--text-md);
+  line-height: var(--leading);
+}
+
+main.container,
+.container {
+  max-width: 72rem;
+  margin: 0 auto;
+  padding: var(--space-6) var(--space-5) var(--space-6);
+}
+
+h1,
+h2,
+h3,
+h4 {
+  color: var(--text);
+  line-height: 1.25;
+  margin: 0 0 var(--space-4);
+}
+
+h1 {
+  font-size: var(--text-xl);
+  letter-spacing: 0.01em;
+}
+
+h2 {
+  font-size: var(--text-lg);
+  margin-top: var(--space-6);
+}
+
+h3 {
+  font-size: var(--text-md);
+  margin-top: var(--space-5);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+}
+
+p {
+  margin: 0 0 var(--space-4);
+}
+
+small {
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+a:hover {
+  color: var(--accent-hover);
+  text-decoration: underline;
+}
+
+hr {
+  border: 0;
+  border-top: 1px solid var(--border);
+  margin: var(--space-5) 0;
+}
+
+::selection {
+  background: var(--accent);
+  color: var(--accent-contrast);
+}
+
+:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+  border-radius: var(--radius);
+}
+
+/* Mono for machine values: ids, cron expressions, paths, costs. */
+code,
+kbd,
+pre,
+.mono {
+  font-family: var(--font-mono);
+  font-size: 0.92em;
+}
+
+code,
+kbd {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0 var(--space-2);
+  color: var(--text);
+}
+
+pre {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--space-4);
+  overflow-x: auto;
+}
+
+pre code {
+  background: none;
+  border: 0;
+  padding: 0;
+}
+
+.muted {
+  color: var(--text-muted);
+}
+
+/* ---------------------------------------------------------------------------
+ * 3. Top nav (base.html). MC-02 redesigns this; keep it serviceable.
+ * ------------------------------------------------------------------------ */
+
+nav {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-5);
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  padding: 0 var(--space-5);
+  min-height: 2.75rem;
+}
+
+nav ul {
+  display: flex;
+  align-items: center;
+  gap: var(--space-5);
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+nav a {
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+}
+
+nav a:hover {
+  color: var(--text);
+  text-decoration: none;
+}
+
+nav a strong {
+  color: var(--text);
+  letter-spacing: 0.02em;
+}
+
+/* The minimal MC-01 theme control. Compact so it doesn't fight the nav. */
+.theme-toggle {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  padding: var(--space-1) var(--space-3);
+  margin: 0;
+  width: auto;
+}
+
+.theme-toggle:hover {
+  color: var(--text);
+  border-color: var(--border-strong);
+  background: var(--surface-3);
+}
+
+/* ---------------------------------------------------------------------------
+ * 4. Panels — <article> is the card primitive: chrome + header strip.
+ * ------------------------------------------------------------------------ */
+
+article,
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  margin: 0 0 var(--space-5);
+  padding: var(--space-4) var(--space-5);
+}
+
+article > header,
+.panel > header {
+  /* Header strip: bleed to the panel edges, sit flush on top. */
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--border);
+  border-radius: var(--radius-lg) var(--radius-lg) 0 0;
+  margin: calc(-1 * var(--space-4)) calc(-1 * var(--space-5)) var(--space-4);
+  padding: var(--space-3) var(--space-5);
+  font-size: var(--text-sm);
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--text-muted);
+}
+
+article > header strong,
+.panel > header strong {
+  color: var(--text);
+  font-weight: 600;
+}
+
+article > *:last-child {
+  margin-bottom: 0;
+}
+
+/* Page-level <header> wrappers (schedule_list, schedule_form) are layout,
+ * not card chrome — only style direct children of <article>/.panel above. */
+.schedule-list-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-5);
+  margin-bottom: var(--space-5);
+}
+
+.schedule-list-header h1 {
+  margin: 0;
+}
+
+.schedule-list-header .button {
+  margin: 0;
+}
+
+.empty-state {
+  text-align: center;
+  color: var(--text-muted);
+  padding: var(--space-6);
+}
+
+/* Busy indicator (restart partial renders <article aria-busy="true">). */
+[aria-busy="true"]::before {
+  content: "";
+  display: inline-block;
+  width: 0.9em;
+  height: 0.9em;
+  margin-right: var(--space-3);
+  vertical-align: -0.125em;
+  border: 2px solid var(--text-faint);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: anna-spin 0.8s linear infinite;
+}
+
+@keyframes anna-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* ---------------------------------------------------------------------------
+ * 5. Tables — dense ops rows.
+ * ------------------------------------------------------------------------ */
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  font-size: var(--text-sm);
+  margin: 0 0 var(--space-5);
+}
+
+thead th {
+  background: var(--surface-2);
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  text-align: left;
+  padding: var(--space-3) var(--space-4);
+  border-bottom: 1px solid var(--border-strong);
+}
+
+td {
+  padding: var(--space-3) var(--space-4);
+  border-bottom: 1px solid var(--border);
+  vertical-align: middle;
+}
+
+tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+tbody tr:hover {
+  background: var(--surface-3);
+}
+
+/* Inline forms inside table cells (env rows): keep them on one compact
+ * line instead of the block layout forms get elsewhere. */
+td form {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin: 0;
+}
+
+td form input:not([type="checkbox"]):not([type="hidden"]) {
+  flex: 1;
+  width: auto;
+  margin: 0;
+}
+
+td form button {
+  width: auto;
+  margin: 0;
+  padding: var(--space-1) var(--space-3);
+  font-size: var(--text-xs);
+}
+
+/* Action buttons / role=button links sitting directly in a cell
+ * (schedule rows' Edit + Delete): compact, no stray bottom margin. */
+td > button,
+td > [role="button"] {
+  margin: 0;
+  padding: var(--space-1) var(--space-3);
+  font-size: var(--text-xs);
+  width: auto;
+}
+
+td label {
+  margin: 0;
+  font-weight: 600;
+}
+
+/* ---------------------------------------------------------------------------
+ * 6. Forms — classless defaults the existing templates rely on.
+ * ------------------------------------------------------------------------ */
+
+form {
+  margin: 0 0 var(--space-5);
+}
+
+label {
+  display: block;
+  font-size: var(--text-sm);
+  font-weight: 500;
+  color: var(--text);
+  margin-bottom: var(--space-4);
+}
+
+/* Inputs are block/full-width whether they sit inside a label
+ * (schedule_form) or after one as a sibling (config_field). */
+input:not([type="checkbox"]):not([type="radio"]):not([type="hidden"]),
+select,
+textarea {
+  display: block;
+  width: 100%;
+  margin: var(--space-2) 0 var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  font-family: var(--font-ui);
+  font-size: var(--text-sm);
+  line-height: 1.4;
+}
+
+/* Machine-value inputs read better in mono. */
+input[type="password"],
+input[type="number"],
+input[name="cron"],
+input[name="timezone"],
+input[name="id"],
+input[name="key"] {
+  font-family: var(--font-mono);
+}
+
+input:not([type="checkbox"]):not([type="radio"]):focus,
+select:focus,
+textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-glow);
+}
+
+input::placeholder,
+textarea::placeholder {
+  color: var(--text-faint);
+}
+
+input[readonly] {
+  background: var(--surface-2);
+  color: var(--text-muted);
+}
+
+input[type="checkbox"],
+input[type="radio"] {
+  width: auto;
+  margin-right: var(--space-3);
+  accent-color: var(--accent);
+  vertical-align: -0.1em;
+}
+
+textarea {
+  min-height: 5rem;
+  resize: vertical;
+}
+
+select {
+  appearance: none;
+  background-image: linear-gradient(45deg, transparent 50%, var(--text-muted) 50%),
+    linear-gradient(135deg, var(--text-muted) 50%, transparent 50%);
+  background-position: calc(100% - 14px) 50%, calc(100% - 9px) 50%;
+  background-size: 5px 5px;
+  background-repeat: no-repeat;
+  padding-right: var(--space-6);
+}
+
+fieldset {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  margin: 0 0 var(--space-5);
+  padding: var(--space-4) var(--space-5);
+}
+
+legend {
+  font-size: var(--text-sm);
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 0 var(--space-3);
+}
+
+fieldset.repeated-row {
+  background: var(--surface-2);
+  margin-bottom: var(--space-4);
+}
+
+/* Validation + warning copy. */
+small.error,
+.field-error {
+  display: block;
+  color: var(--status-fail);
+  margin: var(--space-1) 0 var(--space-3);
+}
+
+small.error:empty {
+  display: none;
+  margin: 0;
+}
+
+.form-error {
+  border-left: 3px solid var(--status-fail);
+  background: var(--status-fail-bg);
+  color: var(--status-fail);
+  padding: var(--space-3) var(--space-4);
+}
+
+.field-warning {
+  display: block;
+  margin: var(--space-2) 0 var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border-left: 3px solid var(--status-warn);
+  border-radius: var(--radius);
+  background: var(--status-warn-bg);
+  color: var(--status-warn);
+}
+
+.field-warning code {
+  background: rgba(0, 0, 0, 0.2);
+}
+
+/* Two-column label/input utility grid (kept from app.css). */
+.form-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: var(--space-4) var(--space-6);
+  align-items: center;
+}
+
+@media (min-width: 768px) {
+  .form-grid {
+    grid-template-columns: minmax(12rem, 1fr) 2fr;
+  }
+}
+
+/* ---------------------------------------------------------------------------
+ * 7. Buttons
+ * ------------------------------------------------------------------------ */
+
+button,
+[role="button"],
+.button,
+input[type="submit"] {
+  display: inline-block;
+  background: var(--accent);
+  color: var(--accent-contrast);
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  padding: var(--space-2) var(--space-4);
+  font-family: var(--font-ui);
+  font-size: var(--text-sm);
+  font-weight: 600;
+  line-height: 1.4;
+  cursor: pointer;
+  text-decoration: none;
+  margin: 0 0 var(--space-3);
+}
+
+button:hover,
+[role="button"]:hover,
+.button:hover,
+input[type="submit"]:hover {
+  background: var(--accent-hover);
+  color: var(--accent-contrast);
+  text-decoration: none;
+}
+
+button:disabled,
+[role="button"][aria-disabled="true"] {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+button.secondary,
+[role="button"].secondary {
+  background: transparent;
+  color: var(--text-muted);
+  border-color: var(--border-strong);
+}
+
+button.secondary:hover:not(:disabled),
+[role="button"].secondary:hover {
+  color: var(--text);
+  background: var(--surface-3);
+}
+
+/* High-stakes control (Restart): outlined in fail-red so it reads as
+ * consequential without screaming like an error state. */
+button.contrast,
+.restart-button {
+  background: transparent;
+  color: var(--status-fail);
+  border-color: var(--status-fail);
+}
+
+button.contrast:hover:not(:disabled),
+.restart-button:hover:not(:disabled) {
+  background: var(--status-fail);
+  color: var(--bg);
+}
+
+/* ---------------------------------------------------------------------------
+ * 8. Badges + status primitives
+ * ------------------------------------------------------------------------ */
+
+.badge,
+.status-badge {
+  display: inline-block;
+  padding: var(--space-1) var(--space-3);
+  border-radius: var(--radius);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  line-height: 1.4;
+  border: 1px solid transparent;
+}
+
+.badge-ok,
+.badge-enabled,
+.status-badge[data-state="up"] {
+  background: var(--status-ok-bg);
+  color: var(--status-ok);
+  border-color: var(--status-ok);
+}
+
+.badge-warn {
+  background: var(--status-warn-bg);
+  color: var(--status-warn);
+  border-color: var(--status-warn);
+}
+
+.badge-fail,
+.status-badge[data-state="down"] {
+  background: var(--status-fail-bg);
+  color: var(--status-fail);
+  border-color: var(--status-fail);
+}
+
+.badge-idle,
+.badge-disabled {
+  background: var(--status-idle-bg);
+  color: var(--status-idle);
+  border-color: var(--status-idle);
+}
+
+.status-list {
+  list-style: none;
+  padding-left: 0;
+  margin: 0;
+}
+
+.status-list li {
+  padding: var(--space-2) 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * 9. Feed row — the MC event-stream primitive. One line per event:
+ *    mono timestamp | body | trailing meta. Later subtasks compose it.
+ * ------------------------------------------------------------------------ */
+
+.feed-row {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: baseline;
+  gap: var(--space-4);
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--border);
+  font-size: var(--text-sm);
+}
+
+.feed-row:last-child {
+  border-bottom: 0;
+}
+
+.feed-row:hover {
+  background: var(--surface-3);
+}
+
+.feed-row .feed-time {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+
+.feed-row .feed-meta {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+/* ---------------------------------------------------------------------------
+ * 10. App-specific surfaces carried over from app.css, re-tokenized.
+ * ------------------------------------------------------------------------ */
+
+/* Toast region — fixed bottom-right, color-coded, fades in on HTMX swap. */
+.toast {
+  position: fixed;
+  right: var(--space-5);
+  bottom: var(--space-5);
+  max-width: 24rem;
+  padding: var(--space-4) var(--space-5);
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-toast);
+  opacity: 0;
+  transition: opacity 150ms ease-in;
+  pointer-events: none;
+}
+
+.toast:not(:empty) {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.toast-success {
+  background: var(--status-ok-bg);
+  color: var(--status-ok);
+  border-color: var(--status-ok);
+}
+
+.toast-error {
+  background: var(--status-fail-bg);
+  color: var(--status-fail);
+  border-color: var(--status-fail);
+}
+
+.toast-info {
+  background: var(--surface-2);
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+/* Inline toasts the restart partial renders are positioned in-flow. */
+.restart-form .toast,
+.restart-status .toast {
+  position: static;
+  margin-top: var(--space-3);
+}
+
+/* Responsive card grid for the /config section index. */
+.section-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 18rem), 1fr));
+  gap: var(--space-4);
+}
+
+.section-grid article {
+  margin: 0;
+}
+
+.section-grid .section-desc {
+  margin-bottom: var(--space-2);
+}
+
+.section-grid .section-preview {
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+
+/* Apply-changes panel housing the restart control. */
+.restart-panel {
+  margin-top: var(--space-6);
+}
+
+.restart-last {
+  display: block;
+  margin-top: var(--space-2);
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+
+.restart-error {
+  display: block;
+  margin-top: var(--space-2);
+  color: var(--status-fail);
+}
+
+/* Masked-input row for the .env reveal toggle. */
+.masked-input {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex: 1;
+}
+
+.masked-input input {
+  font-family: var(--font-mono);
+  flex: 1;
+}
+
+.masked-input .reveal-toggle {
+  width: auto;
+  margin: 0;
+  padding: var(--space-1) var(--space-3);
+  font-size: var(--text-xs);
+  white-space: nowrap;
+  background: transparent;
+  color: var(--text-muted);
+  border-color: var(--border-strong);
+}
+
+.masked-input .reveal-toggle:hover {
+  color: var(--text);
+  background: var(--surface-3);
+}

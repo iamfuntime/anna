@@ -1,6 +1,10 @@
 // ANNA Dashboard — minimal vanilla JS.
 //
-// Single responsibility: the .env masked-input reveal toggle.
+// Two responsibilities:
+//   1. The .env masked-input reveal toggle.
+//   2. The light/dark theme toggle (MC-01).
+//
+// Reveal toggle: the .env masked-input show/hide.
 // On click of any .reveal-toggle button, flip the sibling input's
 // type between "password" and "text". Fire a fetch() to
 // /env/<key>/reveal to load the actual value (server returns the raw
@@ -53,4 +57,28 @@ document.addEventListener("click", function (event) {
     .catch(function (err) {
       console.warn("reveal fetch failed for", key, err);
     });
+});
+
+// Theme toggle (MC-01). The inline head script in base.html seeds
+// data-theme on <html> before first paint; this handler only flips the
+// attribute and persists the choice. Event delegation matches the
+// reveal-toggle pattern above, so the control keeps working if a future
+// nav redesign re-renders it via HTMX.
+document.addEventListener("click", function (event) {
+  var btn = event.target.closest('[data-action="toggle-theme"]');
+  if (!btn) {
+    return;
+  }
+  event.preventDefault();
+
+  var root = document.documentElement;
+  var next = root.getAttribute("data-theme") === "light" ? "dark" : "light";
+  root.setAttribute("data-theme", next);
+  try {
+    localStorage.setItem("anna-theme", next);
+  } catch (err) {
+    // Storage unavailable (private mode / sandbox): theme still flips
+    // for this page view, it just won't persist.
+    console.warn("could not persist theme preference", err);
+  }
 });

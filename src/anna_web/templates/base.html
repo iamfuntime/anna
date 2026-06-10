@@ -4,8 +4,23 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>{% block title %}ANNA Dashboard{% endblock %}</title>
-    <link rel="stylesheet" href="/static/pico.min.css">
-    <link rel="stylesheet" href="/static/app.css">
+    {# Seed data-theme on <html> BEFORE first paint: stored preference
+       wins, else the OS prefers-color-scheme, else dark (anna.css's
+       token defaults are dark-first). Inline + synchronous on purpose —
+       a deferred script would flash the wrong theme. #}
+    <script>
+      (function () {
+        var theme = null;
+        try { theme = localStorage.getItem("anna-theme"); } catch (e) { /* sandboxed storage */ }
+        if (theme !== "light" && theme !== "dark") {
+          theme = (window.matchMedia
+                   && window.matchMedia("(prefers-color-scheme: light)").matches)
+            ? "light" : "dark";
+        }
+        document.documentElement.setAttribute("data-theme", theme);
+      })();
+    </script>
+    <link rel="stylesheet" href="/static/anna.css">
     <script src="/static/htmx.min.js" defer></script>
     <script src="/static/app.js" defer></script>
   </head>
@@ -24,6 +39,14 @@
         {% for entry in integration_nav | default([]) %}
         <li><a href="{{ entry.href }}">{{ entry.label }}</a></li>
         {% endfor %}
+        {# Minimal MC-01 theme control; MC-02's nav redesign may restyle
+           or relocate it. Behavior lives in static/app.js. #}
+        <li>
+          <button type="button"
+                  class="theme-toggle"
+                  data-action="toggle-theme"
+                  aria-label="Toggle light/dark theme">theme</button>
+        </li>
       </ul>
     </nav>
     <main class="container">
