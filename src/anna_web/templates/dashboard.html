@@ -30,18 +30,6 @@
       </ul>
     </article>
 
-    {# (2) Recent activity head — newest audit events; htmx re-polls the
-       partial every 5s. The full feed is MC-05's /activity. #}
-    <article class="panel" id="panel-activity">
-      <header><strong>Recent activity</strong></header>
-      <div id="activity-head"
-           hx-get="/dashboard/panels/activity"
-           hx-trigger="every 5s"
-           hx-swap="innerHTML">
-        {% include "_dashboard_feed.html" %}
-      </div>
-    </article>
-
     {# (3) Schedule health — count + any schedule with consecutive
        failures, off the same ScheduleStoreAdapter the editor uses. #}
     <article class="panel" id="panel-schedules">
@@ -84,6 +72,19 @@
       {% else %}
       {% include "_panel_empty.html" %}
       {% endif %}
+    </article>
+
+    {# (2) Recent activity head — newest audit events; htmx re-polls the
+       partial every 5s. Spans the full grid row below the summary
+       panels (it's denser than they are). The full feed is /activity. #}
+    <article class="panel panel-span" id="panel-activity">
+      <header><strong>Recent activity</strong></header>
+      <div id="activity-head"
+           hx-get="/dashboard/panels/activity"
+           hx-trigger="every 5s"
+           hx-swap="innerHTML">
+        {% include "_dashboard_feed.html" %}
+      </div>
     </article>
 
   </section>

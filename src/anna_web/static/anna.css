@@ -752,12 +752,26 @@ button.contrast:hover:not(:disabled),
 
 .feed-row {
   display: grid;
-  grid-template-columns: auto 1fr auto;
+  grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: baseline;
   gap: var(--space-4);
   padding: var(--space-2) var(--space-3);
   border-bottom: 1px solid var(--border);
   font-size: var(--text-sm);
+  min-width: 0;
+}
+
+.feed-row .feed-event {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* A panel that spans the full dashboard grid row (e.g. recent activity,
+ * which is denser than the summary panels beside it). */
+.panel-span {
+  grid-column: 1 / -1;
 }
 
 .feed-row:last-child {

@@ -7,7 +7,7 @@
 <div class="feed-head">
   {% for e in events %}
   <div class="feed-row">
-    <span class="feed-time">{{ e.ts }}</span>
+    <span class="feed-time" title="{{ e.ts }}">{{ e.ts[11:19] if e.ts and e.ts|length >= 19 else e.ts }}</span>
     <span class="feed-event">{{ e.event }}</span>
     <span class="feed-meta">{{ e.fields.get("slug") or e.fields.get("schedule_id") or e.fields.get("actor") or "" }}</span>
   </div>
