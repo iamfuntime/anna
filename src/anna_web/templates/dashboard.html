@@ -1,0 +1,122 @@
+{% extends "base.html" %}
+
+{# No title override: the landing keeps base.html's default
+   "ANNA Dashboard" (which existing tests also pin). #}
+
+{% block content %}
+  <h1>Mission control</h1>
+
+  <section id="dashboard-grid" class="dashboard-grid">
+
+    {# (1) Service status — server-rendered from the same probe /healthz
+       exposes (healthz_routes.gather_health), kept fresh by the inline
+       poller at the bottom of this page. Same badge ids + copy the
+       pre-MC home used, so the poller contract is unchanged. #}
+    <article class="panel" id="panel-service">
+      <header><strong>Service status</strong></header>
+      <ul class="status-list">
+        <li>
+          <code>{{ restart_unit }}</code>:
+          <span id="anna-status"
+                class="status-badge"
+                data-state="{{ 'up' if anna_running else 'down' }}">{{ 'running' if anna_running else 'stopped' }}</span>
+        </li>
+        <li>
+          Config:
+          <span id="config-status"
+                class="status-badge"
+                data-state="{{ 'up' if config_loaded else 'down' }}">{{ 'loaded' if config_loaded else 'not loaded' }}</span>
+        </li>
+      </ul>
+    </article>
+
+    {# (2) Recent activity head — newest audit events; htmx re-polls the
+       partial every 5s. The full feed is MC-05's /activity. #}
+    <article class="panel" id="panel-activity">
+      <header><strong>Recent activity</strong></header>
+      <div id="activity-head"
+           hx-get="/dashboard/panels/activity"
+           hx-trigger="every 5s"
+           hx-swap="innerHTML">
+        {% include "_dashboard_feed.html" %}
+      </div>
+    </article>
+
+    {# (3) Schedule health — count + any schedule with consecutive
+       failures, off the same ScheduleStoreAdapter the editor uses. #}
+    <article class="panel" id="panel-schedules">
+      <header><strong>Schedule health</strong></header>
+      {% if schedule_summary %}
+      <ul class="status-list" data-total="{{ schedule_summary.total }}">
+        <li>
+          <span class="mono">{{ schedule_summary.total }}</span>
+          schedule{{ '' if schedule_summary.total == 1 else 's' }}
+          ({{ schedule_summary.enabled }} enabled)
+        </li>
+        <li>
+          {% if schedule_summary.failing %}
+          <span class="badge badge-fail">{{ schedule_summary.failing | length }} failing</span>
+          {% else %}
+          <span class="badge badge-ok">no failures</span>
+          {% endif %}
+        </li>
+        {% for s in schedule_summary.failing %}
+        <li>
+          <code>{{ s.id }}</code>
+          <span class="feed-meta">{{ s.state.consecutive_failures }} consecutive failure{{ '' if s.state.consecutive_failures == 1 else 's' }}</span>
+        </li>
+        {% endfor %}
+      </ul>
+      {% else %}
+      {% include "_panel_empty.html" %}
+      {% endif %}
+    </article>
+
+    {# (4) Today's delegation cost — DelegationReader daily rollup
+       (MC-04); empty state until delegations have run today. #}
+    <article class="panel" id="panel-cost">
+      <header><strong>Today's delegation cost</strong></header>
+      {% if cost_today %}
+      <p>
+        <span class="mono">${{ '%.2f' | format(cost_today.cost_usd) }}</span>
+        across {{ cost_today.runs }} run{{ '' if cost_today.runs == 1 else 's' }}
+      </p>
+      {% else %}
+      {% include "_panel_empty.html" %}
+      {% endif %}
+    </article>
+
+  </section>
+
+  <script>
+    // Keep the status badges live off /healthz. /healthz is GET-only and
+    // exempt from same-origin enforcement, so this works without a token.
+    // Mirrors the inline-poll approach the restart partial already uses.
+    (function () {
+      var INTERVAL_MS = 5000;
+
+      function setBadge(id, up, upText, downText) {
+        var el = document.getElementById(id);
+        if (!el) { return; }
+        el.textContent = up ? upText : downText;
+        el.setAttribute("data-state", up ? "up" : "down");
+      }
+
+      function paint(j) {
+        setBadge("anna-status", !!(j && j.anna_running === true), "running", "stopped");
+        setBadge("config-status", !!(j && j.config_loaded === true), "loaded", "not loaded");
+      }
+
+      function tick() {
+        fetch("/healthz", {headers: {"Accept": "application/json"}})
+          .then(function (r) { return r.ok ? r.json() : null; })
+          .then(paint)
+          .catch(function () { /* leave the last-known badge state */ });
+      }
+
+      setInterval(tick, INTERVAL_MS);
+      // Server-render seeds the first paint; refresh once shortly after load.
+      tick();
+    })();
+  </script>
+{% endblock %}

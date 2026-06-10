@@ -242,7 +242,7 @@ pre code {
 }
 
 /* ---------------------------------------------------------------------------
- * 3. Top nav (base.html). MC-02 redesigns this; keep it serviceable.
+ * 3. Top nav (base.html) — the mission-control shell nav (MC-02).
  * ------------------------------------------------------------------------ */
 
 nav {
@@ -278,6 +278,21 @@ nav a:hover {
 nav a strong {
   color: var(--text);
   letter-spacing: 0.02em;
+}
+
+/* Brand subtitle ("mission control") — quiet, lowercase, mono-adjacent. */
+nav .nav-sub {
+  color: var(--text-faint);
+  font-size: var(--text-xs);
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
+/* Active page (MC-02): routes set aria-current="page" on their nav
+ * link via the active_nav template var. */
+nav a[aria-current="page"] {
+  color: var(--text);
+  font-weight: 600;
 }
 
 /* The minimal MC-01 theme control. Compact so it doesn't fight the nav. */
@@ -883,4 +898,22 @@ button.contrast:hover:not(:disabled),
 .masked-input .reveal-toggle:hover {
   color: var(--text);
   background: var(--surface-3);
+}
+
+/* ---------------------------------------------------------------------------
+ * 11. Dashboard panel grid (MC-02). Auto-fills two-up at desktop widths,
+ *     collapses to a single column on narrow viewports. Panel chrome
+ *     comes from the <article>/.panel primitive in section 4; the grid
+ *     owns spacing, so per-panel bottom margins are zeroed.
+ * ------------------------------------------------------------------------ */
+
+.dashboard-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(20rem, 1fr));
+  gap: var(--space-5);
+  align-items: start;
+}
+
+.dashboard-grid > article {
+  margin: 0;
 }

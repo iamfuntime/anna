@@ -193,7 +193,10 @@ async def list_schedules(request: Request) -> Response:
     return request.app.state.templates.TemplateResponse(
         request,
         "schedule_list.html",
-        {"schedules": schedules},
+        # active_nav drives the shell nav's aria-current highlighting
+        # (base.html, MC-02) — Schedules is the only nav target that
+        # already exists outside the dashboard.
+        {"schedules": schedules, "active_nav": "schedules"},
     )
 
 

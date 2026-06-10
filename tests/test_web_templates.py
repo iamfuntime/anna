@@ -41,8 +41,8 @@ def _env() -> Environment:
 
 
 def test_index_renders_via_jinja() -> None:
-    """GET / returns 200 HTML containing the brand and the three nav
-    targets the subtask plan calls out."""
+    """GET / returns 200 HTML containing the brand and the
+    mission-control nav targets (MC-02 shell)."""
     from anna_web.app import app
 
     client = TestClient(app)
@@ -53,12 +53,19 @@ def test_index_renders_via_jinja() -> None:
     assert "html" in content_type.lower()
 
     body = response.text
-    # Brand appears in both the <title> and the nav.
+    # Brand appears in the <title> (default block) and the nav.
     assert "ANNA Dashboard" in body
-    # Nav links to the three sections subtasks 7/8/9 will land.
-    assert 'href="/config"' in body
-    assert 'href="/env"' in body
+    # Every non-gated mission-control nav target. Activity /
+    # Delegations / Settings 404 until MC-05/07/10 land — the nav
+    # entries render regardless (intentional mid-build state).
+    assert 'href="/activity"' in body
     assert 'href="/schedules"' in body
+    assert 'href="/delegations"' in body
+    assert 'href="/settings"' in body
+    # The editor links moved out of the shell nav (Settings hub,
+    # MC-10, will absorb them).
+    assert 'href="/config"' not in body
+    assert 'href="/env"' not in body
 
 
 def test_static_css_reachable() -> None:
@@ -136,8 +143,9 @@ def test_base_block_overrides_land(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Home page rebuild (subtask 8): operator overview surfaces the restart
-# control + live status derived from /healthz, plus the three editor links.
+# Home page (MC-02): the mission-control dashboard landing. The service
+# status panel server-renders the same flags /healthz exposes; the
+# inline poller keeps the badges fresh.
 # ---------------------------------------------------------------------------
 
 
@@ -168,10 +176,16 @@ def _mock_manager(active_state: str) -> MagicMock:
     return mgr
 
 
-def test_home_surfaces_restart_control_and_editor_links(
+def test_home_renders_mission_control_panel_grid(
     home_client: TestClient,
 ) -> None:
-    """GET / includes the (previously orphaned) restart control + quick links."""
+    """GET / renders the MC-02 panel grid: service status, activity head,
+    schedule health, today's cost.
+
+    The restart control and editor quick links moved off Home — restart
+    stays reachable on /config until the Settings hub (MC-10) absorbs
+    it.
+    """
     from anna_web.app import app
 
     app.state.restart_manager = _mock_manager("active")
@@ -180,17 +194,20 @@ def test_home_surfaces_restart_control_and_editor_links(
     assert response.status_code == 200
     body = response.text
 
-    # The restart control is now reachable from Home.
-    assert 'hx-post="/restart"' in body
-    assert "Restart anna.service" in body
+    assert 'id="dashboard-grid"' in body
+    for panel_id in (
+        "panel-service",
+        "panel-activity",
+        "panel-schedules",
+        "panel-cost",
+    ):
+        assert f'id="{panel_id}"' in body, f"missing dashboard panel {panel_id}"
 
-    # Quick links to the three editors.
-    assert 'href="/config"' in body
-    assert 'href="/env"' in body
-    assert 'href="/schedules"' in body
+    # The activity head polls its partial via htmx.
+    assert 'hx-get="/dashboard/panels/activity"' in body
 
-    # The dead "later subtasks" placeholder is gone.
-    assert "land in later subtasks" not in body
+    # Home carries no restart control any more (GET-only landing).
+    assert 'hx-post="/restart"' not in body
 
 
 def test_home_status_reflects_running_daemon(home_client: TestClient) -> None:

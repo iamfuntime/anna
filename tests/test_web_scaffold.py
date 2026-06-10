@@ -26,14 +26,14 @@ def test_app_importable() -> None:
     assert app.title == "ANNA Dashboard"
 
 
-def test_app_root_serves_placeholder() -> None:
-    """GET / returns the Jinja2-rendered index page.
+def test_app_root_serves_dashboard() -> None:
+    """GET / returns the Jinja2-rendered mission-control dashboard.
 
-    Subtask 6 swapped the inline placeholder string for an
-    ``index.html`` template that extends ``base.html``. The body now
-    advertises that the dashboard is live and points at the (still
-    unrouted) nav targets — assert on the new copy so the test
-    actually pins what ships.
+    MC-02 replaced the subtask-6 index (live-copy + editor quick links)
+    with the panel-grid landing rendered by
+    ``routes/dashboard_routes.py`` — assert on the new shape so the
+    test actually pins what ships. (The old ``index.html`` stays on
+    disk unrouted until the rebuild completes.)
     """
     from anna_web.app import app
 
@@ -42,7 +42,7 @@ def test_app_root_serves_placeholder() -> None:
 
     assert response.status_code == 200
     assert "ANNA Dashboard" in response.text
-    assert "ANNA Dashboard is live" in response.text
+    assert 'id="dashboard-grid"' in response.text
 
 
 def test_static_mount() -> None:

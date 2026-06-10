@@ -1,16 +1,18 @@
 """FastAPI app factory for the ANNA web dashboard.
 
-Subtask 2 (scaffold) of the Phase 2.5 buildout. This module exposes
-``create_app(cfg)`` and a module-level ``app`` so uvicorn can import
-it as ``anna_web.app:app``.
+This module exposes ``create_app(cfg)`` and a module-level ``app`` so
+uvicorn can import it as ``anna_web.app:app``.
 
-The scaffold wires per-process state (placeholder dict until the
-ConfigStore/EnvStore/ScheduleStore subtasks land), mounts the
-vendored static directory, registers the shutdown hook, and renders
-the Jinja2 base template for the index. Real routes (config / env /
-schedules / restart / healthz) land in subtasks 7-12.
+It wires per-process state (ConfigStore / EnvStore /
+ScheduleStoreAdapter / RestartManager / AuditReader), mounts the
+vendored static directory, registers the shutdown hook, and includes
+every route module. ``GET /`` is the mission-control dashboard landing
+(``routes/dashboard_routes.py``, MC-02); the Phase 2.5 editor routes
+(config / env / schedules / restart / healthz) are unchanged.
 
-See Inbox/2026-06-02-ANNA-Web-Dashboard-Plan.md for the full design.
+See Inbox/2026-06-02-ANNA-Web-Dashboard-Plan.md for the original
+design and Inbox/2026-06-10-anna-web-mission-control-plan.md for the
+mission-control rebuild.
 """
 
 from __future__ import annotations
@@ -19,8 +21,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, Request
-from fastapi.responses import Response
+from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -31,9 +32,11 @@ from anna_web import integrations as web_integrations
 from anna_web.config_store import ConfigStore
 from anna_web.env_store import EnvStore
 from anna_web.middleware import SameOriginMiddleware, is_wildcard_host
+from anna_web.readers.audit_reader import AuditReader
 from anna_web.restart import RestartManager
 from anna_web.routes import (
     config_routes,
+    dashboard_routes,
     env_routes,
     healthz_routes,
     restart_routes,
@@ -49,9 +52,9 @@ def create_app(cfg: AnnaConfig) -> FastAPI:
     """Build the FastAPI app for the operator dashboard.
 
     Per-process singletons (ConfigStore, EnvStore, ScheduleStoreAdapter,
-    RestartManager) hang off ``app.state``. At scaffold time they're a
-    placeholder dict; subtasks 3-4-9-10 replace the dict entries with
-    real objects without changing the wiring shape.
+    RestartManager, AuditReader) hang off ``app.state``; routes pull
+    them via ``request.app.state.*`` so tests can rebind any of them
+    against a tmp anna_home.
     """
     @asynccontextmanager
     async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -91,6 +94,10 @@ def create_app(cfg: AnnaConfig) -> FastAPI:
     app.state.schedule_store = schedule_store
     restart_manager = RestartManager(target_unit=cfg.web.target_unit)
     app.state.restart_manager = restart_manager
+    # One AuditReader per process (MC-02): its (mtime, size)-keyed parse
+    # cache lives on app.state so an unchanged audit file costs one
+    # stat() per dashboard poll. Routes call it via run_in_threadpool.
+    app.state.audit_reader = AuditReader(cfg.audit_dir)
     app.state.stores = {
         "config_store": config_store,
         "env_store": env_store,
@@ -125,22 +132,9 @@ def create_app(cfg: AnnaConfig) -> FastAPI:
         name="static",
     )
 
-    @app.get("/")
-    async def _index(request: Request) -> Response:
-        # Server-render the live service status from the same probe
-        # /healthz exposes, so the operator overview has a meaningful
-        # state on first paint (and in no-JS contexts). The page's inline
-        # poller then keeps the badges fresh off /healthz.
-        health = await healthz_routes.gather_health(request)
-        return templates.TemplateResponse(
-            request,
-            "index.html",
-            {
-                "anna_running": health["anna_running"],
-                "config_loaded": health["config_loaded"],
-            },
-        )
-
+    # GET / is the mission-control dashboard landing (MC-02). The old
+    # index.html stays on disk unrouted until the rebuild completes.
+    app.include_router(dashboard_routes.router)
     app.include_router(config_routes.router)
     app.include_router(env_routes.router)
     app.include_router(schedule_routes.router)

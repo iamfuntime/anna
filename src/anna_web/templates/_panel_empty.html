@@ -1,0 +1,6 @@
+{# Shared empty state for dashboard panels (MC-02). Rendered whenever a
+   panel's reader returns nothing or fails — fresh installs have no
+   audit/, no transcripts/, and no schedules.yaml, and every view must
+   degrade to this rather than 500 (mission-control plan, "fail soft,
+   everywhere"). #}
+<p class="empty-state">No data yet.</p>
