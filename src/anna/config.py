@@ -70,6 +70,28 @@ def validate_model_string(value: str | None) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# ANNA_HOME resolution
+# ---------------------------------------------------------------------------
+
+
+def _resolve_anna_home() -> Path:
+    """Canonical ``$ANNA_HOME`` directory — the single source of truth.
+
+    ``ANNA_HOME`` from the environment wins (the systemd units and the
+    setup wizard always write it), expanded via
+    :func:`os.path.expanduser`, falling back to ``~/anna``.
+
+    Module-level rather than a method on :class:`AnnaConfig` because
+    :func:`load_config` needs the answer *before* the model is
+    instantiated (the explicit ``.env`` load anchors here). Every
+    ``ANNA_HOME`` read in this module funnels through this helper —
+    do not add another inline ``os.environ.get("ANNA_HOME", ...)``;
+    see TaskNote ANNA-Consolidate-ANNA_HOME-resolution.
+    """
+    return Path(os.path.expanduser(os.environ.get("ANNA_HOME", "~/anna")))
+
+
+# ---------------------------------------------------------------------------
 # Sub-models
 # ---------------------------------------------------------------------------
 
@@ -1105,6 +1127,61 @@ class ImagesConfig(BaseModel):
     inbound: ImagesInboundConfig = Field(default_factory=ImagesInboundConfig)
 
 
+class ObsidianIntegrationConfig(BaseModel):
+    """Optional Obsidian-vault integration (default: fully off).
+
+    First registration of the optional-integration gating pattern
+    (Inbox/2026-06-10-anna-web-mission-control-plan.md, subtask 8).
+    With the defaults below, anna-web renders no vault-touching UI at
+    all: no Tasks nav entry, ``/tasks`` is never mounted (404), and the
+    TaskNote reader reports unavailable. Flipping ``enabled`` +
+    ``tasknotes_enabled`` (and restarting anna-web) surfaces the
+    read-only TaskNote pipeline board.
+
+    * ``enabled`` — master gate for the whole Obsidian integration.
+    * ``vault_path`` — root of the operator's Obsidian vault.
+    * ``tasknotes_enabled`` — sub-gate for the TaskNote board; the
+      board needs BOTH this and ``enabled`` true.
+    * ``tasknotes_path`` — directory the TaskNote markdown files live
+      in (e.g. ``~/Obsidian/Brain/TaskNotes/Tasks``).
+
+    Like the rest of anna.yaml there is no hot-reload; changes apply on
+    the next service restart.
+    """
+
+    enabled: bool = False
+    vault_path: Path | None = None
+    tasknotes_enabled: bool = False
+    tasknotes_path: Path | None = None
+
+    @property
+    def resolved_vault_path(self) -> Path | None:
+        """``vault_path`` with ``~`` expanded; ``None`` stays ``None``."""
+        return self.vault_path.expanduser() if self.vault_path else None
+
+    @property
+    def resolved_tasknotes_path(self) -> Path | None:
+        """``tasknotes_path`` with ``~`` expanded; ``None`` stays ``None``."""
+        return self.tasknotes_path.expanduser() if self.tasknotes_path else None
+
+
+class IntegrationsConfig(BaseModel):
+    """Optional third-party integrations, every one default-off.
+
+    Top-level (not nested under ``web:``) so future daemon features can
+    read the same gates — see mission-control plan Open Q3. The shared
+    contract: a vanilla deploy with no ``integrations:`` block behaves
+    exactly as if the block were absent — no extra nav, routes, or
+    readers. anna-web's :mod:`anna_web.integrations` registry is the
+    consumer that maps each gate onto nav entries / route mounting /
+    reader availability.
+    """
+
+    obsidian: ObsidianIntegrationConfig = Field(
+        default_factory=ObsidianIntegrationConfig
+    )
+
+
 class IdentityAliasEntry(BaseModel):
     """Phase 2 §5 identity alias.
 
@@ -1166,11 +1243,15 @@ class AnnaConfig(BaseModel):
     web: WebDashboardConfig = Field(default_factory=WebDashboardConfig)
     voice: VoiceConfig = Field(default_factory=VoiceConfig)
     images: ImagesConfig = Field(default_factory=ImagesConfig)
+    integrations: IntegrationsConfig = Field(default_factory=IntegrationsConfig)
     identities: list[IdentityAliasEntry] = Field(default_factory=list)
 
     # Derived runtime paths. Not in the YAML file. ANNA_HOME from .env wins,
-    # falling back to ~/anna. The setup wizard always writes ANNA_HOME.
-    anna_home: Path = Field(default_factory=lambda: Path(os.path.expanduser(os.environ.get("ANNA_HOME", "~/anna"))))
+    # falling back to ~/anna (via _resolve_anna_home, the single source of
+    # truth). The setup wizard always writes ANNA_HOME. The sub-path
+    # properties below (audit_dir, transcripts_dir, ...) all derive from
+    # this field, so they inherit the consolidated resolution too.
+    anna_home: Path = Field(default_factory=_resolve_anna_home)
 
     @model_validator(mode="after")
     def _check_unique_canonical(self) -> "AnnaConfig":
@@ -1285,8 +1366,7 @@ def _resolve_config_path() -> Path:
     explicit = os.environ.get("ANNA_CONFIG_PATH")
     if explicit:
         return Path(os.path.expanduser(explicit))
-    anna_home = Path(os.path.expanduser(os.environ.get("ANNA_HOME", "~/anna")))
-    candidate = anna_home / "anna.yaml"
+    candidate = _resolve_anna_home() / "anna.yaml"
     if candidate.is_file():
         return candidate
     return Path("anna.yaml")
@@ -1335,15 +1415,15 @@ def load_config(path: Path | None = None) -> AnnaConfig:
     # Be explicit about the dotenv path: python-dotenv's default upward
     # search walks from this source file, which no longer lives under
     # ~/anna/ after the uv-tool install migration. ANNA_HOME comes from
-    # the systemd unit's Environment= line and is the canonical anchor;
+    # the systemd unit's Environment= line and is the canonical anchor
+    # (resolved via _resolve_anna_home, the single source of truth);
     # fall back to the legacy upward search for dev/test runs that don't
-    # set it.
-    anna_home_env = os.environ.get("ANNA_HOME")
-    if anna_home_env:
-        load_dotenv(
-            dotenv_path=Path(os.path.expanduser(anna_home_env)) / ".env",
-            override=False,
-        )
+    # set it — deliberately NOT _resolve_anna_home()'s ~/anna default,
+    # which would pull the operator's real .env into isolated test envs.
+    # override=False is load-bearing either way: a var already in the
+    # process environment always wins over the file.
+    if os.environ.get("ANNA_HOME"):
+        load_dotenv(dotenv_path=_resolve_anna_home() / ".env", override=False)
     else:
         load_dotenv(override=False)
 

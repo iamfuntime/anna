@@ -590,6 +590,35 @@ images:
     max_total_bytes: 20971520
 
 # ============================================================
+# integrations: optional third-party integrations.
+#
+# The generic optional-integration gating pattern (web mission-control
+# plan, subtask 8). Every integration here defaults OFF: a vanilla
+# deploy shows no integration-specific UI at all — anna-web mounts an
+# integration's routes and renders its nav entries only when its gate
+# below is satisfied (/tasks 404s and there is no Tasks nav until
+# then). Top-level rather than under web: so future daemon features
+# can read the same gates. Like the rest of this file there is no
+# hot-reload — restart anna-web (and anna, once the daemon consumes
+# this block) after edits.
+# ============================================================
+integrations:
+  # obsidian: the first registered integration. Points anna-web at the
+  # operator's Obsidian vault for read-only views.
+  obsidian:
+    # Master gate for the whole Obsidian integration. false = no
+    # vault-touching UI renders anywhere.
+    enabled: false
+    # Root of the Obsidian vault (absolute or ~-rooted). null = unset.
+    vault_path:
+    # Sub-gate for the read-only TaskNote pipeline board at /tasks.
+    # The board needs BOTH enabled and tasknotes_enabled true.
+    tasknotes_enabled: false
+    # Directory the TaskNote markdown files live in, e.g.
+    # ~/Obsidian/Brain/TaskNotes/Tasks. null = unset.
+    tasknotes_path:
+
+# ============================================================
 # identities: Phase 2 §5 cross-transport identity aliasing.
 #
 # DO NOT UNCOMMENT. Identity aliasing across slack/telegram/cli is

@@ -11,6 +11,8 @@ from anna.config import (
     AnnaConfig,
     CheckpointConfig,
     IdentityAliasEntry,
+    IntegrationsConfig,
+    ObsidianIntegrationConfig,
     RuntimeVisibilityConfig,
     VoiceConfig,
     VoiceInboundConfig,
@@ -727,3 +729,145 @@ def test_agent_grants_model_rejects_garbage(garbage: str) -> None:
 
     with pytest.raises(ValueError):
         AgentGrants(model=garbage)
+
+
+# ---------------------------------------------------------------------------
+# integrations block (web mission-control subtask 8)
+# ---------------------------------------------------------------------------
+
+
+def test_integrations_defaults_when_block_omitted() -> None:
+    """A config with no integrations: block is fully off — the vanilla-deploy
+    contract: no gate satisfied, no integration UI anywhere."""
+    cfg = AnnaConfig.model_validate({"auth": {"mode": "max"}})
+    assert isinstance(cfg.integrations, IntegrationsConfig)
+    assert isinstance(cfg.integrations.obsidian, ObsidianIntegrationConfig)
+    obsidian = cfg.integrations.obsidian
+    assert obsidian.enabled is False
+    assert obsidian.vault_path is None
+    assert obsidian.tasknotes_enabled is False
+    assert obsidian.tasknotes_path is None
+
+
+def test_integrations_direct_instantiation_defaults() -> None:
+    """IntegrationsConfig() with no args matches the documented all-off defaults."""
+    ic = IntegrationsConfig()
+    assert ic.obsidian.enabled is False
+    assert ic.obsidian.vault_path is None
+    assert ic.obsidian.tasknotes_enabled is False
+    assert ic.obsidian.tasknotes_path is None
+
+
+def test_integrations_block_parses() -> None:
+    """A fully-populated integrations: block round-trips through the model."""
+    raw = {
+        "integrations": {
+            "obsidian": {
+                "enabled": True,
+                "vault_path": "~/Obsidian/Brain",
+                "tasknotes_enabled": True,
+                "tasknotes_path": "~/Obsidian/Brain/TaskNotes/Tasks",
+            }
+        }
+    }
+    cfg = AnnaConfig.model_validate(raw)
+    obsidian = cfg.integrations.obsidian
+    assert obsidian.enabled is True
+    assert obsidian.vault_path == Path("~/Obsidian/Brain")
+    assert obsidian.tasknotes_enabled is True
+    assert obsidian.tasknotes_path == Path("~/Obsidian/Brain/TaskNotes/Tasks")
+
+
+def test_integrations_resolved_paths_expand_tilde() -> None:
+    obsidian = ObsidianIntegrationConfig(
+        enabled=True,
+        vault_path="~/Obsidian/Brain",
+        tasknotes_enabled=True,
+        tasknotes_path="~/Obsidian/Brain/TaskNotes/Tasks",
+    )
+    assert obsidian.resolved_vault_path is not None
+    assert "~" not in str(obsidian.resolved_vault_path)
+    assert str(obsidian.resolved_vault_path).endswith("/Obsidian/Brain")
+    assert obsidian.resolved_tasknotes_path is not None
+    assert "~" not in str(obsidian.resolved_tasknotes_path)
+    assert str(obsidian.resolved_tasknotes_path).endswith("/TaskNotes/Tasks")
+
+
+def test_integrations_resolved_paths_none_stay_none() -> None:
+    obsidian = ObsidianIntegrationConfig()
+    assert obsidian.resolved_vault_path is None
+    assert obsidian.resolved_tasknotes_path is None
+
+
+def test_example_yaml_includes_integrations_block() -> None:
+    """The anna.yaml.example ships the block explicitly, all-off, and it
+    round-trips through the model."""
+    raw = yaml.safe_load(EXAMPLE_PATH.read_text(encoding="utf-8"))
+    assert "integrations" in raw, "integrations: block missing from anna.yaml.example"
+    cfg = AnnaConfig.model_validate(raw)
+    assert cfg.integrations.obsidian.enabled is False
+    assert cfg.integrations.obsidian.vault_path is None
+    assert cfg.integrations.obsidian.tasknotes_enabled is False
+    assert cfg.integrations.obsidian.tasknotes_path is None
+
+
+# ---------------------------------------------------------------------------
+# ANNA_HOME resolution helper (folded-in refactor:
+# ANNA-Consolidate-ANNA_HOME-resolution)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_anna_home_env_var_wins(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from anna.config import _resolve_anna_home
+
+    monkeypatch.setenv("ANNA_HOME", str(tmp_path))
+    assert _resolve_anna_home() == tmp_path
+
+
+def test_resolve_anna_home_expands_tilde(monkeypatch: pytest.MonkeyPatch) -> None:
+    from anna.config import _resolve_anna_home
+
+    monkeypatch.setenv("ANNA_HOME", "~/custom_anna_home")
+    resolved = _resolve_anna_home()
+    assert "~" not in str(resolved)
+    assert str(resolved).endswith("/custom_anna_home")
+
+
+def test_resolve_anna_home_defaults_when_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import os
+
+    from anna.config import _resolve_anna_home
+
+    monkeypatch.delenv("ANNA_HOME", raising=False)
+    assert _resolve_anna_home() == Path(os.path.expanduser("~/anna"))
+
+
+def test_anna_home_field_delegates_to_resolver(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AnnaConfig.anna_home and its derived sub-paths follow the helper."""
+    monkeypatch.setenv("ANNA_HOME", str(tmp_path))
+    cfg = AnnaConfig()
+    assert cfg.anna_home == tmp_path
+    # Derived sub-path properties inherit the consolidated resolution.
+    assert cfg.audit_dir == tmp_path / "audit"
+    assert cfg.transcripts_dir == tmp_path / "transcripts"
+    assert cfg.core_dir == tmp_path / "core"
+    assert cfg.state_dir == tmp_path / "state"
+
+
+def test_resolve_config_path_uses_resolver(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without ANNA_CONFIG_PATH, $ANNA_HOME/anna.yaml wins when it exists."""
+    from anna.config import _resolve_config_path
+
+    monkeypatch.delenv("ANNA_CONFIG_PATH", raising=False)
+    monkeypatch.setenv("ANNA_HOME", str(tmp_path))
+    cfg_file = tmp_path / "anna.yaml"
+    cfg_file.write_text("auth:\n  mode: max\n", encoding="utf-8")
+    assert _resolve_config_path() == cfg_file
