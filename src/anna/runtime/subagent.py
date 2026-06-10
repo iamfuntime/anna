@@ -1027,6 +1027,10 @@ class SubAgentRunner:
             # Step 6+7: stamp spawn audit. Truncate the task for the
             # audit line so a multi-page prompt does not bloat journald.
             truncated_task = task[:500]
+            # Resolved model string, shared between the spawn audit event
+            # and the outbound transcript trailer so both record the same
+            # value. None = inherited CLI default.
+            resolved_model = resolved.model or "<cli-default>"
             self._audit(
                 "audit.subagent.spawn",
                 parent_conv=parent_conv_key,
@@ -1035,8 +1039,8 @@ class SubAgentRunner:
                 task=truncated_task,
                 timeout_seconds=effective_timeout,
                 # Record the resolved model so the operator can verify which
-                # model a delegation ran on. None = inherited CLI default.
-                model=resolved.model or "<cli-default>",
+                # model a delegation ran on.
+                model=resolved_model,
             )
 
             # Write the task transcript line up front so a crashing
@@ -1182,6 +1186,10 @@ class SubAgentRunner:
                 duration_seconds=duration_ms / 1000.0,
                 cost_usd=cost_usd,
                 tool_calls=tool_calls,
+                # Same resolved model string the spawn audit event records,
+                # so trailer consumers can bucket runs per model without
+                # joining back to the audit log.
+                model=resolved_model,
             )
 
             # Step 12: completion audit.
@@ -1192,6 +1200,7 @@ class SubAgentRunner:
                 audit_id=audit_id,
                 duration_seconds=duration_ms / 1000.0,
                 output_length=len(reply_text),
+                cost_usd=cost_usd,
             )
 
             return DelegateResult(

@@ -1092,6 +1092,9 @@ async def test_delegate_writes_task_and_outbound_transcript_lines(
     assert records[1]["direction"] == "outbound"
     assert records[1]["text"] == "reply body"
     assert records[1]["parent_conv"] == "slack:dm:U123"
+    # Trailer carries the resolved model; no grant + no runtime.model
+    # resolves to the CLI-default sentinel (same as the spawn audit).
+    assert records[1]["model"] == "<cli-default>"
     # task + outbound share the same audit_id.
     assert records[0]["audit_id"] == records[1]["audit_id"]
     # synthetic conv_key shape.
@@ -1135,6 +1138,52 @@ async def test_delegate_emits_spawn_and_complete_audit_events(
     assert spawn["task"] == "t"
     assert spawn["timeout_seconds"] == runner._config.subagents.default_timeout_seconds  # noqa: SLF001
     assert complete["output_length"] == len("reply")
+    # complete stamps the delegation cost (fake client default cost).
+    assert complete["cost_usd"] == pytest.approx(0.0042)
+
+
+@pytest.mark.asyncio
+async def test_delegate_trailer_model_matches_spawn_audit(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The outbound trailer records the resolved model, same as spawn.
+
+    A frontmatter ``grants.model`` resolves through
+    resolve_effective_grant; both the spawn audit event and the outbound
+    transcript trailer must record that same string so trailer consumers
+    (Mission Control delegations view) can bucket runs per model without
+    joining back to the audit log.
+    """
+    runner = _make_runner(tmp_path)
+    agents_dir = tmp_path / "agents"
+    agents_dir.mkdir(parents=True, exist_ok=True)
+    (agents_dir / "modeled.md").write_text(
+        "---\ngrants:\n  model: haiku\n---\npersona body\n",
+        encoding="utf-8",
+    )
+    _install_fake_sdk(
+        monkeypatch,
+        lambda opts: _FakeReplyClient(reply="reply"),
+    )
+
+    result = await runner.delegate(
+        agent_slug="modeled",
+        task="t",
+        parent_conv_key="slack:dm:U123",
+    )
+
+    lines = result.transcript_path.read_text(encoding="utf-8").splitlines()
+    records = [json.loads(line) for line in lines]
+    outbound = next(r for r in records if r["direction"] == "outbound")
+    assert outbound["model"] == "haiku"
+
+    audit_dir = tmp_path / "audit"
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    audit_path = audit_dir / f"audit-{today}.jsonl"
+    events = [json.loads(line) for line in audit_path.read_text().splitlines()]
+    spawn = next(e for e in events if e["event"] == "audit.subagent.spawn")
+    assert spawn["model"] == "haiku"
+    assert outbound["model"] == spawn["model"]
 
 
 @pytest.mark.asyncio
