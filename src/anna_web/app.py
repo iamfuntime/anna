@@ -126,7 +126,8 @@ def create_app(cfg: AnnaConfig) -> FastAPI:
     templates.env.globals["integration_nav"] = web_integrations.nav_entries(cfg)
     app.state.templates = templates
 
-    # Vendored frontend assets (htmx + pico + app.css/app.js). Mounted
+    # Vendored frontend assets (htmx.min.js + anna.css + app.js; the
+    # superseded pico.min.css / app.css stay on disk unlinked). Mounted
     # unconditionally so the base template's <link>/<script> tags
     # resolve.
     app.mount(
@@ -136,7 +137,8 @@ def create_app(cfg: AnnaConfig) -> FastAPI:
     )
 
     # GET / is the mission-control dashboard landing (MC-02). The old
-    # index.html stays on disk unrouted until the rebuild completes.
+    # index.html stays on disk unrouted (kept per the mission-control
+    # plan; nothing renders it).
     app.include_router(dashboard_routes.router)
     app.include_router(activity_routes.router)
     app.include_router(delegation_routes.router)
