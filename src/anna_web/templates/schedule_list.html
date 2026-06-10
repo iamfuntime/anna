@@ -8,29 +8,32 @@
     <a href="/schedules/new" class="button" role="button">+ New schedule</a>
   </header>
 
-  {% if schedules %}
-    <table id="schedule-table">
-      <thead>
-        <tr>
-          <th>ID</th>
-          <th>Cron</th>
-          <th>Natural language</th>
-          <th>Destination</th>
-          <th>Enabled</th>
-          <th>Last fire</th>
-          <th>Failures</th>
-          <th>Actions</th>
-        </tr>
-      </thead>
-      <tbody id="schedule-rows">
-        {% for s in schedules %}
-          {% include "schedule_row.html" %}
-        {% endfor %}
-      </tbody>
-    </table>
-  {% else %}
-    <article class="empty-state">
-      <p>No schedules yet. Click <a href="/schedules/new">+ New schedule</a> to create one.</p>
-    </article>
-  {% endif %}
+  {# Schedule run board (MC-06). The table chrome is server-rendered
+     once; the tbody re-polls /schedules/board every 10s so run state
+     (last fire, failures, computed next fire) stays live without a
+     reload. The empty state lives INSIDE the partial (a colspan row)
+     so a board that empties — or fills — under the poll keeps
+     rendering correctly. #}
+  <table id="schedule-table">
+    <thead>
+      <tr>
+        <th>ID</th>
+        <th>Cron</th>
+        <th>Timezone</th>
+        <th>Destination</th>
+        <th>Enabled</th>
+        <th>Last fired</th>
+        <th>Status</th>
+        <th>Failures</th>
+        <th>Next fire</th>
+        <th>Actions</th>
+      </tr>
+    </thead>
+    <tbody id="schedule-rows"
+           hx-get="/schedules/board"
+           hx-trigger="every 10s"
+           hx-swap="innerHTML">
+      {% include "_schedule_board_rows.html" %}
+    </tbody>
+  </table>
 {% endblock %}

@@ -1,37 +1,54 @@
-{# One <tr> for a Schedule. Used both inside schedule_list.html and as an
-   HTMX swap target for create / update. The id on the row lets HTMX find
-   and replace it; ``s`` is the Schedule passed by the parent context. #}
-<tr id="schedule-row-{{ s.id }}">
-  <td><code>{{ s.id }}</code></td>
-  <td><code>{{ s.cron }}</code></td>
-  <td>{{ s.natural_language or "" }}</td>
-  <td>{{ s.destination.transport }}:{{ s.destination.channel }}</td>
+{# One <tr> of the schedule run board (MC-06). Included per-row by
+   _schedule_board_rows.html and returned standalone by the create /
+   update handlers as their HTMX swap payload — so its column set must
+   track the board's <thead> in schedule_list.html. Context: ``row`` —
+   a readers.schedule_board.ScheduleBoardRow. The id on the row lets
+   HTMX find and replace/delete it. #}
+<tr id="schedule-row-{{ row.id }}"
+    class="schedule-row{% if row.failing %} schedule-row-failing{% endif %}{% if not row.enabled %} schedule-row-disabled{% endif %}">
+  <td><code>{{ row.id }}</code></td>
   <td>
-    {% if s.enabled %}
+    <code>{{ row.cron }}</code>
+    {% if row.natural_language %}
+      <small class="schedule-nl">{{ row.natural_language }}</small>
+    {% endif %}
+  </td>
+  <td><span class="mono">{{ row.timezone }}</span></td>
+  <td><span class="mono">{{ row.destination }}</span></td>
+  <td>
+    {% if row.enabled %}
       <span class="badge badge-enabled">enabled</span>
     {% else %}
       <span class="badge badge-disabled">disabled</span>
     {% endif %}
   </td>
+  <td><span class="mono">{{ row.last_fired_display }}</span></td>
   <td>
-    {% if s.state.last_status == "complete" %}
+    {% if row.last_status == "complete" %}
       <span class="badge badge-ok">ok</span>
-    {% elif s.state.last_status in ("fail", "timeout") %}
-      <span class="badge badge-fail">{{ s.state.last_status }}</span>
+    {% elif row.last_status in ("fail", "timeout") %}
+      <span class="badge badge-fail">{{ row.last_status }}</span>
     {% else %}
       <span class="muted">never</span>
     {% endif %}
   </td>
-  <td>{{ s.state.consecutive_failures }}</td>
   <td>
-    <a href="/schedules/{{ s.id }}/edit" role="button" class="secondary">Edit</a>
+    {% if row.failing %}
+      <span class="badge badge-fail">{{ row.consecutive_failures }}</span>
+    {% else %}
+      <span class="mono">{{ row.consecutive_failures }}</span>
+    {% endif %}
+  </td>
+  <td><span class="mono">{{ row.next_fire_display }}</span></td>
+  <td>
+    <a href="/schedules/{{ row.id }}/edit" role="button" class="secondary">Edit</a>
     <button
       type="button"
       class="secondary"
-      hx-delete="/schedules/{{ s.id }}"
-      hx-target="#schedule-row-{{ s.id }}"
+      hx-delete="/schedules/{{ row.id }}"
+      hx-target="#schedule-row-{{ row.id }}"
       hx-swap="delete"
-      hx-confirm="Delete schedule {{ s.id }}?"
+      hx-confirm="Delete schedule {{ row.id }}?"
     >Delete</button>
   </td>
 </tr>

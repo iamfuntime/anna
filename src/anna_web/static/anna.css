@@ -1075,3 +1075,29 @@ button.contrast:hover:not(:disabled),
   color: var(--text-faint);
   word-break: break-all;
 }
+
+/* ---------------------------------------------------------------------------
+ * 14. Schedule run board (MC-06).
+ * ------------------------------------------------------------------------ */
+
+/* Failing rows: --status-fail tint + inset accent bar (box-shadow, not
+ * border-left, so column alignment doesn't shift). */
+tr.schedule-row-failing > td {
+  background: var(--status-fail-bg);
+}
+
+tr.schedule-row-failing > td:first-child {
+  box-shadow: inset 3px 0 0 var(--status-fail);
+}
+
+/* Disabled rows: dimmed but still readable/clickable. */
+tr.schedule-row-disabled > td {
+  opacity: 0.55;
+}
+
+/* Natural-language gloss under the cron expression. */
+td .schedule-nl {
+  display: block;
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}

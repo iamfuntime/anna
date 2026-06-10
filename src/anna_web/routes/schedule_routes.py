@@ -1,9 +1,14 @@
-"""Schedule CRUD routes for the ANNA web dashboard.
+"""Schedule routes for the ANNA web dashboard: run board + CRUD editor.
 
-Subtask 9 of the Phase 2.5 buildout. Five endpoints, all rendering
-server-side HTML with HTMX swaps for partial updates:
+Originally subtask 9 of the Phase 2.5 buildout; the read side was
+rebuilt into the Mission Control schedule run board in MC-06. All
+endpoints render server-side HTML with HTMX swaps for partial updates:
 
-* ``GET /schedules`` — list view with one row per schedule.
+* ``GET /schedules`` — the run board (MC-06): one dense row per
+  schedule with run state and the computed next fire, live-refreshed
+  by an htmx poll of the tbody partial.
+* ``GET /schedules/board`` — the board's tbody partial the page polls
+  every 10s.
 * ``GET /schedules/new`` — empty create form.
 * ``GET /schedules/{id}/edit`` — pre-populated edit form.
 * ``POST /schedules`` — create handler. Returns the new row partial
@@ -15,16 +20,22 @@ server-side HTML with HTMX swaps for partial updates:
 
 All endpoints pull the adapter off ``request.app.state.schedule_store``
 so tests can swap in a tmp-anna_home adapter without touching the
-underlying store wiring.
+underlying store wiring. Board rows are built by
+:mod:`anna_web.readers.schedule_board`, which mirrors the daemon
+scheduler's next-fire semantics and is fail-soft (an unreadable
+``schedules.yaml`` renders an empty board, a single bad cron degrades
+only its own row).
 
 The plan's HTMX patterns section is followed: ``hx-post`` for create,
 ``hx-put`` for update (FastAPI routes the method natively, no form
 override needed), ``hx-delete`` with ``hx-confirm`` for the destroy
-button, and per-field error rendering on the same form template.
+button, per-field error rendering on the same form template, and an
+``every 10s`` poll on the board tbody (polling, not SSE — matching the
+dashboard's activity panel idiom).
 
 See ``Inbox/2026-06-02-ANNA-Web-Dashboard-Plan.md``, "Subtasks → 9"
-and "Architecture → Schedule UI — direct ScheduleStore use" for the
-full design.
+for the editor design and the 2026-06-10 mission-control plan, MC-06,
+for the board.
 """
 
 from __future__ import annotations
@@ -38,6 +49,7 @@ from pydantic import ValidationError
 from anna.runtime.schedule_store import ScheduleValidationError
 from anna.runtime.schedule_types import Schedule, ScheduleDestination
 from anna_web import audit as web_audit
+from anna_web.readers.schedule_board import build_row, load_board_rows
 
 router = APIRouter(prefix="/schedules", tags=["schedules"])
 
@@ -187,16 +199,31 @@ def _validation_errors_to_dict(exc: ValidationError) -> dict[str, str]:
 @router.get("", response_class=Response)
 @router.get("/", response_class=Response)
 async def list_schedules(request: Request) -> Response:
-    """Render the full schedule list."""
-    store = request.app.state.schedule_store
-    schedules = await store.list_all()
+    """Render the schedule run board (MC-06)."""
+    rows = await load_board_rows(request.app.state.schedule_store)
     return request.app.state.templates.TemplateResponse(
         request,
         "schedule_list.html",
         # active_nav drives the shell nav's aria-current highlighting
-        # (base.html, MC-02) — Schedules is the only nav target that
-        # already exists outside the dashboard.
-        {"schedules": schedules, "active_nav": "schedules"},
+        # (base.html, MC-02).
+        {"rows": rows, "active_nav": "schedules"},
+    )
+
+
+@router.get("/board", response_class=Response)
+async def board_rows(request: Request) -> Response:
+    """Board tbody partial — the target of the page's 10s htmx poll.
+
+    Returns only the ``<tr>`` set (or the empty-state colspan row) so
+    the poll swaps the tbody's innerHTML without re-rendering the page
+    chrome. No path conflict with ``/{schedule_id}/edit``: that route
+    needs a second segment.
+    """
+    rows = await load_board_rows(request.app.state.schedule_store)
+    return request.app.state.templates.TemplateResponse(
+        request,
+        "_schedule_board_rows.html",
+        {"rows": rows},
     )
 
 
@@ -300,10 +327,13 @@ async def create_schedule(
         request=request,
         schedule_id=created.id,
     )
+    # The row partial renders board rows (MC-06), so the swap payload
+    # carries the same computed columns (next fire, displays) the
+    # board's poll would deliver.
     return templates.TemplateResponse(
         request,
         "schedule_row.html",
-        {"s": created},
+        {"row": build_row(created)},
         status_code=201,
     )
 
@@ -388,7 +418,7 @@ async def update_schedule(
     return templates.TemplateResponse(
         request,
         "schedule_row.html",
-        {"s": updated},
+        {"row": build_row(updated)},
         status_code=200,
     )
 

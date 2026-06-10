@@ -1,0 +1,15 @@
+{# Schedule run board tbody contents (MC-06). Rendered inline by
+   schedule_list.html on first paint and returned standalone by
+   GET /schedules/board for the 10s htmx poll. Context: ``rows`` — a
+   list of readers.schedule_board.ScheduleBoardRow. The colspan must
+   track the <thead> column count in schedule_list.html (currently 10). #}
+{% for row in rows %}
+  {% include "schedule_row.html" %}
+{% endfor %}
+{% if not rows %}
+  <tr class="schedule-board-empty">
+    <td colspan="10" class="muted">
+      No schedules yet. Click <a href="/schedules/new">+ New schedule</a> to create one.
+    </td>
+  </tr>
+{% endif %}
