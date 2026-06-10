@@ -159,6 +159,9 @@ async def get_env_form(request: Request) -> Response:
         {
             "documented_rows": documented_rows,
             "extra_rows": extra_rows,
+            # The secrets editor lives under the Settings nav entry
+            # (MC-10): highlight Settings in the shell while editing.
+            "active_nav": "settings",
         },
     )
 

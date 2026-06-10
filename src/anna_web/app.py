@@ -43,6 +43,7 @@ from anna_web.routes import (
     healthz_routes,
     restart_routes,
     schedule_routes,
+    settings_routes,
 )
 from anna_web.schedule_store_adapter import ScheduleStoreAdapter
 
@@ -144,6 +145,7 @@ def create_app(cfg: AnnaConfig) -> FastAPI:
     app.include_router(schedule_routes.router)
     app.include_router(healthz_routes.router)
     app.include_router(restart_routes.router)
+    app.include_router(settings_routes.router)
 
     # Config-gated integration routers (mission-control subtask 8).
     # Mounted only when the integration's gate passes for cfg — with

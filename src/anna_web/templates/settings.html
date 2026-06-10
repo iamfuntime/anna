@@ -1,0 +1,108 @@
+{% extends "base.html" %}
+
+{% block title %}Settings — ANNA Dashboard{% endblock %}
+
+{% block content %}
+  <h1>Settings</h1>
+
+  {# Settings hub (MC-10): one panel per operator tool. Reuses the
+     MC-02 .dashboard-grid + .panel primitives — no settings-specific
+     CSS. Every panel links to or embeds an EXISTING surface; the hub
+     itself mutates nothing. #}
+  <section id="settings-grid" class="dashboard-grid">
+
+    {# (1) Config — schema-driven anna.yaml editor. The loaded badge
+       comes from the same gather_health probe /healthz serves. #}
+    <article class="panel" id="panel-config">
+      <header><strong>Config</strong></header>
+      <p><small>Edit every top-level section of <code>anna.yaml</code> through
+        schema-driven forms. Changes apply on restart.</small></p>
+      <ul class="status-list">
+        <li>
+          Config:
+          <span class="status-badge"
+                data-state="{{ 'up' if config_loaded else 'down' }}">{{ 'loaded' if config_loaded else 'not loaded' }}</span>
+        </li>
+      </ul>
+      <a href="/config" class="button" role="button">Open config editor</a>
+    </article>
+
+    {# (2) Secrets — masked .env editor. #}
+    <article class="panel" id="panel-secrets">
+      <header><strong>Secrets</strong></header>
+      <p><small>Manage <code>$ANNA_HOME/.env</code> — API keys and tokens,
+        masked by default with per-key reveal.</small></p>
+      <a href="/env" class="button" role="button">Open secrets editor</a>
+    </article>
+
+    {# (3) Schedules — the MC-06 run board owns create/edit/delete;
+       the hub only links its existing URLs. #}
+    <article class="panel" id="panel-schedules-editor">
+      <header><strong>Schedules</strong></header>
+      <p><small>Create, edit, enable, or remove scheduled prompts on the
+        run board.</small></p>
+      <a href="/schedules" class="button" role="button">Open schedule editor</a>
+      <a href="/schedules/new" class="button secondary" role="button">+ New schedule</a>
+    </article>
+
+    {# (4) Service — the restart control, reachable from the nav again.
+       Same partial, same POST /restart, same /healthz poller as the
+       Config pages: the include carries no extra context, so the
+       partial renders idle and falls back to the restart_unit global. #}
+    <article class="panel" id="panel-service">
+      <header><strong>Service</strong></header>
+      <ul class="status-list">
+        <li>
+          <code>{{ restart_unit }}</code>:
+          <span class="status-badge"
+                data-state="{{ 'up' if anna_running else 'down' }}">{{ 'running' if anna_running else 'stopped' }}</span>
+        </li>
+      </ul>
+      <p><small>Config and secret edits land on disk immediately; restart to
+        load them into the running daemon.</small></p>
+      {% include "restart_button.html" %}
+    </article>
+
+    {# (5) Integrations — read-only state of cfg.integrations.obsidian.
+       Editing happens in the generic /config/integrations section. #}
+    <article class="panel" id="panel-integrations">
+      <header><strong>Integrations</strong></header>
+      <ul class="status-list">
+        <li>
+          Obsidian:
+          {% if obsidian and obsidian.enabled %}
+          <span class="badge badge-enabled" data-integration="obsidian">enabled</span>
+          {% else %}
+          <span class="badge badge-disabled" data-integration="obsidian">disabled</span>
+          {% endif %}
+        </li>
+        <li>
+          TaskNotes board:
+          {% if obsidian and obsidian.enabled and obsidian.tasknotes_enabled %}
+          <span class="badge badge-enabled" data-integration="obsidian-tasknotes">enabled</span>
+          {% else %}
+          <span class="badge badge-disabled" data-integration="obsidian-tasknotes">disabled</span>
+          {% endif %}
+        </li>
+        <li>
+          Vault path:
+          {% if obsidian and obsidian.vault_path %}
+          <code>{{ obsidian.vault_path }}</code>
+          {% else %}
+          <span class="muted">not set</span>
+          {% endif %}
+        </li>
+        <li>
+          TaskNotes path:
+          {% if obsidian and obsidian.tasknotes_path %}
+          <code>{{ obsidian.tasknotes_path }}</code>
+          {% else %}
+          <span class="muted">not set</span>
+          {% endif %}
+        </li>
+      </ul>
+      <a href="/config/integrations" class="button secondary" role="button">Edit integration config</a>
+    </article>
+
+  </section>
+{% endblock %}

@@ -192,7 +192,9 @@ async def get_config_index(request: Request) -> Response:
     return templates.TemplateResponse(
         request,
         "config_index.html",
-        {"sections": sections},
+        # active_nav: the editors live under the Settings nav entry
+        # (MC-10), so the shell highlights Settings while editing.
+        {"sections": sections, "active_nav": "settings"},
     )
 
 
@@ -218,6 +220,7 @@ async def get_config_section(request: Request, section: str) -> Response:
             "field": field,
             "errors": {},
             "toast": None,
+            "active_nav": "settings",
         },
     )
 
@@ -299,6 +302,7 @@ async def post_config_section(request: Request, section: str) -> Response:
                 "level": "error",
                 "message": f"Validation failed for {section}. Fix the highlighted fields.",
             },
+            "active_nav": "settings",
         }
         return templates.TemplateResponse(
             request,
@@ -317,6 +321,7 @@ async def post_config_section(request: Request, section: str) -> Response:
             "field": section_field,
             "errors": {},
             "toast": {"level": "error", "message": str(exc)},
+            "active_nav": "settings",
         }
         return templates.TemplateResponse(
             request,
@@ -350,6 +355,7 @@ async def post_config_section(request: Request, section: str) -> Response:
             "level": "success",
             "message": f"Saved {section}. Restart anna.service to apply.",
         },
+        "active_nav": "settings",
     }
     return templates.TemplateResponse(
         request,
