@@ -27,6 +27,7 @@ from fastapi.templating import Jinja2Templates
 from anna.config import AnnaConfig, load_config
 from anna.log import get_logger
 from anna_web import audit as web_audit
+from anna_web import integrations as web_integrations
 from anna_web.config_store import ConfigStore
 from anna_web.env_store import EnvStore
 from anna_web.middleware import SameOriginMiddleware, is_wildcard_host
@@ -107,6 +108,12 @@ def create_app(cfg: AnnaConfig) -> FastAPI:
     # web.host bind inline. Both reuse cfg/metadata already on hand here.
     templates.env.globals["restart_unit"] = cfg.web.target_unit
     templates.env.globals["is_non_loopback_host"] = config_routes.is_non_loopback_host
+    # Optional-integration nav gating (mission-control subtask 8):
+    # base.html renders one nav <li> per entry, so a disabled
+    # integration leaves no trace in the chrome. Computed once at app
+    # construction — gates are restart-applied like all anna.yaml
+    # config, so per-request recomputation would buy nothing.
+    templates.env.globals["integration_nav"] = web_integrations.nav_entries(cfg)
     app.state.templates = templates
 
     # Vendored frontend assets (htmx + pico + app.css/app.js). Mounted
@@ -139,6 +146,12 @@ def create_app(cfg: AnnaConfig) -> FastAPI:
     app.include_router(schedule_routes.router)
     app.include_router(healthz_routes.router)
     app.include_router(restart_routes.router)
+
+    # Config-gated integration routers (mission-control subtask 8).
+    # Mounted only when the integration's gate passes for cfg — with
+    # the all-off defaults nothing mounts here and e.g. /tasks 404s.
+    for integration_router in web_integrations.routers(cfg):
+        app.include_router(integration_router)
 
     # Same-origin middleware: rejects mutating requests whose Origin
     # doesn't match the dashboard's bind address. Registered last so

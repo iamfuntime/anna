@@ -18,6 +18,12 @@
         <li><a href="/config">Config</a></li>
         <li><a href="/env">Secrets</a></li>
         <li><a href="/schedules">Schedules</a></li>
+        {# Config-gated integration nav (anna_web/integrations.py).
+           `| default([])` keeps the template renderable outside
+           create_app's Jinja env (direct-render template tests). #}
+        {% for entry in integration_nav | default([]) %}
+        <li><a href="{{ entry.href }}">{{ entry.label }}</a></li>
+        {% endfor %}
       </ul>
     </nav>
     <main class="container">

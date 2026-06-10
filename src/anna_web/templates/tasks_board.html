@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}Tasks · ANNA Dashboard{% endblock %}
+{% block content %}
+<h1>TaskNote pipeline</h1>
+<section id="tasks-board">
+  {% if columns %}
+  {# Subtask 9 renders the kanban columns + task cards here. #}
+  {% else %}
+  <article class="empty-state">
+    <p>No task data yet.</p>
+  </article>
+  {% endif %}
+</section>
+{% endblock %}
