@@ -1,0 +1,45 @@
+{# Full activity feed partial (MC-05). Self-polling, self-replacing:
+   the container carries its own hx-get (with the active kind baked
+   into the query param) and swaps itself outerHTML every 5s, so the
+   poll always re-fetches the filter the operator is looking at.
+   Filter "buttons" are plain links (href = no-JS / deep-link fallback)
+   with an hx-get that swaps this same container — clicking one
+   replaces the whole feed with a container polling the new kind.
+   Rendered inline by activity.html on first paint and re-served whole
+   by GET /activity/feed. #}
+<section id="activity-feed"
+         class="panel activity-feed"
+         hx-get="/activity/feed?kind={{ kind }}"
+         hx-trigger="every 5s"
+         hx-swap="outerHTML">
+  <div class="feed-filters" role="group" aria-label="Filter events by kind">
+    {% for key, label in kind_filters %}
+    <a href="/activity?kind={{ key }}"
+       role="button"
+       class="filter-button{% if kind == key %} filter-active{% endif %}"
+       {% if kind == key %}aria-current="true"{% endif %}
+       hx-get="/activity/feed?kind={{ key }}"
+       hx-target="#activity-feed"
+       hx-swap="outerHTML">{{ label }}</a>
+    {% endfor %}
+  </div>
+
+  {% if rows %}
+  <div class="feed">
+    {% for r in rows %}
+    {# Rows arrive newest-first; draw a group-break line when the UTC
+       date changes between consecutive rows (the older group's date). #}
+    {% if not loop.first and r.date and r.date != loop.previtem.date %}
+    <div class="feed-break"><span class="feed-break-date">{{ r.date }}</span></div>
+    {% endif %}
+    <div class="feed-row feed-row-{{ r.status }}">
+      <span class="feed-time">{{ r.time }}</span>
+      <span class="feed-event">{{ r.event }}</span>
+      <span class="feed-meta">{{ r.meta }}</span>
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  {% include "_panel_empty.html" %}
+  {% endif %}
+</section>

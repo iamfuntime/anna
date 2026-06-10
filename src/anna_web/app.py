@@ -35,6 +35,7 @@ from anna_web.middleware import SameOriginMiddleware, is_wildcard_host
 from anna_web.readers.audit_reader import AuditReader
 from anna_web.restart import RestartManager
 from anna_web.routes import (
+    activity_routes,
     config_routes,
     dashboard_routes,
     env_routes,
@@ -135,6 +136,7 @@ def create_app(cfg: AnnaConfig) -> FastAPI:
     # GET / is the mission-control dashboard landing (MC-02). The old
     # index.html stays on disk unrouted until the rebuild completes.
     app.include_router(dashboard_routes.router)
+    app.include_router(activity_routes.router)
     app.include_router(config_routes.router)
     app.include_router(env_routes.router)
     app.include_router(schedule_routes.router)

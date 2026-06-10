@@ -917,3 +917,72 @@ button.contrast:hover:not(:disabled),
 .dashboard-grid > article {
   margin: 0;
 }
+
+/* ---------------------------------------------------------------------------
+ * 12. Activity feed (MC-05) — filter bar, status-colored rows, date breaks.
+ * ------------------------------------------------------------------------ */
+
+.feed-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  margin-bottom: var(--space-4);
+}
+
+.filter-button,
+[role="button"].filter-button {
+  background: transparent;
+  color: var(--text-muted);
+  border: 1px solid var(--border-strong);
+  padding: var(--space-1) var(--space-3);
+  font-size: var(--text-xs);
+  margin: 0;
+  width: auto;
+}
+
+.filter-button:hover,
+[role="button"].filter-button:hover {
+  color: var(--text);
+  background: var(--surface-3);
+  text-decoration: none;
+}
+
+.filter-button.filter-active,
+[role="button"].filter-button.filter-active {
+  background: var(--surface-3);
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+/* Status color discipline on the event name; fail rows also get a
+ * left rail + tinted background so they read at a glance. */
+.feed-row-ok .feed-event { color: var(--status-ok); }
+
+.feed-row-fail {
+  border-left: 2px solid var(--status-fail);
+  background: var(--status-fail-bg);
+}
+
+.feed-row-fail .feed-event { color: var(--status-fail); }
+
+/* Date group break between days (feed is newest-first). */
+.feed-break {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  color: var(--text-faint);
+}
+
+.feed-break::before,
+.feed-break::after {
+  content: "";
+  flex: 1;
+  border-top: 1px solid var(--border-strong);
+}
+
+.feed-break-date {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  white-space: nowrap;
+}

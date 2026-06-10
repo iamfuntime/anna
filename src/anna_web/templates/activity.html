@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+
+{% block title %}Activity — ANNA Dashboard{% endblock %}
+
+{% block content %}
+  <h1>Activity</h1>
+
+  {# The feed partial is self-contained (filter bar + rows + its own
+     hx poll attributes), so the page body is just the first paint of
+     the same template GET /activity/feed re-serves. See
+     _activity_feed.html for the outerHTML self-swap idiom. #}
+  {% include "_activity_feed.html" %}
+{% endblock %}
