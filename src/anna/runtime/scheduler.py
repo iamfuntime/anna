@@ -72,7 +72,13 @@ class Scheduler:
         self._fsync: bool = config.logging.audit.fsync_on_write
         self._semaphore = asyncio.Semaphore(config.scheduler.max_concurrent)
         self._inflight: set[asyncio.Task[None]] = set()
+        # Parallel index of _inflight keyed by schedule id so deletion can
+        # cancel exactly the tasks belonging to one schedule. Entries are
+        # removed by the task done-callback; a key vanishes when its set
+        # empties.
+        self._tasks_by_schedule: dict[str, set[asyncio.Task[None]]] = {}
         self._shutdown_grace_seconds: float = 5.0
+        self._cancel_grace_seconds: float = 2.0
 
     # ------------------------------------------------------------------
     # Public lifecycle
@@ -137,6 +143,64 @@ class Scheduler:
             for task in list(self._inflight):
                 task.cancel()
         self._inflight.clear()
+        self._tasks_by_schedule.clear()
+
+    async def cancel_schedule_tasks(self, schedule_id: str) -> int:
+        """Cancel every queued or in-flight fire task for ``schedule_id``.
+
+        Invoked when a schedule is deleted (wired via
+        :meth:`ScheduleStore.set_cancel_callback`) so tasks parked on the
+        ``max_concurrent`` semaphore do not later acquire a slot, call
+        :meth:`fire` on a schedule that no longer exists, and emit a noisy
+        ``audit.schedule.fail`` with "does not exist" — the 2026-06-01
+        morning-brief-test incident tail.
+
+        DECISION: in-flight runs are cancelled too, not only queued ones.
+        The operator chose to remove the schedule; output from a run they
+        no longer want is at best noise at the destination and at worst an
+        action they intended to stop. A run worth keeping can always be
+        re-issued manually. Cancellation lands inside
+        ``_guarded_fire``'s ``await`` points as ``CancelledError``, which
+        is deliberately NOT caught by its failure handling, so a cancelled
+        fire records neither a completion nor a failure.
+
+        Waits up to ``_cancel_grace_seconds`` for the cancelled tasks to
+        land; stragglers are logged and left to their done-callbacks for
+        index cleanup. Returns the number of tasks cancelled.
+        """
+        tasks = [
+            task
+            for task in self._tasks_by_schedule.get(schedule_id, ())
+            if not task.done()
+        ]
+        if not tasks:
+            return 0
+        for task in tasks:
+            task.cancel()
+        _done, pending = await asyncio.wait(
+            tasks, timeout=self._cancel_grace_seconds
+        )
+        if pending:
+            self._log.warning(
+                "scheduler.cancel.timeout",
+                schedule_id=schedule_id,
+                still_pending=len(pending),
+            )
+        audit_event(
+            "audit.schedule.cancelled",
+            audit_dir=self._audit_dir,
+            actor="anna",
+            fsync_on_write=self._fsync,
+            schedule_id=schedule_id,
+            cancelled=len(tasks),
+            still_pending=len(pending),
+        )
+        self._log.info(
+            "scheduler.tasks_cancelled",
+            schedule_id=schedule_id,
+            cancelled=len(tasks),
+        )
+        return len(tasks)
 
     # ------------------------------------------------------------------
     # Poll + dispatch
@@ -159,7 +223,21 @@ class Scheduler:
                 name=f"scheduler.fire.{schedule.id}",
             )
             self._inflight.add(task)
-            task.add_done_callback(self._inflight.discard)
+            self._tasks_by_schedule.setdefault(schedule.id, set()).add(task)
+            task.add_done_callback(
+                lambda t, schedule_id=schedule.id: self._discard_task(
+                    schedule_id, t
+                )
+            )
+
+    def _discard_task(self, schedule_id: str, task: asyncio.Task[None]) -> None:
+        """Done-callback: drop a finished fire task from both indexes."""
+        self._inflight.discard(task)
+        tasks = self._tasks_by_schedule.get(schedule_id)
+        if tasks is not None:
+            tasks.discard(task)
+            if not tasks:
+                del self._tasks_by_schedule[schedule_id]
 
     async def fire(self, schedule_id: str) -> str:
         """Fire one schedule by id. Returns the reply text the worker produced.

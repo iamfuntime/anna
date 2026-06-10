@@ -346,6 +346,12 @@ async def _run(config: AnnaConfig) -> None:
             adapters=adapters,
             alerter=alerter,
         )
+        # Deleting a schedule must also cancel its queued/in-flight fire
+        # tasks (2026-06-01 incident: leftover queued fires failed loudly
+        # after the schedule was deleted). The store-level callback covers
+        # every in-process delete path — notably the MCP schedule_delete
+        # tool, which only holds the store.
+        schedule_store.set_cancel_callback(scheduler.cancel_schedule_tasks)
         scheduler_task = asyncio.create_task(scheduler.run(), name="scheduler")
 
     # Schedule the operator startup ping. It waits a few seconds for

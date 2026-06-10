@@ -27,7 +27,7 @@ from __future__ import annotations
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 from zoneinfo import ZoneInfo
 
 import yaml
@@ -57,6 +57,22 @@ class ScheduleStore:
         self._fsync = config.logging.audit.fsync_on_write
         self._log = get_logger("anna.scheduler.store")
         self._cache: dict[str, Schedule] = {}
+        self._cancel_callback: Callable[[str], Awaitable[Any]] | None = None
+
+    def set_cancel_callback(
+        self, callback: Callable[[str], Awaitable[Any]]
+    ) -> None:
+        """Register the hook :meth:`delete` invokes to cancel fire tasks.
+
+        ``__main__`` wires this to :meth:`Scheduler.cancel_schedule_tasks`
+        after the Scheduler is constructed. A store-level callback (rather
+        than chaining the cancel inside the MCP ``schedule_delete`` tool)
+        covers every in-process delete path with one hook: SelfEditTools is
+        built per-worker and holds no Scheduler reference, so threading the
+        Scheduler through router → worker → tools would touch three
+        constructors to cover only the MCP path.
+        """
+        self._cancel_callback = callback
 
     # ------------------------------------------------------------------
     # Load / save
@@ -217,6 +233,22 @@ class ScheduleStore:
         async with await self._supervisor.acquire(_STORE_KEY):
             del self._cache[schedule_id]
             await self.save()
+        # Cancel queued + in-flight fire tasks AFTER the cache removal so a
+        # concurrent poll cannot re-dispatch the schedule, and immediately
+        # after it so the cancel flags land before any queued task waiting
+        # on the max_concurrent semaphore gets a chance to wake, call
+        # fire(), and fail loudly with "does not exist" (2026-06-01
+        # morning-brief-test incident). Best-effort: a cancel failure must
+        # not undo or mask the delete itself.
+        if self._cancel_callback is not None:
+            try:
+                await self._cancel_callback(schedule_id)
+            except Exception as exc:
+                self._log.warning(
+                    "scheduler.store.cancel_callback_failed",
+                    schedule_id=schedule_id,
+                    error=str(exc),
+                )
         audit_event(
             "audit.schedule.deleted",
             audit_dir=self._audit_dir,
