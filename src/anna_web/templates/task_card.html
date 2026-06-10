@@ -1,0 +1,14 @@
+{# One TaskNote card (MC-09). Context: `task`, a dict shaped by
+   tasks_routes._card. Read-only — no controls, no links into the
+   vault. The "other" bucket renders the same card with a subtler
+   variant class. #}
+<div class="task-card{% if task.bucket == 'other' %} task-card-other{% endif %}">
+  <span class="task-title">{{ task.title }}</span>
+  <span class="task-meta">
+    {% if task.assignee %}<span class="badge badge-idle task-assignee">{{ task.assignee }}</span>{% endif %}
+    {% if task.show_priority %}<span class="badge {{ task.priority_class }} task-priority">{{ task.priority }}</span>{% endif %}
+    {% if task.age %}<span class="task-age" title="created {{ task.created }}">{{ task.age }}</span>{% endif %}
+    {% if task.bucket == 'other' and task.status %}<span class="task-status mono muted">{{ task.status }}</span>{% endif %}
+  </span>
+  <span class="mono task-filename">{{ task.filename }}</span>
+</div>

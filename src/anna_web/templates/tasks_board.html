@@ -2,13 +2,13 @@
 {% block title %}Tasks · ANNA Dashboard{% endblock %}
 {% block content %}
 <h1>TaskNote pipeline</h1>
-<section id="tasks-board">
-  {% if columns %}
-  {# Subtask 9 renders the kanban columns + task cards here. #}
-  {% else %}
-  <article class="empty-state">
-    <p>No task data yet.</p>
-  </article>
-  {% endif %}
-</section>
+{# All columns live inside one polled wrapper: a single 15s htmx poll
+   re-fetches the partial whole so column counts and cards can never
+   drift out of sync (they all derive from one reader scan). #}
+<div id="tasks-board"
+     hx-get="/tasks/board"
+     hx-trigger="every 15s"
+     hx-swap="innerHTML">
+  {% include "_tasks_board.html" %}
+</div>
 {% endblock %}

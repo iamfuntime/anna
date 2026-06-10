@@ -1101,3 +1101,72 @@ td .schedule-nl {
   font-size: var(--text-xs);
   color: var(--text-muted);
 }
+
+/* ---------------------------------------------------------------------------
+ * 15. TaskNote pipeline board (MC-09, config-gated /tasks view).
+ * ------------------------------------------------------------------------ */
+
+.task-board-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: var(--space-4);
+  align-items: start;
+}
+
+@media (max-width: 960px) {
+  .task-board-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+.task-column { margin: 0; }
+
+.task-column > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.task-count { color: var(--text-faint); font-size: var(--text-xs); }
+
+.task-column-empty {
+  text-align: center;
+  color: var(--text-faint);
+  margin: var(--space-4) 0;
+}
+
+.task-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--space-3);
+  margin-bottom: var(--space-3);
+  font-size: var(--text-sm);
+}
+
+.task-card:last-child { margin-bottom: 0; }
+
+.task-title { color: var(--text); font-weight: 500; }
+
+.task-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.task-age { color: var(--text-muted); font-size: var(--text-xs); }
+
+.task-filename {
+  color: var(--text-faint);
+  font-size: var(--text-xs);
+  overflow-wrap: anywhere;
+}
+
+/* Strays fold-out: notes with unrecognized status, rendered subtly. */
+.task-other { margin-top: var(--space-4); }
+.task-other summary { cursor: pointer; font-size: var(--text-sm); }
+.task-other .task-card { margin-top: var(--space-3); max-width: 28rem; }
+.task-card-other { opacity: 0.75; border-style: dashed; }

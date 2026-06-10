@@ -1,0 +1,35 @@
+{# TaskNote board partial (MC-09). Rendered inline on first paint and
+   re-fetched whole by the page's htmx poll (GET /tasks/board, every
+   15s). READ-ONLY v1: cards are plain markup, no actions. Fail-soft:
+   an unset/missing tasknotes_path (or an empty TaskNote directory)
+   renders the empty state below — never a 500. #}
+{% if has_data %}
+<div class="task-board-grid">
+  {% for col in columns %}
+  <article class="panel task-column" id="task-column-{{ col.key }}">
+    <header>
+      <strong>{{ col.label }}</strong>
+      <span class="task-count mono">{% if col.key == 'done' and done_total > done_limit %}{{ col.tasks | length }} of {{ done_total }}{% else %}{{ col.tasks | length }}{% endif %}</span>
+    </header>
+    {% if col.tasks %}
+    {% for task in col.tasks %}{% include "task_card.html" %}{% endfor %}
+    {% else %}
+    <p class="task-column-empty muted">—</p>
+    {% endif %}
+  </article>
+  {% endfor %}
+</div>
+{# Strays: notes whose status matched no column (or whose frontmatter
+   didn't parse). Folded away so they read as a footnote, not a fifth
+   column. #}
+{% if other %}
+<details class="task-other" id="tasks-other">
+  <summary class="muted">{{ other | length }} note{{ '' if other | length == 1 else 's' }} with unrecognized status</summary>
+  {% for task in other %}{% include "task_card.html" %}{% endfor %}
+</details>
+{% endif %}
+{% else %}
+<article class="empty-state">
+  <p>No task data yet.</p>
+</article>
+{% endif %}
