@@ -90,6 +90,29 @@ class TelegramAdapter(ChannelAdapter):
         self._connect_attempt = 0
         self._voice = voice
 
+        # Identity-alias reverse mapping: canonical -> telegram chat_id.
+        # Built once at construction from ``config.identities`` (mirrors the
+        # CLIAdapter pattern). When the router rewrites an inbound conv_key
+        # to ``user:<canonical>``, the worker's outbound reply carries the
+        # rewritten key; without this reverse lookup ``_chat_and_topic_for``
+        # could not recover a destination and the send would raise. A
+        # non-numeric configured chat_id is skipped with a warning rather
+        # than crashing adapter construction.
+        self._canonical_to_chat_id: dict[str, int] = {}
+        for entry in config.identities:
+            if not entry.telegram_chat_id:
+                continue
+            try:
+                self._canonical_to_chat_id[entry.canonical] = int(
+                    entry.telegram_chat_id
+                )
+            except ValueError:
+                self._log.warning(
+                    "telegram.identity_chat_id_invalid",
+                    canonical=entry.canonical,
+                    telegram_chat_id=entry.telegram_chat_id,
+                )
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -267,6 +290,16 @@ class TelegramAdapter(ChannelAdapter):
 
     def _chat_and_topic_for(self, conv_key: str) -> tuple[int, int | None]:
         parts = conv_key.split(":")
+        # Identity-alias outbound key (``user:<canonical>`` after the router
+        # rewrote the inbound). Resolve to the configured chat via the
+        # reverse map built at construction; an unknown canonical (or one
+        # with no telegram_chat_id configured) falls through to the
+        # ValueError below.
+        if len(parts) == 2 and parts[0] == "user":
+            chat_id = self._canonical_to_chat_id.get(parts[1])
+            if chat_id is not None:
+                return (chat_id, None)
+            raise ValueError(f"unrecognized telegram conv_key: {conv_key}")
         # telegram:dm:<chat_id> or telegram:gr:<chat_id> or telegram:gr:<chat_id>:<topic_id>
         if parts[0] != "telegram" or len(parts) < 3:
             raise ValueError(f"unrecognized telegram conv_key: {conv_key}")

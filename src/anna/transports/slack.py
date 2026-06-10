@@ -72,6 +72,18 @@ class SlackAdapter(ChannelAdapter):
         self._thread_participation = thread_participation
         self._voice = voice
 
+        # Identity-alias reverse mapping: canonical -> slack_user_id. Built
+        # once at construction from ``config.identities`` (mirrors the
+        # CLIAdapter pattern). When the router rewrites an inbound conv_key
+        # to ``user:<canonical>``, the worker's outbound reply carries the
+        # rewritten key; without this reverse lookup
+        # ``_channel_and_thread_for`` could not recover a destination and
+        # the send would raise.
+        self._canonical_to_slack_user: dict[str, str] = {}
+        for entry in config.identities:
+            if entry.slack_user_id:
+                self._canonical_to_slack_user[entry.canonical] = entry.slack_user_id
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -301,8 +313,10 @@ class SlackAdapter(ChannelAdapter):
     def _channel_and_thread_for(self, conv_key: str) -> tuple[str, str | None]:
         """Recover the Slack channel and thread_ts from a conversation_key.
 
-        Mirror of :meth:`conversation_key_for`. Knows about three shapes:
-        slack:dm:<user>, slack:ch:<channel>:<ts>, slack:ch:<channel>:<ts>:oneshot.
+        Mirror of :meth:`conversation_key_for`. Knows about four shapes:
+        slack:dm:<user>, slack:ch:<channel>:<ts>, slack:ch:<channel>:<ts>:oneshot,
+        and the identity-alias outbound shape user:<canonical> (resolved to
+        the configured user's DM via ``config.identities``).
         """
         parts = conv_key.split(":")
         if len(parts) >= 3 and parts[0] == "slack" and parts[1] == "dm":
@@ -313,6 +327,16 @@ class SlackAdapter(ChannelAdapter):
             channel = parts[2]
             thread_ts = parts[3]
             return (channel, thread_ts)
+        if len(parts) == 2 and parts[0] == "user":
+            # Identity-alias outbound key (``user:<canonical>`` after the
+            # router rewrote the inbound). Resolve to the configured Slack
+            # user's DM — chat.postMessage accepts the bare user ID as
+            # ``channel`` and opens the DM implicitly, same as the
+            # ``slack:dm:`` branch above. A canonical with no slack_user_id
+            # configured falls through to the ValueError below.
+            slack_user_id = self._canonical_to_slack_user.get(parts[1])
+            if slack_user_id is not None:
+                return (slack_user_id, None)
         raise ValueError(f"unrecognized slack conv_key: {conv_key}")
 
     # ------------------------------------------------------------------
