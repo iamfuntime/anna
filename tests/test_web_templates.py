@@ -70,7 +70,7 @@ def test_index_renders_via_jinja() -> None:
 
 def test_static_css_reachable() -> None:
     """anna.css (the linked design system, MC-01) resolves via the
-    /static mount. pico.min.css / app.css remain on disk but unlinked
+    /static mount. pico.min.css / app.css were removed post-rebuild
     until the deploy subtask removes them, so they aren't asserted."""
     from anna_web.app import app
 

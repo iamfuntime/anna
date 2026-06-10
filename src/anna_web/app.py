@@ -126,10 +126,9 @@ def create_app(cfg: AnnaConfig) -> FastAPI:
     templates.env.globals["integration_nav"] = web_integrations.nav_entries(cfg)
     app.state.templates = templates
 
-    # Vendored frontend assets (htmx.min.js + anna.css + app.js; the
-    # superseded pico.min.css / app.css stay on disk unlinked). Mounted
-    # unconditionally so the base template's <link>/<script> tags
-    # resolve.
+    # Vendored frontend assets (htmx.min.js + anna.css + app.js).
+    # Mounted unconditionally so the base template's <link>/<script>
+    # tags resolve.
     app.mount(
         "/static",
         StaticFiles(directory=str(_STATIC_DIR)),
