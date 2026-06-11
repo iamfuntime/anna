@@ -22,7 +22,7 @@ from urllib.parse import urlparse
 import httpx
 
 from anna.config import AnnaConfig
-from anna.log import get_logger
+from anna.log import audit_event, get_logger
 from anna.transports.mrkdwn import normalize_to_slack_mrkdwn
 from anna.transports.base import (
     SLACK_MAX_CHARS,
@@ -71,6 +71,11 @@ class SlackAdapter(ChannelAdapter):
         self._connect_attempt = 0
         self._thread_participation = thread_participation
         self._voice = voice
+        # Process-wide AdminAlerter, injected by __main__ via set_alerter()
+        # after construction (the alerter needs the adapters dict, so it
+        # cannot exist yet here). Used only by the missing-token check in
+        # start(); None for tests / callers that never wire it.
+        self._alerter: Any = None
 
         # Identity-alias reverse mapping: canonical -> slack_user_id. Built
         # once at construction from ``config.identities`` (mirrors the
@@ -89,19 +94,31 @@ class SlackAdapter(ChannelAdapter):
     # ------------------------------------------------------------------
 
     async def start(self) -> None:
+        # Fail loudly when the transport is enabled without its tokens
+        # (TaskNote: fail loudly when a transport boots without its token).
+        # Checked FIRST — before the slack_bolt import and before any
+        # auth/connect attempt — so the operator gets a clear WARNING and
+        # an admin alert instead of a silent death in the auth handshake.
+        bot_token = os.environ.get("SLACK_BOT_TOKEN")
+        app_token = os.environ.get("SLACK_APP_TOKEN")
+        missing = [
+            var
+            for var, value in (
+                ("SLACK_BOT_TOKEN", bot_token),
+                ("SLACK_APP_TOKEN", app_token),
+            )
+            if not value
+        ]
+        if missing:
+            await self._report_missing_tokens(missing)
+            return
+
         try:
             from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
             from slack_bolt.async_app import AsyncApp
         except ImportError as exc:
             self._log.error("channel.import_failed", channel="slack", error=str(exc))
             raise
-
-        bot_token = os.environ.get("SLACK_BOT_TOKEN")
-        app_token = os.environ.get("SLACK_APP_TOKEN")
-        if not bot_token or not app_token:
-            raise RuntimeError(
-                "Slack transport enabled but SLACK_BOT_TOKEN or SLACK_APP_TOKEN missing"
-            )
 
         # Load the thread-participation set before the socket-mode
         # client connects so the first inbound message hits a populated
@@ -124,6 +141,48 @@ class SlackAdapter(ChannelAdapter):
             channel="slack",
             attempt=self._connect_attempt,
         )
+
+    async def _report_missing_tokens(self, missing: list[str]) -> None:
+        """Surface an enabled-but-tokenless boot loudly, then skip connect.
+
+        Three signals, mirroring the watchdog's transport-failure pattern:
+        a WARNING naming the exact missing variable(s), a durable audit
+        event, and a best-effort :class:`AdminAlerter` ping so the operator
+        hears about it on a surviving transport. The caller returns without
+        connecting, leaving the adapter down (``health_check`` False) so
+        the watchdog keeps reporting it rather than dying quietly inside
+        the auth handshake.
+        """
+        note = (
+            "slack transport enabled but "
+            + " and ".join(missing)
+            + (" is" if len(missing) == 1 else " are")
+            + " not set — skipping connect"
+        )
+        self._log.warning(
+            "channel.token_missing",
+            channel="slack",
+            missing=missing,
+            note=note,
+        )
+        audit_event(
+            "audit.transport.token_missing",
+            audit_dir=self._config.audit_dir,
+            actor="anna",
+            fsync_on_write=self._config.logging.audit.fsync_on_write,
+            level="WARNING",
+            channel="slack",
+            missing=missing,
+        )
+        if self._alerter is not None:
+            try:
+                await self._alerter.warn(note, exclude_channel="slack")
+            except Exception as exc:
+                self._log.error(
+                    "channel.token_missing_alert_failed",
+                    channel="slack",
+                    error=str(exc),
+                )
 
     async def stop(self) -> None:
         if self._handler is not None:

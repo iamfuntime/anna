@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from anna.config import AnnaConfig
-from anna.log import get_logger
+from anna.log import audit_event, get_logger
 from anna.transports.base import (
     TELEGRAM_MAX_CHARS,
     ChannelAdapter,
@@ -89,6 +89,11 @@ class TelegramAdapter(ChannelAdapter):
         self._updater_task: asyncio.Task[None] | None = None
         self._connect_attempt = 0
         self._voice = voice
+        # Process-wide AdminAlerter, injected by __main__ via set_alerter()
+        # after construction (the alerter needs the adapters dict, so it
+        # cannot exist yet here). Used only by the missing-token check in
+        # start(); None for tests / callers that never wire it.
+        self._alerter: Any = None
 
         # Identity-alias reverse mapping: canonical -> telegram chat_id.
         # Built once at construction from ``config.identities`` (mirrors the
@@ -118,15 +123,21 @@ class TelegramAdapter(ChannelAdapter):
     # ------------------------------------------------------------------
 
     async def start(self) -> None:
+        # Fail loudly when the transport is enabled without its token
+        # (TaskNote: fail loudly when a transport boots without its token).
+        # Checked FIRST — before the python-telegram-bot import and before
+        # any auth/connect attempt — so the operator gets a clear WARNING
+        # and an admin alert instead of a silent death in the auth handshake.
+        token = os.environ.get("TELEGRAM_BOT_TOKEN")
+        if not token:
+            await self._report_missing_token()
+            return
+
         try:
             from telegram.ext import ApplicationBuilder, MessageHandler, filters
         except ImportError as exc:
             self._log.error("channel.import_failed", channel="telegram", error=str(exc))
             raise
-
-        token = os.environ.get("TELEGRAM_BOT_TOKEN")
-        if not token:
-            raise RuntimeError("Telegram transport enabled but TELEGRAM_BOT_TOKEN missing")
 
         self._application = ApplicationBuilder().token(token).build()
         self._application.add_handler(
@@ -156,6 +167,46 @@ class TelegramAdapter(ChannelAdapter):
             attempt=self._connect_attempt,
             bot_username=bot_username,
         )
+
+    async def _report_missing_token(self) -> None:
+        """Surface an enabled-but-tokenless boot loudly, then skip connect.
+
+        Three signals, mirroring the watchdog's transport-failure pattern:
+        a WARNING naming the missing variable, a durable audit event, and
+        a best-effort :class:`AdminAlerter` ping so the operator hears
+        about it on a surviving transport. The caller returns without
+        connecting, leaving the adapter down (``health_check`` False) so
+        the watchdog keeps reporting it rather than dying quietly inside
+        the auth handshake.
+        """
+        note = (
+            "telegram transport enabled but TELEGRAM_BOT_TOKEN is not set "
+            "— skipping connect"
+        )
+        self._log.warning(
+            "channel.token_missing",
+            channel="telegram",
+            missing=["TELEGRAM_BOT_TOKEN"],
+            note=note,
+        )
+        audit_event(
+            "audit.transport.token_missing",
+            audit_dir=self._config.audit_dir,
+            actor="anna",
+            fsync_on_write=self._config.logging.audit.fsync_on_write,
+            level="WARNING",
+            channel="telegram",
+            missing=["TELEGRAM_BOT_TOKEN"],
+        )
+        if self._alerter is not None:
+            try:
+                await self._alerter.warn(note, exclude_channel="telegram")
+            except Exception as exc:
+                self._log.error(
+                    "channel.token_missing_alert_failed",
+                    channel="telegram",
+                    error=str(exc),
+                )
 
     async def stop(self) -> None:
         if self._application is None:

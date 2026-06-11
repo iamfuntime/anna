@@ -318,6 +318,13 @@ async def _run(config: AnnaConfig) -> None:
         subagent_runner=subagent_runner,
     )
     alerter = AdminAlerter(config=config, adapters=adapters)
+    # Hand the alerter back to every adapter (setter injection — the
+    # alerter itself needs the adapters dict at construction) so a
+    # transport that boots without its token can warn the operator on a
+    # surviving channel instead of failing quietly before the auth
+    # handshake.
+    for adapter in adapters.values():
+        adapter.set_alerter(alerter)
     watchdog = Watchdog(config=config, adapters=adapters, router=router, alerter=alerter)
 
     # Subscribe the router to every transport. Each adapter calls the

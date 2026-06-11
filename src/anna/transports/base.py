@@ -239,6 +239,18 @@ class ChannelAdapter(ABC):
         await self.stop()
         await self.start()
 
+    def set_alerter(self, alerter: Any) -> None:
+        """Receive the process-wide AdminAlerter after construction.
+
+        The alerter is built AFTER the adapters (it needs the adapters
+        dict), so ``__main__`` injects it via this setter before the
+        listener tasks start. The default stores it on ``self._alerter``;
+        adapters that never alert simply ignore the attribute. Typed
+        ``Any`` to avoid a runtime import cycle with
+        :mod:`anna.runtime.alerter` (which imports this module).
+        """
+        self._alerter = alerter
+
     async def start_thinking_signal(
         self, event: InboundEvent
     ) -> SignalHandle | None:
