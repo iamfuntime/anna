@@ -136,6 +136,11 @@ class SlackAdapter(ChannelAdapter):
             self._handler.start_async(),
             name="slack.socket_mode",
         )
+        # COUPLING: scripts/migrate-to-uv-tool.sh greps journalctl for this
+        # exact "channel.connected" event (with channel="slack") as its
+        # post-migration transport gate, and the setup wizard's readiness
+        # probe matches it too. tests/test_migration_log_markers.py pins the
+        # string — update the script and this marker together.
         self._log.info(
             "channel.connected",
             channel="slack",
@@ -159,12 +164,18 @@ class SlackAdapter(ChannelAdapter):
             + (" is" if len(missing) == 1 else " are")
             + " not set — skipping connect"
         )
+        # COUPLING: scripts/migrate-to-uv-tool.sh fails its transport gate
+        # fast when it sees "channel.token_missing" (or the audit mirror
+        # below) for an enabled transport. tests/test_migration_log_markers.py
+        # pins both strings — update the script and these markers together.
         self._log.warning(
             "channel.token_missing",
             channel="slack",
             missing=missing,
             note=note,
         )
+        # COUPLING: "audit.transport.token_missing" is also grepped by
+        # scripts/migrate-to-uv-tool.sh (the journald mirror of this event).
         audit_event(
             "audit.transport.token_missing",
             audit_dir=self._config.audit_dir,

@@ -99,6 +99,10 @@ class CLIAdapter(ChannelAdapter):
             on_inbound=self._on_inbound,
         )
         await self._server.start()
+        # COUPLING: scripts/migrate-to-uv-tool.sh greps journalctl for this
+        # exact "channel.connected" event (with channel="cli") as its
+        # post-migration transport gate. tests/test_migration_log_markers.py
+        # pins the string — update the script and this marker together.
         self._log.info(
             "channel.connected",
             channel="cli",
