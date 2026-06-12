@@ -267,6 +267,15 @@ def sweep_transcript_retention(transcripts_dir: Path, retention_days: int) -> tu
     """Gzip transcripts older than retention_days, delete those older than 3x.
 
     Returns (gzipped, deleted). Zero retention_days means do nothing.
+
+    Walks the transcript tree at any depth so nested sub-agent day-files
+    (``transcripts/subagent/<slug>/<YYYY-MM-DD>.jsonl``) get the same
+    gzip-then-delete treatment as one-level conversation transcripts
+    (``transcripts/<conv>/<YYYY-MM-DD>.jsonl``). Before this recursion the
+    sweep stopped at the slug directories under ``subagent/`` — which fail
+    the suffix checks — so sub-agent transcripts grew unbounded. Voice
+    notes under ``transcripts/voice/`` are not ``.jsonl``/``.gz`` and so
+    are skipped here; they have their own sweep (:func:`sweep_voice_retention`).
     """
     if retention_days <= 0 or not transcripts_dir.is_dir():
         return (0, 0)
@@ -276,36 +285,39 @@ def sweep_transcript_retention(transcripts_dir: Path, retention_days: int) -> tu
     gzipped = 0
     deleted = 0
 
-    for conv_dir in transcripts_dir.iterdir():
-        if not conv_dir.is_dir():
-            continue
-        for path in conv_dir.iterdir():
-            try:
-                mtime = path.stat().st_mtime
-            except OSError:
+    # Materialize the walk up front: gzipping creates sibling ``.gz``
+    # files, and mutating the tree mid-iteration is undefined on some
+    # platforms. ``rglob`` reaches both one-level conversation files and
+    # two-level sub-agent day-files in a single pass.
+    for path in sorted(transcripts_dir.rglob("*")):
+        try:
+            if not path.is_file():
                 continue
-            if path.suffix == ".gz":
-                if mtime < delete_cutoff:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        if path.suffix == ".gz":
+            if mtime < delete_cutoff:
+                try:
+                    path.unlink()
+                    deleted += 1
+                except OSError:
+                    pass
+            continue
+        if path.suffix == ".jsonl" and mtime < gzip_cutoff:
+            gz_path = path.with_suffix(path.suffix + ".gz")
+            try:
+                with path.open("rb") as src, gzip.open(gz_path, "wb") as dst:
+                    dst.writelines(src)
+                path.unlink()
+                gzipped += 1
+            except OSError:
+                # Leave the original in place; next sweep retries.
+                if gz_path.exists():
                     try:
-                        path.unlink()
-                        deleted += 1
+                        gz_path.unlink()
                     except OSError:
                         pass
-                continue
-            if path.suffix == ".jsonl" and mtime < gzip_cutoff:
-                gz_path = path.with_suffix(path.suffix + ".gz")
-                try:
-                    with path.open("rb") as src, gzip.open(gz_path, "wb") as dst:
-                        dst.writelines(src)
-                    path.unlink()
-                    gzipped += 1
-                except OSError:
-                    # Leave the original in place; next sweep retries.
-                    if gz_path.exists():
-                        try:
-                            gz_path.unlink()
-                        except OSError:
-                            pass
     return (gzipped, deleted)
 
 

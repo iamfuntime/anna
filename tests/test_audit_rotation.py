@@ -10,7 +10,12 @@ from pathlib import Path
 
 import pytest
 
-from anna.log import audit_event, sweep_audit_retention, sweep_voice_retention
+from anna.log import (
+    audit_event,
+    sweep_audit_retention,
+    sweep_transcript_retention,
+    sweep_voice_retention,
+)
 
 
 def test_audit_event_creates_daily_file(tmp_path: Path) -> None:
@@ -151,3 +156,145 @@ def test_voice_retention_ignores_non_voice_transcripts(tmp_path: Path) -> None:
     assert deleted == 1
     assert jsonl.exists()
     assert not old_voice.exists()
+
+
+# ---------------------------------------------------------------------------
+# Transcript retention sweep — gzip at retention_days, delete at 3x. Must
+# treat nested sub-agent day-files (transcripts/subagent/<slug>/<date>.jsonl)
+# identically to one-level conversation files (transcripts/<conv>/<date>.jsonl).
+# retention_days=30 -> gzip cutoff 30d, delete cutoff 90d.
+# ---------------------------------------------------------------------------
+
+
+def _make_transcript_file(
+    transcripts_dir: Path,
+    rel: str,
+    *,
+    age_days: float,
+    content: bytes = b'{"direction":"task"}\n',
+) -> Path:
+    """Create transcripts/<rel> and backdate its mtime by age_days days."""
+    path = transcripts_dir / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+    if age_days:
+        when = time.time() - age_days * 86400
+        os.utime(path, (when, when))
+    return path
+
+
+def _gz_sibling(jsonl_path: Path) -> Path:
+    """The .gz path the sweep writes for a given .jsonl day-file."""
+    return jsonl_path.parent / (jsonl_path.name + ".gz")
+
+
+def test_transcript_retention_gzips_old_conversation_file(tmp_path: Path) -> None:
+    # Regression pin for the one-level layout: a conversation day-file older
+    # than the gzip threshold (but younger than the delete threshold) is
+    # gzipped in place, while a fresh sibling is left untouched. This is the
+    # behavior that must NOT change.
+    transcripts_dir = tmp_path / "transcripts"
+    old = _make_transcript_file(
+        transcripts_dir, "telegram-123/2026-04-01.jsonl", age_days=45
+    )
+    fresh = _make_transcript_file(
+        transcripts_dir, "telegram-123/2026-06-12.jsonl", age_days=0
+    )
+
+    gzipped, deleted = sweep_transcript_retention(transcripts_dir, retention_days=30)
+
+    assert (gzipped, deleted) == (1, 0)
+    assert not old.exists()
+    assert _gz_sibling(old).exists()
+    assert fresh.exists()
+
+
+def test_transcript_retention_deletes_old_conversation_gz(tmp_path: Path) -> None:
+    # Regression pin: a one-level .gz older than the delete threshold (3x) is
+    # removed; a fresh .gz is kept.
+    transcripts_dir = tmp_path / "transcripts"
+    old_gz = _make_transcript_file(
+        transcripts_dir, "telegram-123/2026-01-01.jsonl.gz", age_days=120
+    )
+    fresh_gz = _make_transcript_file(
+        transcripts_dir, "telegram-123/2026-06-01.jsonl.gz", age_days=5
+    )
+
+    gzipped, deleted = sweep_transcript_retention(transcripts_dir, retention_days=30)
+
+    assert (gzipped, deleted) == (0, 1)
+    assert not old_gz.exists()
+    assert fresh_gz.exists()
+
+
+def test_transcript_retention_gzips_nested_subagent_file(tmp_path: Path) -> None:
+    # The bug fix: a nested sub-agent day-file two levels deep gets gzipped
+    # at the same 30-day threshold as conversation files.
+    transcripts_dir = tmp_path / "transcripts"
+    nested = _make_transcript_file(
+        transcripts_dir, "subagent/code-writer/2026-04-01.jsonl", age_days=45
+    )
+
+    gzipped, deleted = sweep_transcript_retention(transcripts_dir, retention_days=30)
+
+    assert (gzipped, deleted) == (1, 0)
+    assert not nested.exists()
+    assert _gz_sibling(nested).exists()
+
+
+def test_transcript_retention_deletes_nested_subagent_gz(tmp_path: Path) -> None:
+    # The bug fix: a nested sub-agent .gz older than the delete threshold (3x)
+    # is removed rather than accumulating forever.
+    transcripts_dir = tmp_path / "transcripts"
+    nested_gz = _make_transcript_file(
+        transcripts_dir, "subagent/code-writer/2026-01-01.jsonl.gz", age_days=120
+    )
+
+    gzipped, deleted = sweep_transcript_retention(transcripts_dir, retention_days=30)
+
+    assert (gzipped, deleted) == (0, 1)
+    assert not nested_gz.exists()
+
+
+def test_transcript_retention_leaves_fresh_files_untouched(tmp_path: Path) -> None:
+    # Fresh files at both depths must be left in place (no gzip, no delete).
+    transcripts_dir = tmp_path / "transcripts"
+    conv_fresh = _make_transcript_file(
+        transcripts_dir, "telegram-123/2026-06-12.jsonl", age_days=0
+    )
+    nested_fresh = _make_transcript_file(
+        transcripts_dir, "subagent/code-writer/2026-06-12.jsonl", age_days=2
+    )
+
+    gzipped, deleted = sweep_transcript_retention(transcripts_dir, retention_days=30)
+
+    assert (gzipped, deleted) == (0, 0)
+    assert conv_fresh.exists()
+    assert nested_fresh.exists()
+    assert not _gz_sibling(conv_fresh).exists()
+    assert not _gz_sibling(nested_fresh).exists()
+
+
+def test_transcript_retention_empty_slug_dir_graceful(tmp_path: Path) -> None:
+    # An empty subagent/<slug>/ directory (slug seen but no day-files written
+    # yet) must not crash the sweep and must report zero work.
+    transcripts_dir = tmp_path / "transcripts"
+    (transcripts_dir / "subagent" / "code-writer").mkdir(parents=True)
+    (transcripts_dir / "subagent" / "empty-other").mkdir(parents=True)
+
+    gzipped, deleted = sweep_transcript_retention(transcripts_dir, retention_days=30)
+
+    assert (gzipped, deleted) == (0, 0)
+    assert (transcripts_dir / "subagent" / "code-writer").is_dir()
+
+
+def test_transcript_retention_zero_keeps_forever(tmp_path: Path) -> None:
+    transcripts_dir = tmp_path / "transcripts"
+    old = _make_transcript_file(
+        transcripts_dir, "subagent/code-writer/2025-01-01.jsonl", age_days=300
+    )
+
+    gzipped, deleted = sweep_transcript_retention(transcripts_dir, retention_days=0)
+
+    assert (gzipped, deleted) == (0, 0)
+    assert old.exists()

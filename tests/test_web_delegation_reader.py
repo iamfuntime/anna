@@ -14,6 +14,7 @@ mtime+size-keyed per-file cache.
 
 from __future__ import annotations
 
+import gzip
 import json
 import os
 from datetime import date, timedelta
@@ -69,6 +70,25 @@ def _write_day(root: Path, slug: str, day: date, lines: list[Any]) -> Path:
             fp.write(line if isinstance(line, str) else json.dumps(line))
             fp.write("\n")
     return path
+
+
+def test_reader_ignores_gzipped_day_files(tmp_path: Path) -> None:
+    """The retention sweep gzips day-files at 30d; the reader reads only plain
+    ``.jsonl`` within its 14-day window and must never open a ``.gz``. This
+    pins that gzip-at-30d is safe — an archived sibling is not double-counted
+    and a gzipped run never surfaces."""
+    # A plain day-file the reader is expected to see.
+    _write_day(tmp_path, "code-writer", TODAY, [_outbound(audit_id="live")])
+    # A gzipped sibling carrying a valid outbound record. If the reader opened
+    # it, "archived" would appear in the results.
+    gz_path = tmp_path / "code-writer" / f"{TODAY.isoformat()}.jsonl.gz"
+    with gzip.open(gz_path, "wt", encoding="utf-8") as fp:
+        fp.write(json.dumps(_outbound(audit_id="archived")) + "\n")
+
+    reader = DelegationReader(tmp_path)
+    runs = reader.runs(today=TODAY)
+
+    assert [run.audit_id for run in runs] == ["live"]
 
 
 def test_per_agent_history_newest_first(tmp_path: Path) -> None:
