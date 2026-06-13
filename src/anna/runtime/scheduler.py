@@ -30,6 +30,10 @@ from anna.config import AnnaConfig
 from anna.log import audit_event, get_logger
 from anna.runtime.schedule_store import ScheduleStore
 from anna.runtime.schedule_types import Schedule
+from anna.runtime.worker import (
+    _contains_unparsed_toolcall_markup,
+    _matched_markers,
+)
 from anna.transports.base import ChannelAdapter, InboundEvent, OutboundMessage
 
 if TYPE_CHECKING:
@@ -325,6 +329,23 @@ class Scheduler:
                 self._log.info(
                     f"schedule {schedule.id} returned quiet sentinel — "
                     f"suppressing post"
+                )
+                await self._record_success(
+                    schedule, reply, started_at=started_at, suppressed=True
+                )
+                return
+
+            # Defense-in-depth tool-call-markup guard. The worker already
+            # suppresses leaked function-call syntax before resolving the
+            # completion future (resolving with QUIET_SENTINEL, handled
+            # above), but if anything slips through we must never route it
+            # to the destination transport. Re-run the same structural check
+            # here and suppress identically to the quiet-sentinel path.
+            if reply is not None and _contains_unparsed_toolcall_markup(reply):
+                self._log.warning(
+                    "scheduler.toolcall_markup_suppress",
+                    schedule_id=schedule.id,
+                    markers=_matched_markers(reply),
                 )
                 await self._record_success(
                     schedule, reply, started_at=started_at, suppressed=True

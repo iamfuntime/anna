@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import re
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -49,6 +50,7 @@ from anna.vault.transcript_resume import (
 )
 
 if TYPE_CHECKING:
+    from anna.runtime.alerter import AdminAlerter
     from anna.runtime.schedule_store import ScheduleStore
     from anna.runtime.subagent import SubAgentRunner
     from anna.runtime.supervisor import Supervisor
@@ -101,6 +103,42 @@ def _allowed_tool_names(
     return names
 
 
+# Runtime guard against leaked, unparsed tool-call markup reaching a
+# transport (incident: a degraded model turn posted literal
+# ``<invoke name="Bash">…</invoke>`` XML and a bare
+# ``mcp__anna_google__gmail_list_unread`` line to Slack). The patterns are
+# deliberately structural so prose that merely mentions ``<invoke>`` in
+# backticks (no ``name=`` attribute) or an inline ``mcp__…`` tool name
+# mid-sentence (not on its own line) does NOT match — keeping false
+# positives near zero. Each pattern below is one strong, self-sufficient
+# marker of leaked function-call syntax.
+_TOOLCALL_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"<(?:antml:)?invoke\b[^>]*\bname\s*=", re.IGNORECASE),
+    re.compile(r"</(?:antml:)?invoke>", re.IGNORECASE),
+    re.compile(r"<(?:antml:)?parameter\b[^>]*\bname\s*=", re.IGNORECASE),
+    re.compile(r"</?(?:antml:)?function_calls>", re.IGNORECASE),
+    re.compile(r"(?m)^\s*mcp__[a-z0-9_]+__[a-z0-9_]+\s*$", re.IGNORECASE),
+)
+
+
+def _contains_unparsed_toolcall_markup(text: str) -> bool:
+    """True if ``text`` contains any leaked, unparsed tool-call marker.
+
+    Returns ``False`` for empty/``None`` text. See ``_TOOLCALL_PATTERNS``
+    for the rationale behind the structural (low-false-positive) markers.
+    """
+    if not text:
+        return False
+    return any(pattern.search(text) for pattern in _TOOLCALL_PATTERNS)
+
+
+def _matched_markers(text: str) -> list[str]:
+    """Return the source-pattern strings that matched ``text`` (for audit)."""
+    if not text:
+        return []
+    return [pattern.pattern for pattern in _TOOLCALL_PATTERNS if pattern.search(text)]
+
+
 SendCallback = Callable[[OutboundMessage], Awaitable[None]]
 IdleCloseCallback = Callable[[str], Awaitable[None]]
 
@@ -146,6 +184,7 @@ class ConversationWorker:
         subagent_runner: "SubAgentRunner | None" = None,
         ephemeral: bool = False,
         visibility: VisibilityCallbacks = NULL_VISIBILITY,
+        alerter: "AdminAlerter | None" = None,
     ) -> None:
         self.conversation_key = conversation_key
         self.transport = transport
@@ -161,6 +200,12 @@ class ConversationWorker:
         self._schedule_store = schedule_store
         self._google_clients = google_clients
         self._subagent_runner = subagent_runner
+        # Out-of-band operator alerter (same instance the router/watchdog
+        # hold). Used by the runtime tool-call-markup guard to fire a
+        # best-effort admin alert when a degraded turn leaks unparsed
+        # function-call syntax. ``None`` in standalone unit tests; the guard
+        # then audits + logs but skips the alert.
+        self._alerter = alerter
         # Cadence-Visibility Hooks plan (Inbox/2026-06-02) subtask 5.
         # Default ``NULL_VISIBILITY`` means: no reminder prepend, no
         # thinking-signal start/clear, no lint pass. Existing unit tests
@@ -1227,7 +1272,7 @@ class ConversationWorker:
                     # logged and the timer keeps ticking (buffer untouched, so
                     # the text retries on the next tick or the final send).
                     try:
-                        await self._send(
+                        await self._guarded_send(
                             OutboundMessage(
                                 conversation_key=event.conversation_key,
                                 text=txt,
@@ -1247,6 +1292,77 @@ class ConversationWorker:
                     buffer.last_flush = loop.time()
         except asyncio.CancelledError:
             raise
+
+    async def _emit_markup_suppressed(self, text: str, *, conv_key: str) -> None:
+        """Audit + log + best-effort alert when leaked tool-call markup is
+        suppressed before it can reach a transport.
+
+        Called by :meth:`_guarded_send` (interactive path) and the
+        scheduler-driven completion-future path in :meth:`_handle`. The
+        admin alert is fired through the shared :class:`AdminAlerter` when
+        one is wired; failures there are logged and never propagate.
+        """
+        markers = _matched_markers(text)
+        audit_event(
+            "audit.reply.toolcall_markup_suppressed",
+            audit_dir=self._config.audit_dir,
+            actor="anna",
+            conv_key=conv_key,
+            fsync_on_write=self._config.logging.audit.fsync_on_write,
+            level="WARNING",
+            transport=self.transport,
+            char_count=len(text),
+            markers=markers,
+            preview=text[:280],
+        )
+        self._log.warning(
+            "worker.reply.toolcall_markup_suppressed",
+            conv_key=conv_key,
+            transport=self.transport,
+            char_count=len(text),
+            markers=markers,
+        )
+        if self._alerter is not None:
+            alerter = self._alerter
+            message = (
+                "Suppressed a reply containing leaked tool-call markup "
+                f"on {self.transport} (conv {conv_key}); markers="
+                f"{markers}."
+            )
+
+            async def _alert() -> None:
+                try:
+                    await alerter.warn(message, exclude_channel=None)
+                except Exception as exc:
+                    self._log.warning(
+                        "worker.reply.markup_alert_failed",
+                        error=str(exc),
+                        conv_key=conv_key,
+                        transport=self.transport,
+                    )
+
+            # AdminAlerter.warn is best-effort; do not block the turn on it.
+            # The inner closure owns its own try/except so a raising warn can
+            # never surface as an unretrieved-task exception.
+            asyncio.create_task(
+                _alert(),
+                name=f"worker.markup_alert.{conv_key}",
+            )
+
+    async def _guarded_send(self, msg: OutboundMessage) -> None:
+        """Send ``msg`` unless its text carries leaked tool-call markup.
+
+        Interactive send sites route through here so a degraded turn can
+        never post literal function-call syntax to a transport. On
+        detection the send is dropped after auditing/alerting. SDK-error
+        strings (our own text) bypass this and use ``self._send`` directly.
+        """
+        if _contains_unparsed_toolcall_markup(msg.text):
+            await self._emit_markup_suppressed(
+                msg.text, conv_key=msg.conversation_key
+            )
+            return
+        await self._send(msg)
 
     async def _handle(self, event: InboundEvent) -> None:
         if self._client is None:
@@ -1446,7 +1562,7 @@ class ConversationWorker:
                                                 c for c in buffer.pending if c
                                             ).strip()
                                             if txt:
-                                                await self._send(OutboundMessage(
+                                                await self._guarded_send(OutboundMessage(
                                                     conversation_key=event.conversation_key,
                                                     text=txt,
                                                 ))
@@ -1530,6 +1646,19 @@ class ConversationWorker:
         # output itself. Transport-originated events have completion_future
         # unset and use the standard send-back path.
         if event.completion_future is not None and not event.completion_future.done():
+            # Scheduled-turn guard: a degraded turn must not resolve the
+            # future with leaked tool-call markup, which the scheduler would
+            # otherwise route to the destination transport. Suppress it the
+            # same way the scheduler's QUIET_SENTINEL opt-out does (record a
+            # quiet, non-erroring run) by resolving with the sentinel.
+            if _contains_unparsed_toolcall_markup(reply_text):
+                await self._emit_markup_suppressed(
+                    reply_text, conv_key=event.conversation_key
+                )
+                from anna.runtime.scheduler import QUIET_SENTINEL
+
+                event.completion_future.set_result(QUIET_SENTINEL)
+                return
             event.completion_future.set_result(reply_text)
             return
 
@@ -1542,7 +1671,7 @@ class ConversationWorker:
         # cancelled in the ``finally`` above, so this read needs no lock.
         final_text = "\n".join(c for c in buffer.pending if c).strip()
         if final_text:
-            await self._send(OutboundMessage(
+            await self._guarded_send(OutboundMessage(
                 conversation_key=event.conversation_key,
                 text=final_text,
             ))
@@ -1552,7 +1681,7 @@ class ConversationWorker:
             # operator sees SOMETHING. If reply_chunks is non-empty but
             # final_text is empty, that means every text block was already
             # flushed at a tool-use boundary; nothing more to send.
-            await self._send(OutboundMessage(
+            await self._guarded_send(OutboundMessage(
                 conversation_key=event.conversation_key,
                 text="(no response)",
             ))

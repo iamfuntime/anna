@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 from datetime import datetime, timezone
-from typing import Awaitable, Callable
+from typing import TYPE_CHECKING, Awaitable, Callable
 
 from anna.config import AnnaConfig, IdentityAliasEntry
 from anna.core.identity import CoreFile, read_core_file
@@ -37,6 +37,9 @@ from anna.runtime.visibility import (
 from anna.runtime.worker import ConversationWorker
 from anna.tools.google_clients import GoogleClients
 from anna.transports.base import ChannelAdapter, InboundEvent, OutboundMessage
+
+if TYPE_CHECKING:
+    from anna.runtime.alerter import AdminAlerter
 
 
 SendCallback = Callable[[OutboundMessage], Awaitable[None]]
@@ -105,6 +108,7 @@ class ConversationRouter:
         schedule_store: ScheduleStore | None = None,
         google_clients: GoogleClients | None = None,
         subagent_runner: SubAgentRunner | None = None,
+        alerter: AdminAlerter | None = None,
     ) -> None:
         self._config = config
         self._supervisor = supervisor
@@ -112,6 +116,9 @@ class ConversationRouter:
         self._schedule_store = schedule_store
         self._google_clients = google_clients
         self._subagent_runner = subagent_runner
+        # Out-of-band operator alerter, threaded into every worker so the
+        # tool-call-markup guard can fire a best-effort admin alert.
+        self._alerter = alerter
         self._log = get_logger("anna.router")
         self._workers: dict[str, ConversationWorker] = {}
         self._workers_lock = asyncio.Lock()
@@ -276,6 +283,7 @@ class ConversationRouter:
                 subagent_runner=self._subagent_runner,
                 ephemeral=event.ephemeral,
                 visibility=self._build_visibility_callbacks(event.transport),
+                alerter=self._alerter,
             )
             await worker.start()
             self._workers[key] = worker

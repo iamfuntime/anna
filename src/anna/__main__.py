@@ -309,6 +309,10 @@ async def _run(config: AnnaConfig) -> None:
             ),
         )
 
+    # Build the alerter BEFORE the router so it can be threaded into every
+    # worker the router spawns (the tool-call-markup guard fires a
+    # best-effort admin alert through it).
+    alerter = AdminAlerter(config=config, adapters=adapters)
     router = ConversationRouter(
         config=config,
         supervisor=supervisor,
@@ -316,8 +320,8 @@ async def _run(config: AnnaConfig) -> None:
         schedule_store=schedule_store,
         google_clients=google_clients,
         subagent_runner=subagent_runner,
+        alerter=alerter,
     )
-    alerter = AdminAlerter(config=config, adapters=adapters)
     # Hand the alerter back to every adapter (setter injection — the
     # alerter itself needs the adapters dict at construction) so a
     # transport that boots without its token can warn the operator on a
