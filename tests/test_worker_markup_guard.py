@@ -273,3 +273,65 @@ async def test_guarded_send_survives_failing_alerter(tmp_path: Path) -> None:
     # raise (and no unretrieved-task-exception warning is produced).
     await asyncio.sleep(0)
     assert sent == []
+
+
+@pytest.mark.asyncio
+async def test_no_alert_when_suppression_in_admin_channel(tmp_path: Path) -> None:
+    """The feedback-loop break: a suppression that happened in the admin
+    channel must NOT fire another admin alert into that same channel."""
+    sent: list[OutboundMessage] = []
+    worker = _make_worker(tmp_path, sent)
+
+    # Point the admin destination at the worker's own channel (C123).
+    worker._config.admin.slack_channel_id = "C123"
+
+    warned: list[str] = []
+
+    class _FakeAlerter:
+        async def warn(self, message: str, *, exclude_channel: str | None = None) -> bool:
+            warned.append(message)
+            return True
+
+    worker._alerter = _FakeAlerter()  # type: ignore[assignment]
+
+    await worker._guarded_send(
+        OutboundMessage(
+            conversation_key=worker.conversation_key,
+            text=INCIDENT_TEXT,
+        )
+    )
+    await asyncio.sleep(0)
+
+    # Suppressed (fail-closed preserved) but NO alert — loop broken.
+    assert sent == []
+    assert warned == []
+
+
+@pytest.mark.asyncio
+async def test_alert_still_fires_outside_admin_channel(tmp_path: Path) -> None:
+    """A suppression in a non-admin channel still alerts the admin channel."""
+    sent: list[OutboundMessage] = []
+    worker = _make_worker(tmp_path, sent)
+
+    # Admin destination is a DIFFERENT channel than the worker's (C123).
+    worker._config.admin.slack_channel_id = "CADMIN999"
+
+    warned: list[str] = []
+
+    class _FakeAlerter:
+        async def warn(self, message: str, *, exclude_channel: str | None = None) -> bool:
+            warned.append(message)
+            return True
+
+    worker._alerter = _FakeAlerter()  # type: ignore[assignment]
+
+    await worker._guarded_send(
+        OutboundMessage(
+            conversation_key=worker.conversation_key,
+            text=INCIDENT_TEXT,
+        )
+    )
+    await asyncio.sleep(0)
+
+    assert sent == []
+    assert len(warned) == 1

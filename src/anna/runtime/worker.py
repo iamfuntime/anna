@@ -1314,6 +1314,24 @@ class ConversationWorker:
         except asyncio.CancelledError:
             raise
 
+    def _suppression_in_admin_channel(self, conv_key: str) -> bool:
+        """True when ``conv_key`` targets the admin alert destination for this
+        transport. Used to break the alert feedback loop: a suppression that
+        happened in the admin channel must not fire another admin alert there.
+        """
+        admin = getattr(self._config, "admin", None)
+        if admin is None:
+            return False
+        if self.transport == "slack":
+            destination = getattr(admin, "slack_channel_id", None)
+        elif self.transport == "telegram":
+            destination = getattr(admin, "telegram_chat_id", None)
+        else:
+            destination = None
+        if not destination:
+            return False
+        return str(destination) in conv_key
+
     async def _emit_markup_suppressed(self, text: str, *, conv_key: str) -> None:
         """Audit + log + best-effort alert when leaked tool-call markup is
         suppressed before it can reach a transport.
@@ -1343,7 +1361,13 @@ class ConversationWorker:
             char_count=len(text),
             markers=markers,
         )
-        if self._alerter is not None:
+        # Feedback-loop break: when the suppressed reply was itself posted in
+        # the admin channel, do NOT alert that same channel about it. The
+        # operator is already reading there; an alert-per-suppression in the
+        # admin channel turns one mis-formatted explanation into a runaway
+        # cascade (suppress -> alert -> operator asks -> suppress -> ...).
+        # The audit row + log line above still record every suppression.
+        if self._alerter is not None and not self._suppression_in_admin_channel(conv_key):
             alerter = self._alerter
             message = (
                 "Suppressed a reply containing leaked tool-call markup "
