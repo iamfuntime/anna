@@ -107,6 +107,34 @@ def test_benign_text_not_detected(text: str) -> None:
     assert _contains_unparsed_toolcall_markup(text) is False
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        # The exact false-positive shape that caused the admin-channel cascade:
+        # a reply EXPLAINING the suppression, quoting the markup in backticks.
+        'a reply containing raw tool-call markup (the literal `<invoke name=...>` '
+        "XML that should execute a tool, not get posted).",
+        'The guard matched `<invoke name="Bash">` and `</invoke>` in my draft.',
+        "It also flags a `<parameter name=\"command\">` fragment.",
+        # Fenced block quoting the whole incident blob is prose, not a leak.
+        "Here is what leaked:\n```\n<invoke name=\"Bash\">\n</invoke>\n```\nThat is why it dropped.",
+        # Backticked whole-line mcp tool name is a quote, not a bare leak.
+        "The bare line `mcp__anna_google__gmail_list_unread` is what tripped it.",
+    ],
+)
+def test_quoted_markup_not_detected(text: str) -> None:
+    # Markup wrapped in inline/fenced code spans is prose ABOUT the syntax,
+    # never a genuine leak (those arrive bare). Must NOT be suppressed.
+    assert _contains_unparsed_toolcall_markup(text) is False
+    assert _matched_markers(text) == []
+
+
+def test_bare_leak_still_detected_alongside_quoted() -> None:
+    # A bare leak must still fire even if the same text also quotes markup.
+    text = 'I quote `<invoke name="X">` here, but this is bare:\n<invoke name="Bash">'
+    assert _contains_unparsed_toolcall_markup(text) is True
+
+
 def test_none_text_not_detected() -> None:
     # The guard is called with attribute access that can be falsy; None must
     # return False, not raise.

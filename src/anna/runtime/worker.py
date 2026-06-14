@@ -120,23 +120,44 @@ _TOOLCALL_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(?m)^\s*mcp__[a-z0-9_]+__[a-z0-9_]+\s*$", re.IGNORECASE),
 )
 
+# Code-span strippers, applied BEFORE the markup patterns. A genuine leaked
+# tool call is always BARE — the degraded turn is trying to *invoke*, so the
+# markup arrives unquoted (incident text: ``court\n<invoke name="Bash">``).
+# Legitimate prose that discusses the syntax (e.g. a reply explaining why a
+# message was suppressed) always wraps it in backticks. Stripping fenced and
+# inline code spans first therefore kills the false-positive cascade — where
+# an explanation that quotes ``<invoke name=…>`` got suppressed, fired an
+# admin alert, prompted another question, and looped — without weakening the
+# bare-leak catch. Fenced blocks are stripped before inline spans so a ```
+# fence is never half-consumed by the single-backtick pass.
+_FENCED_CODE = re.compile(r"```.*?```", re.DOTALL)
+_INLINE_CODE = re.compile(r"`[^`\n]*`")
+
+
+def _strip_code_spans(text: str) -> str:
+    """Remove fenced and inline code spans so quoted markup is not scanned."""
+    return _INLINE_CODE.sub(" ", _FENCED_CODE.sub(" ", text))
+
 
 def _contains_unparsed_toolcall_markup(text: str) -> bool:
     """True if ``text`` contains any leaked, unparsed tool-call marker.
 
-    Returns ``False`` for empty/``None`` text. See ``_TOOLCALL_PATTERNS``
+    Returns ``False`` for empty/``None`` text. Code spans (backtick-wrapped)
+    are stripped first — see ``_strip_code_spans`` and ``_TOOLCALL_PATTERNS``
     for the rationale behind the structural (low-false-positive) markers.
     """
     if not text:
         return False
-    return any(pattern.search(text) for pattern in _TOOLCALL_PATTERNS)
+    scannable = _strip_code_spans(text)
+    return any(pattern.search(scannable) for pattern in _TOOLCALL_PATTERNS)
 
 
 def _matched_markers(text: str) -> list[str]:
     """Return the source-pattern strings that matched ``text`` (for audit)."""
     if not text:
         return []
-    return [pattern.pattern for pattern in _TOOLCALL_PATTERNS if pattern.search(text)]
+    scannable = _strip_code_spans(text)
+    return [pattern.pattern for pattern in _TOOLCALL_PATTERNS if pattern.search(scannable)]
 
 
 SendCallback = Callable[[OutboundMessage], Awaitable[None]]
