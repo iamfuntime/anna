@@ -20,6 +20,9 @@ from pathlib import Path
 
 import pytest
 
+from dataclasses import dataclass
+from typing import Any
+
 from anna.config import AnnaConfig
 from anna.runtime.supervisor import Supervisor
 from anna.runtime.worker import (
@@ -27,7 +30,7 @@ from anna.runtime.worker import (
     _contains_unparsed_toolcall_markup,
     _matched_markers,
 )
-from anna.transports.base import OutboundMessage
+from anna.transports.base import InboundEvent, OutboundMessage
 
 
 # The literal blob from the incident: an unparsed invoke block plus a bare
@@ -335,3 +338,355 @@ async def test_alert_still_fires_outside_admin_channel(tmp_path: Path) -> None:
 
     assert sent == []
     assert len(warned) == 1
+
+
+# ---------------------------------------------------------------------------
+# Bounded scheduled-turn regeneration (completion-future path only).
+#
+# A degraded scheduled generation can NARRATE its tool calls as literal markup
+# instead of executing them — zero tools run, so the failed turn has no side
+# effects and one fresh re-generation is safe and almost always succeeds. The
+# worker makes AT MOST one retry before falling back to today's suppress +
+# QUIET_SENTINEL behavior. These tests drive ``_handle`` through a fake SDK
+# session that can return a different reply on the second query/receive cycle.
+# ---------------------------------------------------------------------------
+
+
+# A reply carrying a bare (unparsed) invoke leak — markup, not prose.
+DIRTY_REPLY = (
+    "Let me check your inbox.\n"
+    '<invoke name="Bash">\n'
+    '<parameter name="command">ls</parameter>\n'
+    "</invoke>"
+)
+# A SECOND, DISTINCT dirty reply (a bare whole-line MCP tool name leak) so a
+# both-dirty test can prove WHICH reply text gets suppressed.
+DIRTY_REPLY_2 = (
+    "Checking your inbox now.\n"
+    "mcp__anna_google__gmail_list_unread"
+)
+# A contract-legal compact check-in with no tool-call markup.
+CLEAN_REPLY = "Morning brief: two threads need a reply, calendar is clear."
+
+
+@dataclass
+class _FakeTextBlock:
+    text: str
+
+
+@dataclass
+class _FakeToolUseBlock:
+    """A real tool invocation block. Its mere presence in the drain loop sets
+    the worker's ``tool_used`` flag, which gates off regeneration."""
+
+    name: str = "Bash"
+    input: dict[str, Any] | None = None
+
+
+@dataclass
+class _FakeAssistantMessage:
+    content: list[Any]
+
+
+@dataclass
+class _FakeResultMessage:
+    pass
+
+
+@pytest.fixture
+def _patch_sdk_types(monkeypatch):
+    """Point the worker's lazily-imported SDK message types at local fakes so
+    the (re)drain loops in ``_handle`` / ``_regenerate_scheduled_reply``
+    recognise our fake AssistantMessage/TextBlock/ResultMessage shapes."""
+    import claude_agent_sdk as sdk
+
+    monkeypatch.setattr(sdk, "AssistantMessage", _FakeAssistantMessage, raising=False)
+    monkeypatch.setattr(sdk, "ResultMessage", _FakeResultMessage, raising=False)
+    monkeypatch.setattr(sdk, "TextBlock", _FakeTextBlock, raising=False)
+    monkeypatch.setattr(sdk, "ToolUseBlock", _FakeToolUseBlock, raising=False)
+    yield
+
+
+class _FakeSequenceClient:
+    """Fake SDK session that returns a different reply per query/receive cycle.
+
+    ``replies`` is indexed by the number of ``receive_response`` calls so the
+    first turn yields ``replies[0]`` and the regeneration yields ``replies[1]``
+    (the last entry repeats if fewer replies than cycles are supplied). Set
+    ``raise_on_query`` / ``raise_on_receive`` to a 1-based call index to force
+    the regeneration's query/receive to blow up.
+    """
+
+    def __init__(
+        self,
+        replies: list[str],
+        *,
+        raise_on_query: int | None = None,
+        raise_on_receive: int | None = None,
+        first_uses_tool: bool = False,
+    ) -> None:
+        self._replies = list(replies)
+        self.queries: list[str] = []
+        self._receive_calls = 0
+        self._raise_on_query = raise_on_query
+        self._raise_on_receive = raise_on_receive
+        # When set, the FIRST generation's AssistantMessage carries a real
+        # ToolUseBlock alongside its (leaked-markup) text — i.e. a tool truly
+        # executed this turn, so regeneration must be refused.
+        self._first_uses_tool = first_uses_tool
+
+    async def query(self, prompt: str) -> None:
+        self.queries.append(prompt)
+        if self._raise_on_query is not None and len(self.queries) == self._raise_on_query:
+            raise RuntimeError("regen query boom")
+
+    async def receive_response(self):
+        self._receive_calls += 1
+        if self._raise_on_receive is not None and self._receive_calls == self._raise_on_receive:
+            raise RuntimeError("regen receive boom")
+        idx = min(self._receive_calls - 1, len(self._replies) - 1)
+        content: list[Any] = []
+        if self._first_uses_tool and self._receive_calls == 1:
+            content.append(_FakeToolUseBlock())
+        content.append(_FakeTextBlock(text=self._replies[idx]))
+        yield _FakeAssistantMessage(content=content)
+        yield _FakeResultMessage()
+
+    async def __aenter__(self):  # pragma: no cover
+        return self
+
+    async def __aexit__(self, *_a):  # pragma: no cover
+        return None
+
+
+def _make_scheduled_event(
+    conv_key: str, future: asyncio.Future[str]
+) -> InboundEvent:
+    return InboundEvent(
+        transport="slack",
+        conversation_key=conv_key,
+        sender_id="anna.scheduler",
+        sender_display="ANNA Scheduler",
+        text="Run the heartbeat.",
+        is_dm=False,
+        is_thread=False,
+        completion_future=future,
+    )
+
+
+def _capture_audit(monkeypatch) -> list[str]:
+    """Record the event names passed to ``worker.audit_event`` (the worker
+    imports it by name, so patch it in the worker module)."""
+    names: list[str] = []
+    import anna.runtime.worker as worker_mod
+
+    real = worker_mod.audit_event
+
+    def _spy(event: str, **kwargs):
+        names.append(event)
+        return real(event, **kwargs)
+
+    monkeypatch.setattr(worker_mod, "audit_event", _spy)
+    return names
+
+
+def _spy_suppress(worker: ConversationWorker) -> list[str]:
+    """Replace ``_emit_markup_suppressed`` with an async spy that records the
+    suppressed text instead of auditing/alerting."""
+    calls: list[str] = []
+
+    async def _fake(text: str, *, conv_key: str) -> None:
+        calls.append(text)
+
+    worker._emit_markup_suppressed = _fake  # type: ignore[assignment]
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_regeneration_rescues_dirty_first_generation(
+    tmp_path: Path, monkeypatch, _patch_sdk_types
+) -> None:
+    """First generation leaks markup; the single retry returns clean text →
+    the future resolves with that clean text (NOT the sentinel), the
+    ``regenerated`` audit event fires, and suppression is never invoked."""
+    from anna.runtime.scheduler import QUIET_SENTINEL
+
+    sent: list[OutboundMessage] = []
+    worker = _make_worker(tmp_path, sent)
+    worker._client = _FakeSequenceClient([DIRTY_REPLY, CLEAN_REPLY])
+
+    audit_names = _capture_audit(monkeypatch)
+    suppressed = _spy_suppress(worker)
+
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[str] = loop.create_future()
+    await worker._handle(_make_scheduled_event(worker.conversation_key, future))
+
+    assert future.done()
+    assert future.result() == CLEAN_REPLY
+    assert future.result() != QUIET_SENTINEL
+    # Exactly one retry: the original turn + the regeneration.
+    assert len(worker._client.queries) == 2
+    # The rescue was recorded and the fallback suppression never ran.
+    assert "audit.reply.toolcall_markup_regenerating" in audit_names
+    assert "audit.reply.toolcall_markup_regenerated" in audit_names
+    assert suppressed == []
+    assert sent == []
+
+
+@pytest.mark.asyncio
+async def test_regeneration_both_dirty_falls_back_to_sentinel(
+    tmp_path: Path, monkeypatch, _patch_sdk_types
+) -> None:
+    """Both generations leak markup → the future resolves with QUIET_SENTINEL,
+    suppression fires exactly once (the fallback), and only ONE retry is
+    attempted (query called exactly twice)."""
+    from anna.runtime.scheduler import QUIET_SENTINEL
+
+    sent: list[OutboundMessage] = []
+    worker = _make_worker(tmp_path, sent)
+    # Original and regenerated dirty replies are DISTINCT so the suppression
+    # assertion below actually proves WHICH text was suppressed (the original,
+    # not the regenerated one).
+    worker._client = _FakeSequenceClient([DIRTY_REPLY, DIRTY_REPLY_2])
+
+    audit_names = _capture_audit(monkeypatch)
+    suppressed = _spy_suppress(worker)
+
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[str] = loop.create_future()
+    await worker._handle(_make_scheduled_event(worker.conversation_key, future))
+
+    assert future.done()
+    assert future.result() == QUIET_SENTINEL
+    # AT MOST one retry — no runaway loop.
+    assert len(worker._client.queries) == 2
+    # The regenerating marker fired but the success marker did NOT.
+    assert "audit.reply.toolcall_markup_regenerating" in audit_names
+    assert "audit.reply.toolcall_markup_regenerated" not in audit_names
+    # Fallback suppression ran exactly once, on the ORIGINAL reply — NOT the
+    # (also-dirty) regenerated one.
+    assert suppressed == [DIRTY_REPLY]
+
+
+@pytest.mark.asyncio
+async def test_clean_first_generation_skips_regeneration(
+    tmp_path: Path, monkeypatch, _patch_sdk_types
+) -> None:
+    """A clean first generation resolves the future directly with no second
+    query and no regeneration audit markers (existing behavior unchanged)."""
+    sent: list[OutboundMessage] = []
+    worker = _make_worker(tmp_path, sent)
+    worker._client = _FakeSequenceClient([CLEAN_REPLY])
+
+    audit_names = _capture_audit(monkeypatch)
+    suppressed = _spy_suppress(worker)
+
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[str] = loop.create_future()
+    await worker._handle(_make_scheduled_event(worker.conversation_key, future))
+
+    assert future.done()
+    assert future.result() == CLEAN_REPLY
+    # No regeneration: only the original query ran.
+    assert len(worker._client.queries) == 1
+    assert "audit.reply.toolcall_markup_regenerating" not in audit_names
+    assert "audit.reply.toolcall_markup_regenerated" not in audit_names
+    assert suppressed == []
+
+
+@pytest.mark.asyncio
+async def test_regeneration_query_error_falls_back_to_sentinel(
+    tmp_path: Path, monkeypatch, _patch_sdk_types
+) -> None:
+    """If the regeneration's query/receive raises, the worker logs and falls
+    back to suppress + QUIET_SENTINEL — the future is resolved and no
+    exception escapes ``_handle``."""
+    from anna.runtime.scheduler import QUIET_SENTINEL
+
+    sent: list[OutboundMessage] = []
+    worker = _make_worker(tmp_path, sent)
+    # First turn yields the dirty reply; the SECOND query (regeneration) raises.
+    worker._client = _FakeSequenceClient([DIRTY_REPLY], raise_on_query=2)
+
+    suppressed = _spy_suppress(worker)
+
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[str] = loop.create_future()
+    # Must not raise out of _handle.
+    await worker._handle(_make_scheduled_event(worker.conversation_key, future))
+
+    assert future.done()
+    assert future.result() == QUIET_SENTINEL
+    # The retry was attempted (query called twice) then errored out.
+    assert len(worker._client.queries) == 2
+    # Fallback suppressed the ORIGINAL reply.
+    assert suppressed == [DIRTY_REPLY]
+
+
+@pytest.mark.asyncio
+async def test_regeneration_receive_error_falls_back_to_sentinel(
+    tmp_path: Path, monkeypatch, _patch_sdk_types
+) -> None:
+    """If the regeneration's ``receive_response`` drain raises, the worker logs
+    and falls back to suppress + QUIET_SENTINEL — the future is resolved and no
+    exception escapes ``_handle`` (mirrors the query-error path, but the failure
+    happens during the re-drain rather than the re-query)."""
+    from anna.runtime.scheduler import QUIET_SENTINEL
+
+    sent: list[OutboundMessage] = []
+    worker = _make_worker(tmp_path, sent)
+    # First receive yields the dirty reply; the SECOND receive (regeneration's
+    # drain) raises after the re-query already landed.
+    worker._client = _FakeSequenceClient([DIRTY_REPLY], raise_on_receive=2)
+
+    suppressed = _spy_suppress(worker)
+
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[str] = loop.create_future()
+    # Must not raise out of _handle.
+    await worker._handle(_make_scheduled_event(worker.conversation_key, future))
+
+    assert future.done()
+    assert future.result() == QUIET_SENTINEL
+    # The retry's query landed (called twice) before the drain blew up.
+    assert len(worker._client.queries) == 2
+    # Fallback suppressed the ORIGINAL reply.
+    assert suppressed == [DIRTY_REPLY]
+
+
+@pytest.mark.asyncio
+async def test_executed_tool_with_trailing_markup_is_not_regenerated(
+    tmp_path: Path, monkeypatch, _patch_sdk_types
+) -> None:
+    """A scheduled turn that ACTUALLY executed a tool (ToolUseBlock) AND then
+    trailed leaked markup must NOT be regenerated — re-running would
+    double-execute that tool. Instead it goes straight to today's suppress +
+    QUIET_SENTINEL behavior, with no regeneration query and no regenerating
+    audit marker."""
+    from anna.runtime.scheduler import QUIET_SENTINEL
+
+    sent: list[OutboundMessage] = []
+    worker = _make_worker(tmp_path, sent)
+    # First generation runs a real tool AND leaks markup in its text. A clean
+    # CLEAN_REPLY is queued as the "regeneration" reply that must NEVER be used.
+    worker._client = _FakeSequenceClient(
+        [DIRTY_REPLY, CLEAN_REPLY], first_uses_tool=True
+    )
+
+    audit_names = _capture_audit(monkeypatch)
+    suppressed = _spy_suppress(worker)
+
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[str] = loop.create_future()
+    await worker._handle(_make_scheduled_event(worker.conversation_key, future))
+
+    assert future.done()
+    assert future.result() == QUIET_SENTINEL
+    # Regeneration NOT attempted: only the original query ran.
+    assert len(worker._client.queries) == 1
+    # Fallback suppression ran exactly once, on the ORIGINAL dirty reply.
+    assert suppressed == [DIRTY_REPLY]
+    # No regeneration was even attempted — neither audit marker fired.
+    assert "audit.reply.toolcall_markup_regenerating" not in audit_names
+    assert "audit.reply.toolcall_markup_regenerated" not in audit_names

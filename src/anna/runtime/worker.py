@@ -1394,6 +1394,56 @@ class ConversationWorker:
                 name=f"worker.markup_alert.{conv_key}",
             )
 
+    async def _regenerate_scheduled_reply(
+        self, event: InboundEvent, correction_prompt: str
+    ) -> str | None:
+        """Re-issue a degraded scheduled turn into the SAME SDK session and
+        return the freshly-generated ``reply_text`` (or ``None`` on error).
+
+        Scoped to the scheduler-driven completion-future path only. The
+        original turn leaked tool-call markup as TEXT, which means NO tool
+        actually ran (the model only narrated the calls) — so the failed
+        generation has zero side effects and re-running carries no
+        double-execution risk. We feed a short correction prompt back into
+        the live session and drain a fresh response.
+
+        This is a deliberately stripped-down mirror of the main drain loop in
+        :meth:`_handle`: the scheduled path never mid-flushes (no buffer, no
+        timed drip, no stream subscriber, no tool-use boundary sends), so a
+        plain accumulate-text-blocks loop is the whole story here. On any
+        query/receive exception we log ``worker.regenerate_failed`` and return
+        ``None`` so the caller can fall back to today's suppress behavior;
+        we never raise out of here and never leave the caller's future unset.
+        """
+        try:
+            from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
+        except Exception:  # pragma: no cover - SDK always present in prod
+            AssistantMessage = ResultMessage = TextBlock = None  # type: ignore[assignment,misc]
+
+        reply_chunks: list[str] = []
+        try:
+            await self._client.query(correction_prompt)  # type: ignore[attr-defined]
+            async for msg in self._client.receive_response():  # type: ignore[attr-defined]
+                if AssistantMessage is not None and isinstance(msg, AssistantMessage):
+                    for block in msg.content:
+                        if TextBlock is not None and isinstance(block, TextBlock):
+                            reply_chunks.append(block.text)
+                if ResultMessage is not None and isinstance(msg, ResultMessage):
+                    break
+        except Exception as exc:
+            self._log.error(
+                "worker.regenerate_failed",
+                error=str(exc),
+                conv_key=event.conversation_key,
+                transport=self.transport,
+            )
+            return None
+
+        reply_text = "\n".join(c for c in reply_chunks if c).strip()
+        if not reply_text:
+            reply_text = "(no response)"
+        return reply_text
+
     async def _guarded_send(self, msg: OutboundMessage) -> None:
         """Send ``msg`` unless its text carries leaked tool-call markup.
 
@@ -1498,6 +1548,15 @@ class ConversationWorker:
         # no concurrent-mutation race. ``pending`` is always mutated in
         # place (extend/clear) — never rebound — so the timer sees writes.
         reply_chunks: list[str] = []
+        # Tracks whether ANY real tool actually executed this turn (a
+        # ToolUseBlock was observed). Load-bearing for the scheduled-turn
+        # regeneration guard below: regeneration is only safe when zero tools
+        # ran (a degraded turn that NARRATED its calls as markup has no side
+        # effects). If a tool truly executed AND markup also leaked, re-running
+        # would double-execute that tool — so we must NOT regenerate. Set on
+        # EVERY path (interactive and scheduled) because the ToolUseBlock is
+        # visible in the drain loop regardless of the flush sub-branch.
+        tool_used = False
         loop = asyncio.get_running_loop()
         buffer = _FlushBuffer(last_flush=loop.time())
         # Timed-drip timer (Inbox/2026-06-04 plan). Started ONLY for an
@@ -1572,6 +1631,14 @@ class ConversationWorker:
                                             conv_key=event.conversation_key,
                                         )
                             elif ToolUseBlock is not None and isinstance(block, ToolUseBlock):
+                                # A real tool executed this turn. Record it
+                                # OUTSIDE the flush guard below so it reflects
+                                # BOTH the interactive and scheduled paths (the
+                                # scheduled path skips the flush sub-branch but
+                                # still sees the ToolUseBlock here). The
+                                # scheduled-turn regeneration guard reads this
+                                # to refuse a re-run that would double-execute.
+                                tool_used = True
                                 # Tool-use boundary: the model has stopped
                                 # narrating to invoke a tool. Flush the
                                 # pending narration as its own outbound
@@ -1693,16 +1760,143 @@ class ConversationWorker:
         if event.completion_future is not None and not event.completion_future.done():
             # Scheduled-turn guard: a degraded turn must not resolve the
             # future with leaked tool-call markup, which the scheduler would
-            # otherwise route to the destination transport. Suppress it the
-            # same way the scheduler's QUIET_SENTINEL opt-out does (record a
-            # quiet, non-erroring run) by resolving with the sentinel.
+            # otherwise route to the destination transport.
+            #
+            # Before falling back to the QUIET_SENTINEL suppression (which
+            # silently loses the whole tick), make ONE bounded regeneration
+            # attempt. The leak means the model NARRATED its tool calls as
+            # text instead of executing them, so zero tools ran and the failed
+            # generation has no side effects — re-running the heartbeat into
+            # the same SDK session is safe with no double-execution risk. The
+            # failure is intermittent and probabilistic per-generation
+            # (~1-2 of 26 daily ticks), so a single fresh generation almost
+            # always succeeds. AT MOST one retry — never recurse — so a
+            # persistently degraded model degrades to exactly today's behavior.
             if _contains_unparsed_toolcall_markup(reply_text):
-                await self._emit_markup_suppressed(
-                    reply_text, conv_key=event.conversation_key
-                )
                 from anna.runtime.scheduler import QUIET_SENTINEL
 
-                event.completion_future.set_result(QUIET_SENTINEL)
+                # Exception-safe fallback used by every "give up and go quiet"
+                # branch below. ``_emit_markup_suppressed`` audits/alerts
+                # WITHOUT internal isolation around its own ``audit_event``, so
+                # if that raises the future would be left unresolved — the
+                # scheduler then rescues it only via its 1500s timeout AND
+                # counts the tick as a FAILURE (three auto-disable the
+                # heartbeat). The ``finally`` guarantees the future is ALWAYS
+                # resolved exactly once (the ``done()`` guard prevents a
+                # double set_result if the future was somehow already settled).
+                async def _suppress_and_resolve(text: str) -> None:
+                    try:
+                        await self._emit_markup_suppressed(
+                            text, conv_key=event.conversation_key
+                        )
+                    except Exception as exc:
+                        # ``_emit_markup_suppressed`` calls ``audit_event``
+                        # without isolation, so a disk/audit failure could
+                        # raise here. The ``_run`` loop wraps ``_handle`` in
+                        # try/FINALLY with no ``except`` — an escaping
+                        # exception would kill the worker. Swallow it (log
+                        # only) and fall through to the guaranteed resolution
+                        # so the tick goes quiet instead of crashing.
+                        self._log.warning(
+                            "worker.markup_suppress_failed",
+                            error=str(exc),
+                            conv_key=event.conversation_key,
+                            transport=self.transport,
+                        )
+                    finally:
+                        if not event.completion_future.done():
+                            event.completion_future.set_result(QUIET_SENTINEL)
+
+                # Double-execution guard: regeneration is safe ONLY when zero
+                # tools ran this turn — a degraded turn that narrated its calls
+                # as markup has no side effects, so re-running it is harmless.
+                # If a real tool actually executed AND markup also leaked,
+                # re-running the heartbeat would invoke that tool a SECOND time,
+                # so skip regeneration entirely and fall straight through to
+                # today's suppress + sentinel behavior. (Empirically the leak is
+                # all-or-nothing, but we enforce the invariant rather than
+                # trust it.)
+                if tool_used:
+                    await _suppress_and_resolve(reply_text)
+                    return
+
+                # Step 1: record (exception-isolated, mirroring the alert
+                # code) that we are attempting a regeneration. WARNING level
+                # so the intermittent failure stays visible in the audit log
+                # even when the retry rescues the tick.
+                try:
+                    audit_event(
+                        "audit.reply.toolcall_markup_regenerating",
+                        audit_dir=self._config.audit_dir,
+                        actor="anna",
+                        conv_key=event.conversation_key,
+                        fsync_on_write=self._config.logging.audit.fsync_on_write,
+                        level="WARNING",
+                        transport=self.transport,
+                        char_count=len(reply_text),
+                        markers=_matched_markers(reply_text),
+                        preview=reply_text[:280],
+                    )
+                except Exception as exc:
+                    self._log.warning(
+                        "worker.reply.markup_regenerating_audit_failed",
+                        error=str(exc),
+                        conv_key=event.conversation_key,
+                        transport=self.transport,
+                    )
+
+                # Step 2: re-issue the turn with a short, direct correction
+                # prompt. ``_regenerate_scheduled_reply`` returns the fresh
+                # reply_text, or None if the re-query/re-drain itself errored.
+                correction_prompt = (
+                    "Your previous reply emitted tool-call markup (like "
+                    "<invoke name=...>) as literal text instead of actually "
+                    "executing the tools, so nothing ran. Re-run the heartbeat "
+                    "now from the start, ACTUALLY invoking each tool, and "
+                    "return ONLY the contract-legal final reply (the "
+                    "[[ANNA_NO_OUTPUT]] sentinel if nothing is new, otherwise "
+                    "the compact check-in). Do not describe or print tool "
+                    "calls as text."
+                )
+                regenerated = await self._regenerate_scheduled_reply(
+                    event, correction_prompt
+                )
+
+                # Step 3a: regeneration produced CLEAN text — record the
+                # rescue and resolve the future with it. The scheduler already
+                # treats a bare QUIET_SENTINEL string as a quiet run, so if the
+                # model returned the sentinel we just pass it straight through.
+                if regenerated is not None and not _contains_unparsed_toolcall_markup(
+                    regenerated
+                ):
+                    try:
+                        audit_event(
+                            "audit.reply.toolcall_markup_regenerated",
+                            audit_dir=self._config.audit_dir,
+                            actor="anna",
+                            conv_key=event.conversation_key,
+                            fsync_on_write=self._config.logging.audit.fsync_on_write,
+                            level="WARNING",
+                            transport=self.transport,
+                            char_count=len(regenerated),
+                        )
+                    except Exception as exc:
+                        self._log.warning(
+                            "worker.reply.markup_regenerated_audit_failed",
+                            error=str(exc),
+                            conv_key=event.conversation_key,
+                            transport=self.transport,
+                        )
+                    event.completion_future.set_result(regenerated)
+                    return
+
+                # Step 3b: regeneration errored (None) or the retry ALSO
+                # leaked markup — fall back to EXACTLY today's behavior:
+                # suppress the ORIGINAL reply (audit + log + best-effort
+                # alert) and resolve with the sentinel so the run is recorded
+                # quiet rather than erroring. Exception-safe so a raising audit
+                # can never strand the future.
+                await _suppress_and_resolve(reply_text)
                 return
             event.completion_future.set_result(reply_text)
             return
