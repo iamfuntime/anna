@@ -21,6 +21,7 @@ events. Query text and URLs go to the audit log; raw bodies do not
 
 from __future__ import annotations
 
+import asyncio
 import os
 from typing import Any
 
@@ -32,6 +33,12 @@ from anna.log import audit_event, get_logger
 
 
 _BRAVE_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
+# Bounded retry for transient Brave failures (per-second 429s, 5xx, flaky
+# transport). 1 initial attempt + up to 2 retries. Backoff for retry N
+# (1-indexed) = base * N, i.e. ~1.2s then ~2.4s — Brave's free tier allows
+# 1 query/second, so each delay must clear a full second.
+_WEB_SEARCH_MAX_ATTEMPTS = 3
+_WEB_SEARCH_BACKOFF_SECONDS = 1.2
 _TEXT_CONTENT_TYPES = (
     "text/html",
     "text/plain",
@@ -137,36 +144,92 @@ class WebTools:
         )
 
         client = await self._get_client()
-        try:
-            resp = await client.get(
-                _BRAVE_ENDPOINT,
-                params={"q": query, "count": effective_max},
-                headers={
-                    "X-Subscription-Token": api_key,
-                    "Accept": "application/json",
-                },
-                timeout=cfg.timeout_seconds,
-            )
-        except httpx.TimeoutException as exc:
-            self._audit(
-                "audit.tool.web_search.fail",
-                conv_key=conv_key,
-                level="WARNING",
-                error="timeout",
-                query=query,
-            )
-            raise RuntimeError(
-                f"web_search timed out after {cfg.timeout_seconds}s"
-            ) from exc
-        except httpx.HTTPError as exc:
-            self._audit(
-                "audit.tool.web_search.fail",
-                conv_key=conv_key,
-                level="WARNING",
-                error=str(exc),
-                query=query,
-            )
-            raise RuntimeError(f"web_search transport error: {exc}") from exc
+        # Bounded retry loop. The `.call` audit above fires once, before the
+        # loop. Transient failures (429, 5xx, transport errors) emit a
+        # `.retry` event and back off; only the final exhausted attempt falls
+        # through to the existing `.fail` + raise branches below. Success,
+        # 401, and non-retryable 4xx break out immediately with no retry.
+        resp: httpx.Response | None = None
+        for attempt in range(1, _WEB_SEARCH_MAX_ATTEMPTS + 1):
+            backoff = _WEB_SEARCH_BACKOFF_SECONDS * attempt
+            try:
+                resp = await client.get(
+                    _BRAVE_ENDPOINT,
+                    params={"q": query, "count": effective_max},
+                    headers={
+                        "X-Subscription-Token": api_key,
+                        "Accept": "application/json",
+                    },
+                    timeout=cfg.timeout_seconds,
+                )
+            except httpx.TimeoutException as exc:
+                if attempt < _WEB_SEARCH_MAX_ATTEMPTS:
+                    self._audit(
+                        "audit.tool.web_search.retry",
+                        conv_key=conv_key,
+                        level="INFO",
+                        query=query,
+                        attempt=attempt,
+                        status=None,
+                        backoff_seconds=backoff,
+                    )
+                    await asyncio.sleep(backoff)
+                    continue
+                self._audit(
+                    "audit.tool.web_search.fail",
+                    conv_key=conv_key,
+                    level="WARNING",
+                    error="timeout",
+                    query=query,
+                )
+                raise RuntimeError(
+                    f"web_search timed out after {cfg.timeout_seconds}s"
+                ) from exc
+            except httpx.HTTPError as exc:
+                if attempt < _WEB_SEARCH_MAX_ATTEMPTS:
+                    self._audit(
+                        "audit.tool.web_search.retry",
+                        conv_key=conv_key,
+                        level="INFO",
+                        query=query,
+                        attempt=attempt,
+                        status=None,
+                        backoff_seconds=backoff,
+                    )
+                    await asyncio.sleep(backoff)
+                    continue
+                self._audit(
+                    "audit.tool.web_search.fail",
+                    conv_key=conv_key,
+                    level="WARNING",
+                    error=str(exc),
+                    query=query,
+                )
+                raise RuntimeError(f"web_search transport error: {exc}") from exc
+
+            # Transient HTTP failures: per-second rate limit (429) or upstream
+            # outage (5xx). Retry until attempts are exhausted, then fall
+            # through to the terminal status handling below.
+            if (resp.status_code == 429 or resp.status_code >= 500) and (
+                attempt < _WEB_SEARCH_MAX_ATTEMPTS
+            ):
+                self._audit(
+                    "audit.tool.web_search.retry",
+                    conv_key=conv_key,
+                    level="INFO",
+                    query=query,
+                    attempt=attempt,
+                    status=resp.status_code,
+                    backoff_seconds=backoff,
+                )
+                await asyncio.sleep(backoff)
+                continue
+
+            # Success, 401, non-retryable 4xx, or an exhausted 429/5xx — stop
+            # retrying and let the status handling below decide the outcome.
+            break
+
+        assert resp is not None  # loop always sets resp or raises
 
         if resp.status_code == 401:
             self._audit(

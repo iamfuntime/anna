@@ -186,6 +186,161 @@ async def test_web_search_rejects_empty_query(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# web_search — bounded retry with backoff
+# ---------------------------------------------------------------------------
+
+
+def _sequenced_handler(responses: list[httpx.Response]) -> tuple[Any, list[int]]:
+    """Build a MockTransport handler that returns ``responses`` in order.
+
+    Returns ``(handler, calls)`` where ``calls`` is a one-element list used
+    as a mutable counter of how many times the handler ran (== client.get
+    calls). The last response repeats if more requests arrive than provided.
+    """
+    calls = [0]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        idx = min(calls[0], len(responses) - 1)
+        calls[0] += 1
+        return responses[idx]
+
+    return handler, calls
+
+
+def _patch_sleep(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Patch asyncio.sleep in web_tools so tests don't actually wait.
+
+    Returns a list that records each backoff duration slept.
+    """
+    slept: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        slept.append(seconds)
+
+    import anna.tools.web_tools as web_tools_mod
+
+    monkeypatch.setattr(web_tools_mod.asyncio, "sleep", fake_sleep)
+    return slept
+
+
+@pytest.mark.asyncio
+async def test_web_search_retry_429_then_200(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("BRAVE_SEARCH_API_KEY", "abc")
+    slept = _patch_sleep(monkeypatch)
+    cfg = _make_config(tmp_path)
+    tools = WebTools(config=cfg)
+
+    ok = httpx.Response(
+        200,
+        json={"web": {"results": [{"url": "https://e/1", "title": "T", "description": "D"}]}},
+    )
+    handler, calls = _sequenced_handler([httpx.Response(429, text="slow down"), ok])
+    _install_mock(tools, handler)
+
+    result = await tools.web_search(query="x", max_results=1, conv_key=CONV_KEY)
+    assert "1 results" in result["content"][0]["text"]
+    assert calls[0] == 2  # one 429, one success
+
+    # Exactly one backoff slept, base * attempt(1) == 1.2s.
+    assert slept == [pytest.approx(1.2)]
+
+    events = _read_audit(cfg)
+    names = [e["event"] for e in events]
+    retries = [e for e in events if e["event"] == "audit.tool.web_search.retry"]
+    assert len(retries) == 1
+    assert retries[0]["attempt"] == 1
+    assert retries[0]["status"] == 429
+    assert retries[0]["backoff_seconds"] == pytest.approx(1.2)
+    assert retries[0]["level"] == "INFO"
+    assert "audit.tool.web_search.fail" not in names
+    assert "audit.tool.web_search.complete" in names
+    await tools.aclose()
+
+
+@pytest.mark.asyncio
+async def test_web_search_retry_429_exhausted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("BRAVE_SEARCH_API_KEY", "abc")
+    slept = _patch_sleep(monkeypatch)
+    cfg = _make_config(tmp_path)
+    tools = WebTools(config=cfg)
+
+    handler, calls = _sequenced_handler([httpx.Response(429, text="rate limited")])
+    _install_mock(tools, handler)
+
+    with pytest.raises(RuntimeError, match="HTTP 429"):
+        await tools.web_search(query="x", max_results=1, conv_key=CONV_KEY)
+
+    assert calls[0] == 3  # 1 initial + 2 retries
+    assert slept == [pytest.approx(1.2), pytest.approx(2.4)]
+
+    events = _read_audit(cfg)
+    retries = [e for e in events if e["event"] == "audit.tool.web_search.retry"]
+    fails = [e for e in events if e["event"] == "audit.tool.web_search.fail"]
+    assert [r["attempt"] for r in retries] == [1, 2]
+    assert all(r["status"] == 429 for r in retries)
+    assert len(fails) == 1
+    assert fails[0]["error"] == "quota_exhausted"
+    await tools.aclose()
+
+
+@pytest.mark.asyncio
+async def test_web_search_retry_500_then_200(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("BRAVE_SEARCH_API_KEY", "abc")
+    slept = _patch_sleep(monkeypatch)
+    cfg = _make_config(tmp_path)
+    tools = WebTools(config=cfg)
+
+    ok = httpx.Response(
+        200,
+        json={"web": {"results": [{"url": "https://e/1", "title": "T", "description": "D"}]}},
+    )
+    handler, calls = _sequenced_handler([httpx.Response(500, text="boom"), ok])
+    _install_mock(tools, handler)
+
+    result = await tools.web_search(query="x", max_results=1, conv_key=CONV_KEY)
+    assert "1 results" in result["content"][0]["text"]
+    assert calls[0] == 2
+    assert slept == [pytest.approx(1.2)]
+
+    events = _read_audit(cfg)
+    retries = [e for e in events if e["event"] == "audit.tool.web_search.retry"]
+    assert len(retries) == 1
+    assert retries[0]["status"] == 500
+    assert "audit.tool.web_search.fail" not in [e["event"] for e in events]
+    await tools.aclose()
+
+
+@pytest.mark.asyncio
+async def test_web_search_no_retry_on_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("BRAVE_SEARCH_API_KEY", "abc")
+    slept = _patch_sleep(monkeypatch)
+    cfg = _make_config(tmp_path)
+    tools = WebTools(config=cfg)
+
+    handler, calls = _sequenced_handler(
+        [httpx.Response(200, json={"web": {"results": []}})]
+    )
+    _install_mock(tools, handler)
+
+    result = await tools.web_search(query="zzzz", max_results=1, conv_key=CONV_KEY)
+    assert "no Brave results" in result["content"][0]["text"]
+    assert calls[0] == 1
+    assert slept == []  # zero sleeps on the happy path
+
+    events = _read_audit(cfg)
+    assert "audit.tool.web_search.retry" not in [e["event"] for e in events]
+    await tools.aclose()
+
+
+# ---------------------------------------------------------------------------
 # web_fetch
 # ---------------------------------------------------------------------------
 
