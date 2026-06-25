@@ -28,7 +28,9 @@ from anna.runtime.supervisor import Supervisor
 from anna.runtime.worker import (
     ConversationWorker,
     _contains_unparsed_toolcall_markup,
+    _markup_is_strong,
     _matched_markers,
+    _should_suppress_markup,
 )
 from anna.transports.base import InboundEvent, OutboundMessage
 
@@ -166,6 +168,59 @@ def test_matched_markers_empty_for_benign() -> None:
 
 
 # ---------------------------------------------------------------------------
+# _markup_is_strong / _should_suppress_markup: marker strength + tool gate
+# ---------------------------------------------------------------------------
+
+
+def test_lone_opening_invoke_is_weak() -> None:
+    # A single opening-invoke tag, no closing tag, no parameter tag → WEAK.
+    assert _contains_unparsed_toolcall_markup('Sure.\n<invoke name="Bash">') is True
+    assert _markup_is_strong('Sure.\n<invoke name="Bash">') is False
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        INCIDENT_TEXT,  # invoke + parameter + close + bare mcp line
+        # Two distinct markers: opening invoke AND a parameter tag.
+        '<invoke name="Bash">\n<parameter name="command">ls</parameter>',
+        # Paired open + close is two distinct markers.
+        '<invoke name="Bash"></invoke>',
+        # A single self-sufficient marker (closing tag) with no invoke open.
+        "Done.\n</invoke>",
+        # A single self-sufficient marker (bare whole-line mcp tool name).
+        "Checking.\nmcp__anna_google__gmail_list_unread",
+    ],
+)
+def test_strong_markup_detected(text: str) -> None:
+    assert _markup_is_strong(text) is True
+
+
+@pytest.mark.parametrize("text", ["", "   ", "All clear.", None])
+def test_no_markup_is_not_strong(text) -> None:
+    assert _markup_is_strong(text) is False
+
+
+def test_should_suppress_strong_markup_regardless_of_tool() -> None:
+    # Behavior 1: full leaked markup as prose is suppressed whether or not a
+    # tool ran (the heartbeat / INCIDENT_TEXT case).
+    assert _should_suppress_markup(INCIDENT_TEXT, tool_used=False) is True
+    assert _should_suppress_markup(INCIDENT_TEXT, tool_used=True) is True
+
+
+def test_should_suppress_weak_markup_only_without_tool() -> None:
+    # Behavior 2 vs 3: a lone partial fragment is delivered when a real tool
+    # call executed, but suppressed when no tool ran (prose-instead-of-call).
+    assert _should_suppress_markup(WEAK_TRAILING_REPLY, tool_used=True) is False
+    assert _should_suppress_markup(WEAK_TRAILING_REPLY, tool_used=False) is True
+
+
+def test_should_suppress_clean_text_never() -> None:
+    assert _should_suppress_markup(CLEAN_REPLY, tool_used=False) is False
+    assert _should_suppress_markup(CLEAN_REPLY, tool_used=True) is False
+
+
+# ---------------------------------------------------------------------------
 # _guarded_send: drops on markup, sends when clean
 # ---------------------------------------------------------------------------
 
@@ -220,6 +275,61 @@ async def test_guarded_send_passes_clean_text(tmp_path: Path) -> None:
 
     assert len(sent) == 1
     assert sent[0].text == "Here is your morning brief."
+
+
+@pytest.mark.asyncio
+async def test_guarded_send_delivers_weak_fragment_when_tool_used(tmp_path: Path) -> None:
+    # Behavior 2 at the send layer: a weak trailing fragment on a turn that
+    # executed a real tool is delivered, not suppressed.
+    sent: list[OutboundMessage] = []
+    worker = _make_worker(tmp_path, sent)
+
+    await worker._guarded_send(
+        OutboundMessage(
+            conversation_key=worker.conversation_key,
+            text=WEAK_TRAILING_REPLY,
+        ),
+        tool_used=True,
+    )
+
+    assert len(sent) == 1
+    assert sent[0].text == WEAK_TRAILING_REPLY
+
+
+@pytest.mark.asyncio
+async def test_guarded_send_drops_weak_fragment_without_tool(tmp_path: Path) -> None:
+    # Behavior 3 at the send layer: the SAME weak fragment is suppressed when no
+    # tool ran (default tool_used=False), preserving the prose-instead-of-call
+    # protection.
+    sent: list[OutboundMessage] = []
+    worker = _make_worker(tmp_path, sent)
+
+    await worker._guarded_send(
+        OutboundMessage(
+            conversation_key=worker.conversation_key,
+            text=WEAK_TRAILING_REPLY,
+        )
+    )
+
+    assert sent == []
+
+
+@pytest.mark.asyncio
+async def test_guarded_send_drops_strong_markup_even_when_tool_used(tmp_path: Path) -> None:
+    # Behavior 1 at the send layer: strong leaked markup is dropped even on a
+    # turn that executed a real tool.
+    sent: list[OutboundMessage] = []
+    worker = _make_worker(tmp_path, sent)
+
+    await worker._guarded_send(
+        OutboundMessage(
+            conversation_key=worker.conversation_key,
+            text=INCIDENT_TEXT,
+        ),
+        tool_used=True,
+    )
+
+    assert sent == []
 
 
 @pytest.mark.asyncio
@@ -364,6 +474,13 @@ DIRTY_REPLY = (
 DIRTY_REPLY_2 = (
     "Checking your inbox now.\n"
     "mcp__anna_google__gmail_list_unread"
+)
+# A WEAK leak: otherwise-good prose carrying a SINGLE stray/partial opening
+# invoke fragment — no closing tag, no parameter tag, no second distinct
+# marker. On a turn that executed a real tool this is delivered, not eaten.
+WEAK_TRAILING_REPLY = (
+    "Morning brief: two threads need a reply, calendar is clear.\n"
+    '<invoke name="Bash">'
 )
 # A contract-legal compact check-in with no tool-call markup.
 CLEAN_REPLY = "Morning brief: two threads need a reply, calendar is clear."
@@ -656,19 +773,59 @@ async def test_regeneration_receive_error_falls_back_to_sentinel(
 
 
 @pytest.mark.asyncio
-async def test_executed_tool_with_trailing_markup_is_not_regenerated(
+async def test_executed_tool_with_weak_trailing_fragment_is_delivered(
     tmp_path: Path, monkeypatch, _patch_sdk_types
 ) -> None:
-    """A scheduled turn that ACTUALLY executed a tool (ToolUseBlock) AND then
-    trailed leaked markup must NOT be regenerated — re-running would
-    double-execute that tool. Instead it goes straight to today's suppress +
-    QUIET_SENTINEL behavior, with no regeneration query and no regenerating
-    audit marker."""
+    """Behavior 2 (scheduled path): a scheduled turn that ACTUALLY executed a
+    tool (ToolUseBlock) and whose prose carries only a single WEAK/partial
+    markup fragment (a lone opening invoke tag) is DELIVERED — the future
+    resolves with that original reply text, NOT the sentinel. No suppression,
+    no regeneration, no regenerating audit marker. (Softened guard: re-running
+    would double-execute the tool, and the fragment is almost always ANNA
+    quoting markup in otherwise-good prose.)"""
     from anna.runtime.scheduler import QUIET_SENTINEL
 
     sent: list[OutboundMessage] = []
     worker = _make_worker(tmp_path, sent)
-    # First generation runs a real tool AND leaks markup in its text. A clean
+    # First generation runs a real tool AND trails a WEAK fragment. CLEAN_REPLY
+    # is queued as a "regeneration" reply that must NEVER be used.
+    worker._client = _FakeSequenceClient(
+        [WEAK_TRAILING_REPLY, CLEAN_REPLY], first_uses_tool=True
+    )
+
+    audit_names = _capture_audit(monkeypatch)
+    suppressed = _spy_suppress(worker)
+
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[str] = loop.create_future()
+    await worker._handle(_make_scheduled_event(worker.conversation_key, future))
+
+    assert future.done()
+    # Delivered: the original reply text, not the sentinel.
+    assert future.result() == WEAK_TRAILING_REPLY
+    assert future.result() != QUIET_SENTINEL
+    # No regeneration: only the original query ran.
+    assert len(worker._client.queries) == 1
+    # Suppression never ran and neither audit marker fired.
+    assert suppressed == []
+    assert "audit.reply.toolcall_markup_regenerating" not in audit_names
+    assert "audit.reply.toolcall_markup_regenerated" not in audit_names
+
+
+@pytest.mark.asyncio
+async def test_executed_tool_with_strong_markup_is_suppressed_not_regenerated(
+    tmp_path: Path, monkeypatch, _patch_sdk_types
+) -> None:
+    """Invariant preserved: a scheduled turn that ACTUALLY executed a tool AND
+    leaked STRONG markup (full invoke+parameter block) must NOT be regenerated
+    — re-running would double-execute that tool. It goes straight to suppress +
+    QUIET_SENTINEL with no regeneration query and no regenerating audit
+    marker."""
+    from anna.runtime.scheduler import QUIET_SENTINEL
+
+    sent: list[OutboundMessage] = []
+    worker = _make_worker(tmp_path, sent)
+    # First generation runs a real tool AND leaks STRONG markup. A clean
     # CLEAN_REPLY is queued as the "regeneration" reply that must NEVER be used.
     worker._client = _FakeSequenceClient(
         [DIRTY_REPLY, CLEAN_REPLY], first_uses_tool=True
@@ -690,3 +847,30 @@ async def test_executed_tool_with_trailing_markup_is_not_regenerated(
     # No regeneration was even attempted — neither audit marker fired.
     assert "audit.reply.toolcall_markup_regenerating" not in audit_names
     assert "audit.reply.toolcall_markup_regenerated" not in audit_names
+
+
+@pytest.mark.asyncio
+async def test_no_tool_full_markup_still_suppressed_via_regeneration(
+    tmp_path: Path, monkeypatch, _patch_sdk_types
+) -> None:
+    """Behavior 3 (scheduled path): a turn with NO real tool call whose prose
+    is full leaked markup still enters the guard. With both generations dirty it
+    falls back to suppress + QUIET_SENTINEL — protection preserved even when the
+    model substituted prose for a tool call."""
+    from anna.runtime.scheduler import QUIET_SENTINEL
+
+    sent: list[OutboundMessage] = []
+    worker = _make_worker(tmp_path, sent)
+    # No tool ran; both generations leak strong markup.
+    worker._client = _FakeSequenceClient([DIRTY_REPLY, DIRTY_REPLY_2])
+
+    suppressed = _spy_suppress(worker)
+
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[str] = loop.create_future()
+    await worker._handle(_make_scheduled_event(worker.conversation_key, future))
+
+    assert future.done()
+    assert future.result() == QUIET_SENTINEL
+    # Suppressed the ORIGINAL dirty reply.
+    assert suppressed == [DIRTY_REPLY]

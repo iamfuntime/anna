@@ -112,8 +112,18 @@ def _allowed_tool_names(
 # mid-sentence (not on its own line) does NOT match — keeping false
 # positives near zero. Each pattern below is one strong, self-sufficient
 # marker of leaked function-call syntax.
+# The lone OPENING-invoke tag is the one "weak" marker: by itself (no closing
+# tag, no parameter tag, no second distinct marker) it is the fragment that
+# legitimately shows up when ANNA quotes/explains markup mid-prose, or trails a
+# turn that DID make a real structured tool call. Every other marker below is
+# independently "strong" (a closing tag, a parameter tag, the function_calls
+# wrappers, or a bare whole-line mcp tool name), and any two distinct markers
+# together are strong regardless.
+_OPEN_INVOKE_PATTERN: re.Pattern[str] = re.compile(
+    r"<(?:antml:)?invoke\b[^>]*\bname\s*=", re.IGNORECASE
+)
 _TOOLCALL_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"<(?:antml:)?invoke\b[^>]*\bname\s*=", re.IGNORECASE),
+    _OPEN_INVOKE_PATTERN,
     re.compile(r"</(?:antml:)?invoke>", re.IGNORECASE),
     re.compile(r"<(?:antml:)?parameter\b[^>]*\bname\s*=", re.IGNORECASE),
     re.compile(r"</?(?:antml:)?function_calls>", re.IGNORECASE),
@@ -158,6 +168,49 @@ def _matched_markers(text: str) -> list[str]:
         return []
     scannable = _strip_code_spans(text)
     return [pattern.pattern for pattern in _TOOLCALL_PATTERNS if pattern.search(scannable)]
+
+
+def _markup_is_strong(text: str) -> bool:
+    """True if the leaked markup in ``text`` is a STRONG signal of a tool call
+    emitted as prose (rather than a stray/partial fragment).
+
+    Strong means either (a) two or more DISTINCT markers matched (e.g. an
+    opening invoke tag AND a parameter tag, or a paired open/close), or (b) any
+    single marker OTHER than the lone opening-invoke tag matched (a closing
+    tag, a parameter tag, the function_calls wrappers, or a bare whole-line mcp
+    tool name — each self-sufficient evidence of a full leak). The single
+    lone opening-invoke fragment is the only WEAK case.
+    """
+    if not text:
+        return False
+    scannable = _strip_code_spans(text)
+    matched = [p for p in _TOOLCALL_PATTERNS if p.search(scannable)]
+    if not matched:
+        return False
+    if len(matched) >= 2:
+        return True
+    # Exactly one distinct marker: strong unless it is the lone opening-invoke.
+    return matched[0] is not _OPEN_INVOKE_PATTERN
+
+
+def _should_suppress_markup(text: str, *, tool_used: bool = False) -> bool:
+    """Suppression decision for ``text`` given whether a real tool call ran.
+
+    Suppress when the markup is STRONG, OR when it is weak (a lone partial
+    opening-invoke fragment) AND no real structured tool call executed this
+    turn. Equivalently: a weak/partial fragment on a turn that DID execute a
+    real tool call is delivered. ``tool_used`` defaults to ``False`` so callers
+    with no notion of tool execution (e.g. the scheduler defense-in-depth pass)
+    keep the strict, fail-closed behavior.
+    """
+    if not text:
+        return False
+    if not _contains_unparsed_toolcall_markup(text):
+        return False
+    if _markup_is_strong(text):
+        return True
+    # Weak fragment: deliver only when a real tool call actually executed.
+    return not tool_used
 
 
 SendCallback = Callable[[OutboundMessage], Awaitable[None]]
@@ -1449,15 +1502,27 @@ class ConversationWorker:
             reply_text = "(no response)"
         return reply_text
 
-    async def _guarded_send(self, msg: OutboundMessage) -> None:
+    async def _guarded_send(
+        self, msg: OutboundMessage, *, tool_used: bool = False
+    ) -> None:
         """Send ``msg`` unless its text carries leaked tool-call markup.
 
         Interactive send sites route through here so a degraded turn can
         never post literal function-call syntax to a transport. On
         detection the send is dropped after auditing/alerting. SDK-error
         strings (our own text) bypass this and use ``self._send`` directly.
+
+        ``tool_used`` reports whether a real structured tool call executed
+        this turn. A weak/partial markup fragment (a lone opening invoke tag)
+        on such a turn is delivered rather than suppressed — it is almost
+        always ANNA quoting a fragment in otherwise-good prose. Strong markup
+        (two-plus distinct markers, or any self-sufficient marker) is always
+        suppressed, as is weak markup when no tool ran (the genuine
+        prose-instead-of-tool-call failure). ``tool_used`` defaults to
+        ``False`` so callers with no notion of tool execution keep the strict,
+        fail-closed behavior.
         """
-        if _contains_unparsed_toolcall_markup(msg.text):
+        if _should_suppress_markup(msg.text, tool_used=tool_used):
             await self._emit_markup_suppressed(
                 msg.text, conv_key=msg.conversation_key
             )
@@ -1679,10 +1744,17 @@ class ConversationWorker:
                                                 c for c in buffer.pending if c
                                             ).strip()
                                             if txt:
-                                                await self._guarded_send(OutboundMessage(
-                                                    conversation_key=event.conversation_key,
-                                                    text=txt,
-                                                ))
+                                                # ``tool_used`` is True here (set
+                                                # just above on this ToolUseBlock),
+                                                # so a weak trailing fragment in the
+                                                # narration is delivered, not eaten.
+                                                await self._guarded_send(
+                                                    OutboundMessage(
+                                                        conversation_key=event.conversation_key,
+                                                        text=txt,
+                                                    ),
+                                                    tool_used=tool_used,
+                                                )
                                             buffer.pending.clear()
                                             buffer.last_flush = loop.time()
                     if ResultMessage is not None and isinstance(msg, ResultMessage):
@@ -1777,7 +1849,14 @@ class ConversationWorker:
             # (~1-2 of 26 daily ticks), so a single fresh generation almost
             # always succeeds. AT MOST one retry — never recurse — so a
             # persistently degraded model degrades to exactly today's behavior.
-            if _contains_unparsed_toolcall_markup(reply_text):
+            # ``_should_suppress_markup`` softens the gate: a WEAK/partial
+            # fragment (a lone opening invoke tag) on a turn that DID execute a
+            # real tool call is delivered (falls through to ``set_result``
+            # below), since it is almost always ANNA quoting a fragment in
+            # otherwise-good prose. STRONG markup, or any markup on a turn with
+            # no real tool call, still enters this block and is regenerated or
+            # suppressed exactly as before.
+            if _should_suppress_markup(reply_text, tool_used=tool_used):
                 from anna.runtime.scheduler import QUIET_SENTINEL
 
                 # Exception-safe fallback used by every "give up and go quiet"
@@ -1815,12 +1894,13 @@ class ConversationWorker:
                 # Double-execution guard: regeneration is safe ONLY when zero
                 # tools ran this turn — a degraded turn that narrated its calls
                 # as markup has no side effects, so re-running it is harmless.
-                # If a real tool actually executed AND markup also leaked,
-                # re-running the heartbeat would invoke that tool a SECOND time,
-                # so skip regeneration entirely and fall straight through to
-                # today's suppress + sentinel behavior. (Empirically the leak is
-                # all-or-nothing, but we enforce the invariant rather than
-                # trust it.)
+                # Reaching this branch with ``tool_used`` set means a real tool
+                # executed AND the leaked markup was STRONG (a weak/partial
+                # fragment plus a tool call was already delivered above by
+                # ``_should_suppress_markup``). Re-running the heartbeat would
+                # invoke that tool a SECOND time, so skip regeneration entirely
+                # and fall straight through to today's suppress + sentinel
+                # behavior.
                 if tool_used:
                     await _suppress_and_resolve(reply_text)
                     return
@@ -1915,10 +1995,13 @@ class ConversationWorker:
         # cancelled in the ``finally`` above, so this read needs no lock.
         final_text = "\n".join(c for c in buffer.pending if c).strip()
         if final_text:
-            await self._guarded_send(OutboundMessage(
-                conversation_key=event.conversation_key,
-                text=final_text,
-            ))
+            await self._guarded_send(
+                OutboundMessage(
+                    conversation_key=event.conversation_key,
+                    text=final_text,
+                ),
+                tool_used=tool_used,
+            )
         elif not reply_chunks:
             # Edge case: the SDK returned no text at all and no tools were
             # called — preserve the "(no response)" fallback so the
