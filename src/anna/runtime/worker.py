@@ -1322,13 +1322,26 @@ class ConversationWorker:
         mechanism. Cancellation is the normal teardown path and is re-raised.
         """
         interval = float(self._flush_interval)
-        # Poll at the interval. Clamp to a sane floor so a tiny configured
-        # interval (or a test clock) still wakes promptly without busy-looping.
-        poll = max(interval, 0.05)
+        # Poll at a 1-second floor (or the interval, if smaller) so the timer
+        # task is frequently runnable and the event loop services it on its
+        # own timer wheel instead of leaving it starved behind the turn's
+        # receive coroutine. The actual SEND cadence stays at ``interval``:
+        # the ``loop.time() - last_flush < interval`` guard below is evaluated
+        # every tick, so a real flush still only happens once the full
+        # interval has elapsed since the last message of any kind.
+        poll = min(interval, 1.0)
         loop = asyncio.get_running_loop()
         try:
             while True:
                 await asyncio.sleep(poll)
+                # TEMP instrumentation (flush-stall diagnosis) — remove after confirmation
+                self._log.debug(
+                    "worker.periodic_flush.tick",
+                    pending=len(buffer.pending),
+                    since_last_flush=loop.time() - buffer.last_flush,
+                    conv_key=event.conversation_key,
+                    transport=self.transport,
+                )
                 async with buffer.lock:
                     if not buffer.pending:
                         continue
@@ -1679,6 +1692,13 @@ class ConversationWorker:
                     if AssistantMessage is not None and isinstance(msg, AssistantMessage):
                         for block in msg.content:
                             if TextBlock is not None and isinstance(block, TextBlock):
+                                # TEMP instrumentation (flush-stall diagnosis) — remove after confirmation
+                                self._log.debug(
+                                    "worker.receive.text_block",
+                                    length=len(block.text),
+                                    conv_key=event.conversation_key,
+                                    transport=self.transport,
+                                )
                                 reply_chunks.append(block.text)
                                 # Append the narration to the shared flush
                                 # buffer under the lock so the timer task

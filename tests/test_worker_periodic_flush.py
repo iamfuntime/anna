@@ -656,3 +656,95 @@ async def test_drip_send_failure_logged_timer_survives(
     assert failed[0][1]["transport"] == "slack"
     # The later drip delivered the (retained) text — timer kept running.
     assert [m.text for m in sent] == ["retryme"]
+
+
+# ---------------------------------------------------------------------------
+# Direct ``_periodic_flush_loop`` coverage of the 1s poll-floor change:
+# the loop must wake frequently (poll == min(interval, 1.0)) yet still gate
+# the actual SEND on the full ``interval`` via the elapsed-since-last_flush
+# guard. These drive the loop task directly with a controllable clock.
+# ---------------------------------------------------------------------------
+
+
+def _make_buffer(clock: _FakeClock, *, pending: list[str] | None = None):
+    """Build a ``_FlushBuffer`` seeded with the current clock as ``last_flush``
+    (mirroring the turn-start seeding in ``_handle``)."""
+    from anna.runtime.worker import _FlushBuffer
+
+    return _FlushBuffer(last_flush=clock(), pending=list(pending or []))
+
+
+@pytest.mark.asyncio
+async def test_loop_flushes_when_interval_elapsed_send_before_clear(
+    tmp_path: Path, clock: _FakeClock
+) -> None:
+    """(a) With pending text and >= interval elapsed, the loop flushes:
+    it sends BEFORE clearing ``pending`` (the lock is held across the send,
+    pending still carries the text at send time) and stamps ``last_flush``."""
+    sent: list[OutboundMessage] = []
+    observed_pending_at_send: list[list[str]] = []
+    worker = _make_worker(tmp_path, sent, flush_seconds=30)
+
+    async def _recording_send(msg: OutboundMessage) -> None:
+        # Capture pending AS IT IS at send time to prove send-before-clear.
+        observed_pending_at_send.append(list(buffer.pending))
+        sent.append(msg)
+
+    worker._send = _recording_send  # type: ignore[method-assign]
+
+    buffer = _make_buffer(clock, pending=["partial narration"])
+    event = _make_event()
+
+    task = asyncio.create_task(worker._periodic_flush_loop(event, buffer))
+    try:
+        # The interval has elapsed since last_flush → the loop must drip.
+        clock.advance(31)
+        await _wait_for(lambda: len(sent) >= 1)
+    finally:
+        # Cancel-and-await teardown (mirrors the turn's finally).
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    assert [m.text for m in sent] == ["partial narration"]
+    # Send happened while the text was still in ``pending`` (send-before-clear).
+    assert observed_pending_at_send == [["partial narration"]]
+    # The buffer was cleared and ``last_flush`` re-stamped to "now".
+    assert buffer.pending == []
+    assert buffer.last_flush == clock()
+
+
+@pytest.mark.asyncio
+async def test_loop_does_not_flush_before_interval_despite_fast_poll(
+    tmp_path: Path, clock: _FakeClock
+) -> None:
+    """(b) The 1s poll floor wakes the loop many times, but with < interval
+    elapsed since ``last_flush`` it must NOT send — no premature / double
+    drip. Pending and ``last_flush`` are left untouched."""
+    sent: list[OutboundMessage] = []
+    worker = _make_worker(tmp_path, sent, flush_seconds=30)
+
+    buffer = _make_buffer(clock, pending=["not yet"])
+    seeded_last_flush = buffer.last_flush
+    event = _make_event()
+
+    task = asyncio.create_task(worker._periodic_flush_loop(event, buffer))
+    try:
+        # Only 5s elapse — well under the 30s interval. Spin generously so the
+        # fast (1s-floor) poll loop iterates many times with the clock fake's
+        # instant sleep, confirming it never sends.
+        clock.advance(5)
+        await _spin(60)
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    assert sent == []
+    # Nothing was consumed or re-stamped.
+    assert buffer.pending == ["not yet"]
+    assert buffer.last_flush == seeded_last_flush
