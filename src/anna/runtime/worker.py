@@ -1334,14 +1334,6 @@ class ConversationWorker:
         try:
             while True:
                 await asyncio.sleep(poll)
-                # TEMP instrumentation (flush-stall diagnosis) — remove after confirmation
-                self._log.debug(
-                    "worker.periodic_flush.tick",
-                    pending=len(buffer.pending),
-                    since_last_flush=loop.time() - buffer.last_flush,
-                    conv_key=event.conversation_key,
-                    transport=self.transport,
-                )
                 async with buffer.lock:
                     if not buffer.pending:
                         continue
@@ -1692,13 +1684,6 @@ class ConversationWorker:
                     if AssistantMessage is not None and isinstance(msg, AssistantMessage):
                         for block in msg.content:
                             if TextBlock is not None and isinstance(block, TextBlock):
-                                # TEMP instrumentation (flush-stall diagnosis) — remove after confirmation
-                                self._log.debug(
-                                    "worker.receive.text_block",
-                                    length=len(block.text),
-                                    conv_key=event.conversation_key,
-                                    transport=self.transport,
-                                )
                                 reply_chunks.append(block.text)
                                 # Append the narration to the shared flush
                                 # buffer under the lock so the timer task
