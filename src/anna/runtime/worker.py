@@ -240,6 +240,50 @@ class _FlushBuffer:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
+@dataclass
+class _StreamError:
+    """Sentinel the stream consumer enqueues into a live turn's queue when
+    the SDK message stream raises mid-turn. :meth:`ConversationWorker._turn_messages`
+    re-raises the wrapped exception so the drain sites' existing
+    receive-error handling fires instead of the drain hanging on a queue
+    that will never fill.
+    """
+
+    exc: Exception
+
+
+# Marker the bundled CLI embeds in the user message it injects when a
+# background task completes (``<task-notification>...``). Used to recognize
+# a CLI-injected notification that straddles a live turn start so its
+# unsolicited turn is routed through the idle path instead of terminating
+# the live drain with a foreign ResultMessage.
+_TASK_NOTIFICATION_MARKER = "<task-notification>"
+
+# Belt-and-suspenders per-message wait bound for a live drain. Backstops the
+# two hang paths the queue design introduces (a cleanly-ended stream mid-turn
+# that the consumer failed to sentinel, and a wedged ``_unsolicited_open``
+# diverting the turn's messages): rather than the worker hanging until the
+# idle watcher (30min-hours), the turn fails through the existing
+# receive-error path. Deliberately GENEROUS — in-turn silence is legitimate
+# while a tool runs (delegate sub-agents default to a 300s wall-clock cap;
+# CLI tool timeouts top out at 600s), so 30 minutes cannot false-positive a
+# healthy turn.
+_TURN_MESSAGE_TIMEOUT_SECONDS = 1800.0
+
+
+def _user_message_text(msg: Any) -> str:
+    """Best-effort plain text of a UserMessage's content (str or block list)."""
+    content = getattr(msg, "content", "")
+    if isinstance(content, str):
+        return content
+    parts: list[str] = []
+    for block in content or []:
+        text = getattr(block, "text", None)
+        if isinstance(text, str):
+            parts.append(text)
+    return "\n".join(parts)
+
+
 class ConversationWorker:
     """An async worker that owns one Claude SDK session for one conversation."""
 
@@ -305,6 +349,25 @@ class ConversationWorker:
         self._idle_task: asyncio.Task[None] | None = None
         self._stopping = False
         self._client: object | None = None
+        # Single-owned-stream consumer state (stale-turn fix). One long-lived
+        # task per SDK client exclusively owns ``client.receive_messages()``
+        # and routes every message either into the ACTIVE turn's queue
+        # (``_turn_queue`` set) or through the idle/unsolicited path. Without
+        # it, an unsolicited turn (e.g. the task-notification turn the CLI
+        # runs when a background agent finishes while the worker is idle)
+        # buffers unread in the shared stream and the next live drain
+        # delivers the STALE reply first, then breaks on the stale
+        # ResultMessage — one-turn-behind until restart. See
+        # ``_consume_stream`` / ``_route_idle``.
+        self._consumer_task: asyncio.Task[None] | None = None
+        self._turn_queue: asyncio.Queue[Any] | None = None
+        self._idle_chunks: list[str] = []
+        self._unsolicited_open = False
+        self._idle_route_lock = asyncio.Lock()
+        # Unsolicited-turn texts that completed WHILE a live turn was
+        # registered. Delivery is deferred to ``_end_turn`` so the live
+        # turn's own reply always reaches the transport first.
+        self._deferred_unsolicited: list[str] = []
         self._closed_out = False
         self._operator_short_name: str | None = None
         # Set true once the idle watcher has fired its close callback so we
@@ -774,6 +837,416 @@ class ConversationWorker:
         client = ClaudeSDKClient(options=options)
         await client.__aenter__()
         self._client = client
+        # Start the owned stream consumer for this client so idle-time
+        # (unsolicited) turns are consumed and delivered as they complete
+        # instead of buffering into the next live drain.
+        self._ensure_stream_consumer()
+
+    # ------------------------------------------------------------------
+    # Owned message-stream consumer (stale-turn fix)
+    # ------------------------------------------------------------------
+    #
+    # The SDK client exposes ONE buffered message stream shared by every
+    # ``receive_response()`` caller: unconsumed messages are handed to the
+    # NEXT caller. When the CLI runs an unsolicited turn while the worker
+    # is idle (a finished background task injects a ``<task-notification>``
+    # user message and the model replies), that turn's AssistantMessage(s)
+    # and ResultMessage sit unread — and the next live drain first delivers
+    # the STALE reply, then breaks on the stale ResultMessage before the
+    # fresh reply is ever read. Every turn thereafter runs one-turn-behind.
+    #
+    # Fix: exactly one long-lived consumer task owns ``receive_messages()``
+    # and routes each message. Turn ACTIVE (``_turn_queue`` set, no
+    # unsolicited turn straddling): push into the per-turn queue the drain
+    # sites read via ``_turn_messages``. Otherwise: idle path — accumulate
+    # assistant text and, at the unsolicited turn's ResultMessage, deliver
+    # the text through the guarded send path and DISCARD the Result so it
+    # can never terminate a future live drain. Background-agent completions
+    # therefore deliver immediately, which is the desired behavior.
+
+    def _ensure_stream_consumer(self) -> None:
+        """Start (or restart) the consumer task for the current client.
+
+        Idempotent: a live consumer is left alone. A consumer that exited —
+        normal stream end at client teardown, exhaustion of a scripted test
+        fake, or the give-up path after repeated idle failures — is
+        replaced. Called from ``_ensure_client`` and at every turn start
+        (``_begin_turn``) so a dead consumer never strands a turn. NOTE: no
+        ``_stopping`` guard — ``stop()`` sets that flag BEFORE ``_closeout``
+        runs the checkpoint-summary turn, which still needs a consumer.
+        """
+        if self._client is None:
+            return
+        if self._consumer_task is not None and not self._consumer_task.done():
+            return
+        if self._consumer_task is not None:
+            # Replacing a DEAD consumer: its stream position is lost, so a
+            # half-observed unsolicited turn can never complete. Reset the
+            # idle-route state so a wedged ``_unsolicited_open`` cannot
+            # divert the next live turn to the idle path.
+            self._reset_idle_route_state("consumer_replaced")
+        self._consumer_task = asyncio.create_task(
+            self._consume_stream(self._client),
+            name=f"worker.stream.{self.conversation_key}",
+        )
+
+    def _reset_idle_route_state(self, reason: str) -> None:
+        """Drop half-tracked unsolicited-turn state (stream position lost).
+
+        Called whenever the consumer's stream generator is re-created after
+        a failure or a dead consumer is replaced: the closing ResultMessage
+        of a partially-observed unsolicited turn may never arrive, and a
+        wedged ``_unsolicited_open`` would divert the ENTIRE next live turn
+        to the idle path (hung drain, reply deferred an idle-gap late).
+        """
+        if self._idle_chunks:
+            self._log.info(
+                "worker.stream.idle_chunks_discarded",
+                char_count=sum(len(c) for c in self._idle_chunks),
+                reason=reason,
+            )
+        self._idle_chunks.clear()
+        self._unsolicited_open = False
+
+    async def _stop_stream_consumer(self) -> None:
+        """Cancel-and-await the consumer task and reset the idle-route state.
+
+        Called before client teardown and before closeout eviction (which
+        drains ``receive_response`` on the shared client directly — two
+        concurrent readers would steal each other's messages).
+
+        Only the consumer task's OWN cancellation (from our explicit
+        ``task.cancel()``) is suppressed. If the current task is itself
+        being cancelled (worker stop/restart), that cancellation must
+        propagate — re-raise it rather than swallow (mirrors the flush-task
+        teardown in ``_dispatch_turn``).
+        """
+        task = self._consumer_task
+        if task is not None:
+            self._consumer_task = None
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                current = asyncio.current_task()
+                if current is not None and current.cancelling() > 0:
+                    raise
+            except Exception as exc:
+                self._log.warning(
+                    "worker.stream_consumer.teardown_failed", error=str(exc)
+                )
+        self._reset_idle_route_state("consumer_stopped")
+        if self._deferred_unsolicited:
+            self._log.info(
+                "worker.stream.deferred_replies_discarded",
+                count=len(self._deferred_unsolicited),
+                char_count=sum(len(t) for t in self._deferred_unsolicited),
+            )
+            self._deferred_unsolicited.clear()
+
+    async def _consume_stream(self, client: Any) -> None:
+        """Exclusively read ``client``'s message stream and route messages.
+
+        Runs for the life of the client. Prefers ``receive_messages()`` (the
+        real SDK's unfiltered stream); falls back to ``receive_response()``
+        for minimal stubs. A normal stream end (client closed, or a scripted
+        fake exhausted) simply ends the task — ``_ensure_stream_consumer``
+        starts a fresh one at the next turn. Exceptions never die silently:
+        they are logged, surfaced to any ACTIVE turn via a ``_StreamError``
+        sentinel (so the existing sdk_receive_failed error path fires
+        instead of a hung drain), and — when idle — retried a bounded number
+        of times before giving up until the next turn restarts the consumer.
+        """
+        failures = 0
+        while True:
+            try:
+                receive = getattr(client, "receive_messages", None)
+                stream = receive() if receive is not None else client.receive_response()
+                async for msg in stream:
+                    failures = 0
+                    await self._route_message(msg)
+                # Clean stream end. The real SDK's receive_messages can
+                # terminate CLEANLY mid-turn (Query.receive_messages breaks
+                # on the {"type": "end"} control message when the CLI dies
+                # or the transport closes) without raising. A live drain
+                # would otherwise block forever on its queue — fail the turn
+                # through the existing receive-error path instead.
+                queue = self._turn_queue
+                if queue is not None:
+                    queue.put_nowait(
+                        _StreamError(
+                            RuntimeError("SDK message stream ended mid-turn")
+                        )
+                    )
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._log.error("worker.stream_consumer.failed", error=str(exc))
+                queue = self._turn_queue
+                if queue is not None:
+                    # Fail the live turn through its queue; the drain raises
+                    # and the existing receive-error path answers the
+                    # operator. The next turn's ``_ensure_stream_consumer``
+                    # restarts us.
+                    queue.put_nowait(_StreamError(exc))
+                    return
+                failures += 1
+                if failures >= 3 or self._stopping or self._client is not client:
+                    return
+                # Re-creating the stream generator loses our position in any
+                # half-observed unsolicited turn: its closing ResultMessage
+                # may never be seen, and a wedged ``_unsolicited_open`` would
+                # divert the ENTIRE next live turn to the idle path. Drop the
+                # half-tracked state before retrying.
+                self._reset_idle_route_state("consumer_retry")
+                await asyncio.sleep(1.0)
+
+    def _is_injected_user_message(self, msg: Any) -> bool:
+        """True for a CLI-injected task-notification user message.
+
+        Our own inbounds go out through ``query()`` and are not echoed back
+        (no replay-user-messages flag), and tool results carry
+        ``tool_use_result``/``parent_tool_use_id`` — so a bare user message
+        carrying the ``<task-notification>`` marker is the CLI waking the
+        model about a finished background task.
+        """
+        try:
+            from claude_agent_sdk import UserMessage
+        except ImportError:
+            return False
+        if UserMessage is None or not isinstance(msg, UserMessage):
+            return False
+        if getattr(msg, "tool_use_result", None) is not None:
+            return False
+        if getattr(msg, "parent_tool_use_id", None) is not None:
+            return False
+        return _TASK_NOTIFICATION_MARKER in _user_message_text(msg)
+
+    async def _route_message(self, msg: Any) -> None:
+        """Route one stream message: live turn queue or the idle path.
+
+        The active-turn branch is deliberately synchronous (``put_nowait``,
+        no await between the ``_turn_queue`` read and the put) so a
+        concurrent ``_end_turn`` can never interleave and drop a message.
+        ``_unsolicited_open`` keeps a turn that STRADDLES a live turn start
+        (the CLI serializes turns, so an in-flight unsolicited turn's
+        remaining messages arrive before the live query's response) on the
+        idle path until its own ResultMessage closes it. A task-notification
+        user message observed while a turn is active likewise opens the
+        idle path — its unsolicited turn must not feed the live drain.
+        """
+        queue = self._turn_queue
+        if queue is not None and not self._unsolicited_open:
+            if self._is_injected_user_message(msg):
+                await self._route_idle(msg)
+                return
+            queue.put_nowait(msg)
+            return
+        await self._route_idle(msg)
+
+    async def _route_idle(self, msg: Any) -> None:
+        """Handle a message that belongs to no live turn (unsolicited turn).
+
+        Thin locking wrapper over :meth:`_route_idle_locked` — the lock
+        serializes the consumer task against ``_end_turn``'s boundary work
+        (deferred flush + leftover replay, which holds the lock across the
+        WHOLE batch and calls the locked variant directly) so the chunk
+        list and open flag always mutate in stream order.
+        """
+        async with self._idle_route_lock:
+            await self._route_idle_locked(msg)
+
+    async def _route_idle_locked(self, msg: Any) -> None:
+        """Body of :meth:`_route_idle`. MUST be called holding
+        ``_idle_route_lock``.
+
+        Assistant text accumulates in ``_idle_chunks``; the turn's
+        ResultMessage delivers the accumulated text through the guarded send
+        path and is then DISCARDED so it can never terminate a future live
+        drain.
+        """
+        try:
+            from claude_agent_sdk import (
+                AssistantMessage,
+                ResultMessage,
+                SystemMessage,
+                TextBlock,
+                UserMessage,
+            )
+        except ImportError:
+            AssistantMessage = ResultMessage = SystemMessage = TextBlock = UserMessage = None  # type: ignore[assignment,misc]
+
+        if ResultMessage is not None and isinstance(msg, ResultMessage):
+            self._unsolicited_open = False
+            text = "\n".join(c for c in self._idle_chunks if c).strip()
+            self._idle_chunks.clear()
+            if text:
+                if self._turn_queue is not None:
+                    # A live turn is registered: defer delivery to
+                    # ``_end_turn`` so the turn's own reply reaches the
+                    # transport first.
+                    self._deferred_unsolicited.append(text)
+                else:
+                    await self._deliver_unsolicited_text(text)
+            return
+        if UserMessage is not None and isinstance(msg, UserMessage):
+            # A user message on the idle path is CLI-injected (operator
+            # inbounds run through ``query()`` on a live turn): it opens
+            # an unsolicited model turn that a ResultMessage will close.
+            self._unsolicited_open = True
+            if self._is_injected_user_message(msg):
+                self._log.info("worker.stream.task_notification_user")
+            return
+        if AssistantMessage is not None and isinstance(msg, AssistantMessage):
+            self._unsolicited_open = True
+            for block in msg.content:
+                if TextBlock is not None and isinstance(block, TextBlock):
+                    self._idle_chunks.append(block.text)
+            return
+        if (
+            SystemMessage is not None
+            and isinstance(msg, SystemMessage)
+            and getattr(msg, "subtype", None) == "task_notification"
+        ):
+            # Observational only: a system task notification does NOT
+            # open an unsolicited turn (no guarantee a model turn
+            # follows), so it can never wedge routing away from a live
+            # turn. Other idle system/stream messages are dropped.
+            self._log.info(
+                "worker.stream.task_notification",
+                status=getattr(msg, "status", None),
+            )
+
+    async def _deliver_unsolicited_text(self, text: str) -> None:
+        """Send a completed unsolicited turn's text via the guarded path."""
+        # Instrumentation (daemon journal only): an idle-time (unsolicited)
+        # turn's text is being delivered.
+        self._log.info(
+            "worker.stream.unsolicited_reply_delivered",
+            char_count=len(text),
+        )
+        try:
+            await self._guarded_send(
+                OutboundMessage(
+                    conversation_key=self.conversation_key,
+                    text=text,
+                )
+            )
+        except Exception as exc:
+            self._log.warning(
+                "worker.stream.unsolicited_send_failed",
+                error=str(exc),
+            )
+
+    def _begin_turn(self) -> asyncio.Queue[Any]:
+        """Register a live turn with the stream consumer; return its queue.
+
+        Must be called BEFORE ``self._client.query(...)`` so every message
+        the CLI emits in response is routed to this turn. Also (re)starts
+        the consumer, covering consumers that previously exited.
+        """
+        queue: asyncio.Queue[Any] = asyncio.Queue()
+        self._turn_queue = queue
+        self._ensure_stream_consumer()
+        return queue
+
+    async def _end_turn(self, queue: asyncio.Queue[Any]) -> None:
+        """Deregister the live turn, flush deferred unsolicited replies,
+        and re-route any queued leftovers.
+
+        Order is load-bearing: (1) deregister, (2) deliver unsolicited
+        texts that completed during the turn (deferred by ``_route_idle``
+        so the turn's own reply landed first — flushed under the idle
+        lock so the consumer cannot deliver a newer unsolicited reply
+        ahead of them), (3) replay messages that landed in the turn queue
+        AFTER the turn's own ResultMessage (e.g. a background task's turn
+        serialized right behind it) through the idle handler so nothing is
+        lost at the boundary. The lock is held across BOTH steps: leftovers
+        are OLDER stream positions than anything the consumer routes idle
+        once the queue is deregistered, so the consumer's concurrent idle
+        routing must queue behind this boundary work or a newer Result
+        could close ``_unsolicited_open`` before its text replays (orphaned
+        text / re-wedge). Never raises (except cancellation): each step is
+        exception-isolated because callers invoke this from ``finally``
+        blocks.
+        """
+        self._turn_queue = None
+        async with self._idle_route_lock:
+            while self._deferred_unsolicited:
+                await self._deliver_unsolicited_text(
+                    self._deferred_unsolicited.pop(0)
+                )
+            while True:
+                try:
+                    msg = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+                if isinstance(msg, _StreamError):
+                    continue
+                try:
+                    await self._route_idle_locked(msg)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    self._log.warning(
+                        "worker.stream.leftover_route_failed", error=str(exc)
+                    )
+
+    async def _turn_messages(self, queue: asyncio.Queue[Any]) -> AsyncIterator[Any]:
+        """Yield this turn's messages until (and including) its ResultMessage.
+
+        Replaces the direct ``receive_response()`` drains: only messages the
+        consumer routed to THIS turn's queue — i.e. only Results arriving
+        after our own ``query()`` — can reach the caller. A ``_StreamError``
+        sentinel re-raises the consumer's exception so the callers' existing
+        receive-error paths fire instead of the drain hanging forever; the
+        ``_TURN_MESSAGE_TIMEOUT_SECONDS`` bound backstops any hang path the
+        sentinel machinery misses.
+        """
+        try:
+            from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
+        except ImportError:
+            AssistantMessage = ResultMessage = TextBlock = None  # type: ignore[assignment,misc]
+
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        saw_text = False
+        while True:
+            try:
+                msg = await asyncio.wait_for(
+                    queue.get(), timeout=_TURN_MESSAGE_TIMEOUT_SECONDS
+                )
+            except TimeoutError:
+                raise RuntimeError(
+                    "no SDK message within "
+                    f"{_TURN_MESSAGE_TIMEOUT_SECONDS:.0f}s mid-turn"
+                ) from None
+            if isinstance(msg, _StreamError):
+                raise msg.exc
+            if ResultMessage is not None and isinstance(msg, ResultMessage):
+                elapsed = loop.time() - started
+                if saw_text and elapsed < 2.0:
+                    # Tripwire: the historic stale-turn signature was a live
+                    # drain that "answered" near-instantly with buffered text
+                    # from the PREVIOUS turn. Journal-only breadcrumb if this
+                    # ever regresses (fast genuine replies also log; fine).
+                    self._log.info(
+                        "worker.turn.fast_result_with_text",
+                        elapsed_seconds=round(elapsed, 3),
+                    )
+                yield msg
+                return
+            if (
+                AssistantMessage is not None
+                and isinstance(msg, AssistantMessage)
+                and any(
+                    TextBlock is not None and isinstance(b, TextBlock) and b.text
+                    for b in msg.content
+                )
+            ):
+                saw_text = True
+            yield msg
 
     def _assemble_system_prompt(
         self,
@@ -992,6 +1465,11 @@ class ConversationWorker:
         await self._write_checkpoint_now(summary, kind="closeout")
 
         # ----- 2. Per-core-file eviction ---------------------------------
+        # eviction.py drains ``receive_response()`` on the shared client
+        # directly, so the owned stream consumer must be stopped first — two
+        # concurrent readers would steal each other's messages. The worker
+        # is shutting down; the consumer is not restarted.
+        await self._stop_stream_consumer()
         for which in CORE_FILES.keys():
             spec = CORE_FILES[which]
             lock = await self._supervisor.acquire(f"core/{spec.name}")
@@ -1209,29 +1687,37 @@ class ConversationWorker:
             "covered, decisions, open threads, anything to remember next time "
             "we resume. Two to four short paragraphs. Plain text."
         )
-        try:
-            await self._client.query(prompt)  # type: ignore[attr-defined]
-        except Exception as exc:
-            self._log.warning("worker.closeout.query_failed", error=str(exc))
-            return f"(closeout query failed: {exc})"
-
         chunks: list[str] = []
+        turn_queue = self._begin_turn()
         try:
-            async for msg in self._client.receive_response():  # type: ignore[attr-defined]
-                if AssistantMessage is not None and isinstance(msg, AssistantMessage):
-                    for block in msg.content:
-                        if TextBlock is not None and isinstance(block, TextBlock):
-                            chunks.append(block.text)
-                if ResultMessage is not None and isinstance(msg, ResultMessage):
-                    break
-        except Exception as exc:
-            self._log.warning("worker.closeout.receive_failed", error=str(exc))
-            return f"(closeout receive failed: {exc})"
+            try:
+                await self._client.query(prompt)  # type: ignore[attr-defined]
+            except Exception as exc:
+                self._log.warning("worker.closeout.query_failed", error=str(exc))
+                return f"(closeout query failed: {exc})"
+
+            try:
+                async for msg in self._turn_messages(turn_queue):
+                    if AssistantMessage is not None and isinstance(msg, AssistantMessage):
+                        for block in msg.content:
+                            if TextBlock is not None and isinstance(block, TextBlock):
+                                chunks.append(block.text)
+                    if ResultMessage is not None and isinstance(msg, ResultMessage):
+                        break
+            except Exception as exc:
+                self._log.warning("worker.closeout.receive_failed", error=str(exc))
+                return f"(closeout receive failed: {exc})"
+        finally:
+            await self._end_turn(turn_queue)
 
         text = "\n".join(c for c in chunks if c).strip()
         return text or "(empty closeout summary)"
 
     async def _close_client(self) -> None:
+        # The stream consumer reads the client's message stream; stop it
+        # first so it cannot race the disconnect. No-op when _closeout
+        # already stopped it ahead of eviction.
+        await self._stop_stream_consumer()
         if self._client is None:
             return
         try:
@@ -1488,9 +1974,10 @@ class ConversationWorker:
             AssistantMessage = ResultMessage = TextBlock = None  # type: ignore[assignment,misc]
 
         reply_chunks: list[str] = []
+        turn_queue = self._begin_turn()
         try:
             await self._client.query(correction_prompt)  # type: ignore[attr-defined]
-            async for msg in self._client.receive_response():  # type: ignore[attr-defined]
+            async for msg in self._turn_messages(turn_queue):
                 if AssistantMessage is not None and isinstance(msg, AssistantMessage):
                     for block in msg.content:
                         if TextBlock is not None and isinstance(block, TextBlock):
@@ -1505,6 +1992,8 @@ class ConversationWorker:
                 transport=self.transport,
             )
             return None
+        finally:
+            await self._end_turn(turn_queue)
 
         reply_text = "\n".join(c for c in reply_chunks if c).strip()
         if not reply_text:
@@ -1555,6 +2044,31 @@ class ConversationWorker:
         # checkpoint failure never blocks the turn.
         await self._maybe_periodic_checkpoint()
 
+        # Stale-turn fix: register this turn with the owned stream consumer
+        # BEFORE the query is written so every message the CLI emits in
+        # response routes to THIS turn (and a straddling unsolicited turn
+        # keeps draining through the idle path until its own ResultMessage
+        # closes it). The turn stays registered until ``_dispatch_turn`` —
+        # query, drain, AND the final sends — fully returns, so the turn's
+        # own reply always precedes any re-routed leftover (unsolicited)
+        # messages; ``_end_turn`` then deregisters and replays post-Result
+        # leftovers to the idle path on every exit path.
+        turn_queue = self._begin_turn()
+        try:
+            await self._dispatch_turn(event, turn_queue)
+        finally:
+            await self._end_turn(turn_queue)
+
+    async def _dispatch_turn(
+        self, event: InboundEvent, turn_queue: asyncio.Queue[Any]
+    ) -> None:
+        """Run one live turn: query, drain ``turn_queue``, dispatch the reply.
+
+        Extracted from :meth:`_handle` so the turn-registration lifecycle
+        (``_begin_turn`` / ``_end_turn``) wraps the ENTIRE turn including
+        the final sends. Body unchanged apart from draining the per-turn
+        queue (via ``_turn_messages``) instead of ``receive_response()``.
+        """
         try:
             from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock, ToolUseBlock
         except ImportError:
@@ -1684,7 +2198,7 @@ class ConversationWorker:
             self._dirty = True
 
             try:
-                async for msg in self._client.receive_response():  # type: ignore[attr-defined]
+                async for msg in self._turn_messages(turn_queue):
                     if AssistantMessage is not None and isinstance(msg, AssistantMessage):
                         for block in msg.content:
                             if TextBlock is not None and isinstance(block, TextBlock):
