@@ -215,9 +215,19 @@ class RuntimeConfig(BaseModel):
     # hot-reload, so a change here takes effect on the next daemon restart.
     model: str | None = None
 
+    # Fallback model for the main conversation loop. Passed through to the
+    # SDK as ``ClaudeAgentOptions.fallback_model`` (CLI ``--fallback-model``):
+    # when the primary ``model`` is overloaded or not available (which should
+    # include subscription usage-cap exhaustion), the CLI transparently serves
+    # the turn on this model instead of erroring. ``None`` (unset) preserves
+    # today's behavior — no flag passed, a capped/overloaded primary fails the
+    # turn. Same value grammar as ``model``. Restart-gated like everything
+    # else in anna.yaml.
+    fallback_model: str | None = None
+
     visibility: RuntimeVisibilityConfig = Field(default_factory=RuntimeVisibilityConfig)
 
-    @field_validator("model")
+    @field_validator("model", "fallback_model")
     @classmethod
     def _validate_model(cls, v: str | None) -> str | None:
         return validate_model_string(v)

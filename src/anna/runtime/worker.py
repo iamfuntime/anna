@@ -727,6 +727,10 @@ class ConversationWorker:
             # runtime.* directly), so it takes the model straight off config.
             # None inherits the CLI/account default — today's behavior exactly.
             model=self._config.runtime.model,
+            # Automatic fallback when the primary model is overloaded or
+            # unavailable (incl. usage-cap exhaustion). None = no fallback
+            # flag passed, a failed primary fails the turn (prior behavior).
+            fallback_model=self._config.runtime.fallback_model,
             # In-process MCP servers. Dict keys become the MCP server
             # prefixes in the SDK's allowed_tools naming convention
             # (``mcp__<server>__<tool>``). anna_self_edit is always

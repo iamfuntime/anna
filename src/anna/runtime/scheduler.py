@@ -335,6 +335,24 @@ class Scheduler:
                 )
                 return
 
+            # Blank-output guard (2026-07-02 incident: deals-watch emitted a
+            # single stray character on a quiet run instead of the sentinel,
+            # and it flushed to the operator's DM as a blank message). A reply
+            # with no alphanumeric characters — empty, whitespace-only, or a
+            # lone punctuation mark — is never a legitimate scheduled post.
+            # Suppress it identically to the quiet-sentinel path so the run
+            # still counts as a success and last_fired_at advances.
+            if reply is not None and not any(ch.isalnum() for ch in reply):
+                self._log.warning(
+                    "scheduler.blank_output_suppress",
+                    schedule_id=schedule.id,
+                    reply_len=len(reply),
+                )
+                await self._record_success(
+                    schedule, reply, started_at=started_at, suppressed=True
+                )
+                return
+
             # Defense-in-depth tool-call-markup guard. The worker already
             # suppresses leaked function-call syntax before resolving the
             # completion future (resolving with QUIET_SENTINEL, handled
