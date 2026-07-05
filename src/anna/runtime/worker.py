@@ -409,35 +409,52 @@ class ConversationWorker:
 
     async def stop(self) -> None:
         self._stopping = True
+        current = asyncio.current_task()
         # Cancel the idle watcher first so it cannot fire a redundant close
-        # callback while stop() is mid-flight.
-        if self._idle_task is not None:
-            self._idle_task.cancel()
+        # callback while stop() is mid-flight. EXCEPT when stop() is running
+        # INSIDE the idle watcher's own task (the idle-close path:
+        # _idle_watch -> router callback -> stop()): cancelling it there is a
+        # SELF-cancel whose swallowed CancelledError leaves the task's
+        # ``cancelling()`` count permanently raised. _stop_stream_consumer
+        # later reads that count as "worker stop is being cancelled" and
+        # re-raises out of _closeout, aborting stop() before _close_client —
+        # the SDK's `claude` subprocess then leaks (one per closed worker).
+        # The watcher needs no cancel here anyway: it returns on its own
+        # right after the close callback.
+        idle_task = self._idle_task
+        self._idle_task = None
+        if idle_task is not None and idle_task is not current:
+            idle_task.cancel()
             try:
-                await self._idle_task
+                await idle_task
             except (asyncio.CancelledError, Exception):
                 pass
-            self._idle_task = None
-        if self._task is not None:
-            self._task.cancel()
+        task = self._task
+        self._task = None
+        if task is not None and task is not current:
+            task.cancel()
             try:
-                await self._task
+                await task
             except (asyncio.CancelledError, Exception):
                 pass
-            self._task = None
         # _closeout writes the checkpoint and runs eviction. It MUST run
         # before the SDK client is closed (eviction needs the client to
         # propose evictions). The flag guards against double-run if stop()
         # is called twice (e.g. idle-watcher and router shutdown race).
-        if not self._closed_out and self._client is not None:
-            try:
-                await self._closeout()
-            except Exception as exc:
-                self._log.error("worker.closeout_failed", error=str(exc))
-            finally:
-                self._closed_out = True
-        await self._close_client()
-        self._log.info("worker.complete")
+        # The outer try/finally guarantees the SDK client is disconnected
+        # no matter what closeout raises — including BaseExceptions like
+        # CancelledError that bypass the ``except Exception`` below.
+        try:
+            if not self._closed_out and self._client is not None:
+                try:
+                    await self._closeout()
+                except Exception as exc:
+                    self._log.error("worker.closeout_failed", error=str(exc))
+                finally:
+                    self._closed_out = True
+        finally:
+            await self._close_client()
+            self._log.info("worker.complete")
 
     async def restart(self) -> None:
         await self.stop()
@@ -1716,16 +1733,21 @@ class ConversationWorker:
     async def _close_client(self) -> None:
         # The stream consumer reads the client's message stream; stop it
         # first so it cannot race the disconnect. No-op when _closeout
-        # already stopped it ahead of eviction.
-        await self._stop_stream_consumer()
-        if self._client is None:
-            return
+        # already stopped it ahead of eviction. try/finally: even if the
+        # consumer teardown raises (e.g. _stop_stream_consumer re-raising a
+        # genuine cancellation of the stopping task), the SDK client MUST
+        # still be disconnected — a skipped __aexit__ leaks the bundled
+        # `claude` subprocess for the life of the service.
         try:
-            await self._client.__aexit__(None, None, None)  # type: ignore[attr-defined]
-        except Exception as exc:
-            self._log.warning("worker.client_close_failed", error=str(exc))
+            await self._stop_stream_consumer()
         finally:
+            client = self._client
             self._client = None
+            if client is not None:
+                try:
+                    await client.__aexit__(None, None, None)  # type: ignore[attr-defined]
+                except Exception as exc:
+                    self._log.warning("worker.client_close_failed", error=str(exc))
 
     async def _build_image_prompt(
         self, query_text: str, images: list[ImageAttachment]

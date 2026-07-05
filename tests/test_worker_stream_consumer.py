@@ -548,6 +548,123 @@ async def test_system_task_notification_is_observational_only(tmp_path: Path) ->
         await worker._stop_stream_consumer()
 
 
+class _TrackedCloseClient(_StreamClient):
+    """`_StreamClient` that counts ``__aexit__`` (disconnect) calls.
+
+    ``fail_close`` makes the disconnect raise, for the swallow-and-log
+    teardown path.
+    """
+
+    def __init__(self, *, fail_close: bool = False) -> None:
+        super().__init__()
+        self.aexit_calls = 0
+        self.fail_close = fail_close
+
+    async def __aexit__(self, *_a):
+        self.aexit_calls += 1
+        if self.fail_close:
+            raise RuntimeError("transport already gone")
+        return None
+
+
+def _closeout_ready_worker(
+    tmp_path: Path, client: _TrackedCloseClient
+) -> ConversationWorker:
+    """Worker wired to ``client`` with a scripted closeout-summary reply."""
+    sent: list[OutboundMessage] = []
+    worker = _make_worker(tmp_path, sent)
+    client.on_query = lambda prompt: _reply("closeout summary")
+    worker._client = client
+    worker._ensure_stream_consumer()
+    return worker
+
+
+@pytest.mark.asyncio
+async def test_stop_disconnects_sdk_client(tmp_path: Path) -> None:
+    """(g) Worker closeout must terminate the SDK client: stop() awaits the
+    client's ``__aexit__`` (which ends the bundled ``claude`` subprocess)
+    exactly once and clears the handle."""
+    client = _TrackedCloseClient()
+    worker = _closeout_ready_worker(tmp_path, client)
+
+    await asyncio.wait_for(worker.stop(), timeout=10)
+
+    assert client.aexit_calls == 1
+    assert worker._client is None
+    assert worker._consumer_task is None
+    # Idempotent: a second stop() (idle-watcher / router-shutdown race)
+    # neither double-disconnects nor raises.
+    await asyncio.wait_for(worker.stop(), timeout=10)
+    assert client.aexit_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_idle_close_stop_inside_watcher_task_disconnects_client(
+    tmp_path: Path,
+) -> None:
+    """(g) THE subprocess-leak regression. In production the idle watcher
+    task itself awaits the router callback, which awaits worker.stop() — so
+    stop() runs INSIDE the task registered as ``_idle_task``. Cancelling
+    that task from within left its ``cancelling()`` count raised, which
+    ``_stop_stream_consumer`` re-raised as CancelledError out of _closeout,
+    skipping ``_close_client`` — the checkpoint landed but the SDK's
+    ``claude`` subprocess leaked, one per closed worker."""
+    client = _TrackedCloseClient()
+    worker = _closeout_ready_worker(tmp_path, client)
+
+    async def _idle_watcher_fires() -> None:
+        # Shape of _idle_watch -> router _idle_close_callback -> stop().
+        await worker.stop()
+
+    watcher = asyncio.create_task(_idle_watcher_fires())
+    worker._idle_task = watcher
+
+    # Before the fix the task died with CancelledError here and the client
+    # was never disconnected.
+    await asyncio.wait_for(asyncio.shield(watcher), timeout=10)
+
+    assert client.aexit_calls == 1
+    assert worker._client is None
+    assert worker._closed_out is True
+
+
+@pytest.mark.asyncio
+async def test_stop_disconnects_client_when_checkpoint_write_raises(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """(g, robustness) A checkpoint-write crash inside _closeout must not
+    skip the disconnect: stop() logs closeout_failed and still awaits
+    ``__aexit__`` exactly once."""
+    import anna.runtime.worker as worker_mod
+
+    def _boom(**_kwargs):
+        raise RuntimeError("disk on fire")
+
+    monkeypatch.setattr(worker_mod, "write_checkpoint", _boom)
+
+    client = _TrackedCloseClient()
+    worker = _closeout_ready_worker(tmp_path, client)
+
+    await asyncio.wait_for(worker.stop(), timeout=10)
+
+    assert client.aexit_calls == 1
+    assert worker._client is None
+    assert worker._closed_out is True
+
+
+@pytest.mark.asyncio
+async def test_stop_swallows_client_disconnect_failure(tmp_path: Path) -> None:
+    """(g, robustness) A failing disconnect is logged, not raised: stop()
+    completes normally and drops the client handle."""
+    client = _TrackedCloseClient(fail_close=True)
+    worker = _closeout_ready_worker(tmp_path, client)
+
+    await asyncio.wait_for(worker.stop(), timeout=10)
+
+    assert client.aexit_calls == 1
+    assert worker._client is None
+
+
 @pytest.mark.asyncio
 async def test_unsolicited_turn_with_empty_text_sends_nothing(tmp_path: Path) -> None:
     """An unsolicited turn that produced no text (e.g. tool-only) delivers
