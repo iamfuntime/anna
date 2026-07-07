@@ -134,6 +134,21 @@ def test_build_options_passes_runtime_model_through(tmp_path: Path) -> None:
     assert options.model == "opus"
 
 
+def test_build_options_effort_defaults_to_none(tmp_path: Path) -> None:
+    """Unset runtime.effort → options.effort is None (SDK default 'high')."""
+    worker = _make_worker(tmp_path)
+    options = worker._build_options()
+    assert options.effort is None
+
+
+def test_build_options_passes_runtime_effort_through(tmp_path: Path) -> None:
+    """A set runtime.effort is wired into ClaudeAgentOptions.effort."""
+    worker = _make_worker(tmp_path)
+    worker._config.runtime.effort = "xhigh"
+    options = worker._build_options()
+    assert options.effort == "xhigh"
+
+
 def test_build_options_mounts_google_server_when_enabled(tmp_path: Path) -> None:
     worker = _make_worker(tmp_path, with_google=True)
     options = worker._build_options()

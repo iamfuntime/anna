@@ -787,6 +787,12 @@ class SubAgentRunner:
             # layers (runtime.model fallback → anna.yaml agents.<slug>.model →
             # frontmatter grants.model). None inherits the CLI/account default.
             model=resolved.model,
+            # Reasoning-effort for this sub-agent. Unlike model, the grant
+            # fallback layer seeds effort=None (runtime.effort is main-loop
+            # only), so this is set only by agents.<slug>.effort or
+            # frontmatter grants.effort; None falls through to the SDK
+            # default ("high").
+            effort=resolved.effort,
             # Resolved MCP servers only. Never anna_self_edit, anna_google,
             # or anna_delegate — build_mcp_servers enforces that.
             mcp_servers=mcp_servers,

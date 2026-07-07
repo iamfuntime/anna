@@ -773,6 +773,7 @@ class ConversationWorker:
         self._log.info(
             "worker.model.resolved",
             model=self._config.runtime.model or "<cli-default>",
+            effort=self._config.runtime.effort or "<sdk-default>",
         )
 
         return ClaudeAgentOptions(
@@ -811,6 +812,12 @@ class ConversationWorker:
             # unavailable (incl. usage-cap exhaustion). None = no fallback
             # flag passed, a failed primary fails the turn (prior behavior).
             fallback_model=self._config.runtime.fallback_model,
+            # Reasoning-effort level for the main loop
+            # (low|medium|high|xhigh|max). None = no effort flag passed, the
+            # SDK applies its own default ("high"). Main-loop only:
+            # sub-agents do NOT inherit this (their grant fallback layer
+            # seeds effort=None — see grants._fallback_layer).
+            effort=self._config.runtime.effort,
             # In-process MCP servers. Dict keys become the MCP server
             # prefixes in the SDK's allowed_tools naming convention
             # (``mcp__<server>__<tool>``). anna_self_edit is always

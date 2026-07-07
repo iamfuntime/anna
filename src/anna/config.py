@@ -69,6 +69,33 @@ def validate_model_string(value: str | None) -> str | None:
     )
 
 
+# Valid Claude Agent SDK reasoning-effort levels (ClaudeAgentOptions.effort).
+# Mirrors the SDK's EffortLevel literal; when effort is None/unset the SDK
+# applies its own default, which is "high".
+_EFFORT_LEVELS: frozenset[str] = frozenset({"low", "medium", "high", "xhigh", "max"})
+
+
+def validate_effort_string(value: str | None) -> str | None:
+    """Light validator for a configurable reasoning-effort level.
+
+    ``None``/unset is always valid and means "no ``effort=`` passed to the
+    SDK" — the SDK then applies its own default (``"high"``). A set value
+    must be one of the SDK's effort levels
+    (``low``/``medium``/``high``/``xhigh``/``max``); input is
+    case-insensitive and normalized to lowercase. Anything else is rejected
+    at config load with a clear error listing the accepted values.
+    """
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if normalized in _EFFORT_LEVELS:
+        return normalized
+    raise ValueError(
+        f"effort must be one of {sorted(_EFFORT_LEVELS)} "
+        f"(unset = SDK default 'high'); got {value!r}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # ANNA_HOME resolution
 # ---------------------------------------------------------------------------
@@ -225,12 +252,28 @@ class RuntimeConfig(BaseModel):
     # else in anna.yaml.
     fallback_model: str | None = None
 
+    # Reasoning-effort level for the MAIN conversation loop, passed through
+    # to the SDK as ``ClaudeAgentOptions.effort``. One of
+    # low | medium | high | xhigh | max (case-insensitive, normalized to
+    # lowercase). ``None`` (unset) means no ``effort=`` passed — the SDK
+    # applies its own default, which is "high". Deliberately NOT inherited by
+    # sub-agents (unlike ``model``): the grant fallback layer seeds
+    # ``effort=None``, so an override-less sub-agent falls through to the SDK
+    # default regardless of this setting. Restart-gated like the rest of
+    # anna.yaml.
+    effort: str | None = None
+
     visibility: RuntimeVisibilityConfig = Field(default_factory=RuntimeVisibilityConfig)
 
     @field_validator("model", "fallback_model")
     @classmethod
     def _validate_model(cls, v: str | None) -> str | None:
         return validate_model_string(v)
+
+    @field_validator("effort")
+    @classmethod
+    def _validate_effort(cls, v: str | None) -> str | None:
+        return validate_effort_string(v)
 
 
 class SlackTransportConfig(BaseModel):
@@ -721,10 +764,25 @@ class AgentGrants(BaseModel):
     # clamp here.
     model: str | None = None
 
+    # Per-agent reasoning-effort override, passed through to the SDK as
+    # ``ClaudeAgentOptions.effort``. Same scalar REPLACE semantics as
+    # ``model``: ``None``/unset passes the lower layer through, a set value
+    # (low|medium|high|xhigh|max, case-insensitive) replaces it. NOTE the
+    # grant fallback layer deliberately seeds ``effort=None`` — sub-agents
+    # do NOT inherit ``runtime.effort`` — so an override-less agent falls
+    # through to the SDK default ("high"). Like ``model``, effort is
+    # free-form (not pool-resolved): it cannot escalate capability.
+    effort: str | None = None
+
     @field_validator("model")
     @classmethod
     def _validate_model(cls, v: str | None) -> str | None:
         return validate_model_string(v)
+
+    @field_validator("effort")
+    @classmethod
+    def _validate_effort(cls, v: str | None) -> str | None:
+        return validate_effort_string(v)
 
 
 class SubagentsConfig(BaseModel):
@@ -1385,9 +1443,9 @@ def _resolve_config_path() -> Path:
 def _apply_env_overrides(data: dict[str, Any]) -> dict[str, Any]:
     """Layer env-var overrides on top of the parsed YAML.
 
-    The two we honor explicitly are ANNA_LOG_LEVEL and ANNA_LOG_FORMAT, which
-    the .env file documents as override knobs. Anything else in the YAML is
-    treated as authoritative.
+    The ones we honor explicitly are ANNA_LOG_LEVEL, ANNA_LOG_FORMAT, and
+    ANNA_RUNTIME_EFFORT, which the .env file documents as override knobs.
+    Anything else in the YAML is treated as authoritative.
     """
     level = os.environ.get("ANNA_LOG_LEVEL")
     if level:
@@ -1396,6 +1454,14 @@ def _apply_env_overrides(data: dict[str, Any]) -> dict[str, Any]:
     fmt = os.environ.get("ANNA_LOG_FORMAT")
     if fmt:
         data.setdefault("logging", {})["format"] = fmt
+
+    # Reasoning-effort override for the main loop. Same precedence as
+    # ANNA_LOG_LEVEL: the env var, when set, wins over the YAML value.
+    # Validation (low|medium|high|xhigh|max) happens downstream in
+    # RuntimeConfig, so a garbage env value fails config load loudly.
+    effort = os.environ.get("ANNA_RUNTIME_EFFORT")
+    if effort:
+        data.setdefault("runtime", {})["effort"] = effort
 
     # Admin destinations fall back to .env so the operator can keep the
     # channel IDs out of anna.yaml if they prefer.

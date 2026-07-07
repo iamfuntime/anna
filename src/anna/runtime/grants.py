@@ -91,6 +91,12 @@ class ResolvedGrant:
             CLI/account default. Free-form (tier alias or full ID); NOT
             resolved against an operator pool — a model choice cannot escalate
             capability, so there is no clamp (contrast ``permission_mode``).
+        effort: Reasoning-effort level for the delegation
+            (low|medium|high|xhigh|max), or ``None`` to fall through to the
+            SDK default ("high"). Unlike ``model``, the fallback layer does
+            NOT seed this from ``runtime.effort`` — sub-agents deliberately
+            do not inherit the main loop's effort. Free-form like ``model``:
+            no capability-escalation risk, so no clamp.
     """
 
     write_dirs: list[str] = field(default_factory=list)
@@ -98,6 +104,7 @@ class ResolvedGrant:
     allowed_tools: list[str] = field(default_factory=list)
     permission_mode: str = "acceptEdits"
     model: str | None = None
+    effort: str | None = None
 
 
 @dataclass
@@ -114,6 +121,7 @@ class _GrantLayer:
     allowed_tools: list[str] | None = None
     permission_mode: str | None = None
     model: str | None = None
+    effort: str | None = None
 
 
 def _layer_from_grants(grants: AgentGrants | None) -> _GrantLayer:
@@ -140,6 +148,7 @@ def _layer_from_grants(grants: AgentGrants | None) -> _GrantLayer:
         ),
         permission_mode=grants.permission_mode,
         model=grants.model,
+        effort=grants.effort,
     )
 
 
@@ -153,6 +162,10 @@ def _fallback_layer(config: AnnaConfig) -> _GrantLayer:
     * model <- ``config.runtime.model`` (the global default; ``None`` =
       inherit the CLI/account default, today's behavior). This is what makes
       every override-less sub-agent inherit the main loop's model.
+    * effort <- ``None``, deliberately NOT ``config.runtime.effort`` — the
+      main loop's effort setting is for the main loop only. An override-less
+      sub-agent falls through to the SDK default ("high"); only the
+      per-agent yaml layer or persona frontmatter can set it.
     """
     mcp = [_FALLBACK_BUILTIN] if config.tools.enabled else []
     return _GrantLayer(
@@ -161,6 +174,7 @@ def _fallback_layer(config: AnnaConfig) -> _GrantLayer:
         allowed_tools=list(config.subagents.allowed_tools),
         permission_mode="acceptEdits",
         model=config.runtime.model,
+        effort=None,
     )
 
 
@@ -191,6 +205,11 @@ def _merge(lower: _GrantLayer, higher: _GrantLayer) -> _GrantLayer:
             higher.model
             if higher.model is not None
             else lower.model
+        ),
+        effort=(
+            higher.effort
+            if higher.effort is not None
+            else lower.effort
         ),
     )
 
@@ -308,6 +327,11 @@ def resolve_effective_grant(
         # which model executes), so there is no clamp like the bypassPermissions
         # one above. ``None`` = inherit the CLI/account default.
         model=merged.model,
+        # ``effort`` is free-form like ``model`` (no pool, no clamp). The
+        # fallback layer seeds None, so this is non-None only when the
+        # per-agent yaml or persona frontmatter set it; None falls through
+        # to the SDK default ("high") at the ClaudeAgentOptions boundary.
+        effort=merged.effort,
     )
 
 

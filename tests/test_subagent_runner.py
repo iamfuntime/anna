@@ -481,6 +481,43 @@ def test_build_subagent_options_model_from_resolved_grant(tmp_path: Path) -> Non
     assert options.model == "haiku"
 
 
+def test_build_subagent_options_effort_defaults_to_none(tmp_path: Path) -> None:
+    """With no grant effort, the SDK effort is None (SDK default 'high')."""
+    runner = _make_runner_with_tools(tmp_path, tools_enabled=True)
+    options = runner._build_subagent_options(  # noqa: SLF001
+        system_prompt="system",
+        conv_key="subagent:slug:abc",
+    )
+    assert options.effort is None
+
+
+def test_build_subagent_options_effort_not_inherited_from_runtime(
+    tmp_path: Path,
+) -> None:
+    """runtime.effort is main-loop only — the synthesized fallback grant
+    leaves effort None, so the sub-agent gets the SDK default."""
+    runner = _make_runner_with_tools(tmp_path, tools_enabled=True)
+    runner._config.runtime.effort = "xhigh"  # noqa: SLF001
+    options = runner._build_subagent_options(  # noqa: SLF001
+        system_prompt="system",
+        conv_key="subagent:slug:abc",
+    )
+    assert options.effort is None
+
+
+def test_build_subagent_options_effort_from_resolved_grant(tmp_path: Path) -> None:
+    """A resolved grant's effort is threaded into ClaudeAgentOptions.effort."""
+    from anna.runtime.grants import ResolvedGrant
+
+    runner = _make_runner_with_tools(tmp_path, tools_enabled=True)
+    options = runner._build_subagent_options(  # noqa: SLF001
+        system_prompt="system",
+        conv_key="subagent:slug:abc",
+        resolved=ResolvedGrant(effort="low"),
+    )
+    assert options.effort == "low"
+
+
 def test_build_subagent_options_sets_claude_config_dir_env(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

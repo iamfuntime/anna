@@ -732,6 +732,95 @@ def test_agent_grants_model_rejects_garbage(garbage: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Configurable effort — light validator (shared by RuntimeConfig + AgentGrants)
+# ---------------------------------------------------------------------------
+
+
+def test_runtime_effort_defaults_to_none() -> None:
+    """Unset effort is the no-op default (SDK applies its own 'high')."""
+    cfg = AnnaConfig.model_validate({"auth": {"mode": "max"}})
+    assert cfg.runtime.effort is None
+
+
+@pytest.mark.parametrize("level", ["low", "medium", "high", "xhigh", "max"])
+def test_runtime_effort_accepts_valid_levels(level: str) -> None:
+    cfg = AnnaConfig.model_validate({"runtime": {"effort": level}})
+    assert cfg.runtime.effort == level
+
+
+@pytest.mark.parametrize(
+    ("raw", "normalized"),
+    [("HIGH", "high"), ("XHigh", "xhigh"), (" max ", "max")],
+)
+def test_runtime_effort_normalizes_case(raw: str, normalized: str) -> None:
+    """Input is case-insensitive and normalized to lowercase."""
+    cfg = AnnaConfig.model_validate({"runtime": {"effort": raw}})
+    assert cfg.runtime.effort == normalized
+
+
+@pytest.mark.parametrize("garbage", ["ultra", "highest", "", "x-high", "42"])
+def test_runtime_effort_rejects_garbage(garbage: str) -> None:
+    with pytest.raises(ValueError):
+        AnnaConfig.model_validate({"runtime": {"effort": garbage}})
+
+
+def test_effort_env_override_applies_when_unset() -> None:
+    from anna.config import _apply_env_overrides
+
+    import os
+
+    prev = os.environ.get("ANNA_RUNTIME_EFFORT")
+    os.environ["ANNA_RUNTIME_EFFORT"] = "xhigh"
+    try:
+        data = _apply_env_overrides({})
+        assert data["runtime"]["effort"] == "xhigh"
+    finally:
+        if prev is None:
+            del os.environ["ANNA_RUNTIME_EFFORT"]
+        else:
+            os.environ["ANNA_RUNTIME_EFFORT"] = prev
+
+
+def test_effort_env_override_wins_over_yaml_value() -> None:
+    """Same precedence as ANNA_LOG_LEVEL: a set env var beats the YAML."""
+    from anna.config import _apply_env_overrides
+
+    import os
+
+    prev = os.environ.get("ANNA_RUNTIME_EFFORT")
+    os.environ["ANNA_RUNTIME_EFFORT"] = "low"
+    try:
+        data = _apply_env_overrides({"runtime": {"effort": "max"}})
+        assert data["runtime"]["effort"] == "low"
+    finally:
+        if prev is None:
+            del os.environ["ANNA_RUNTIME_EFFORT"]
+        else:
+            os.environ["ANNA_RUNTIME_EFFORT"] = prev
+
+
+def test_agent_grants_effort_defaults_to_none() -> None:
+    from anna.config import AgentGrants
+
+    assert AgentGrants().effort is None
+
+
+@pytest.mark.parametrize("level", ["low", "medium", "high", "xhigh", "max"])
+def test_agent_grants_effort_accepts_valid(level: str) -> None:
+    from anna.config import AgentGrants
+
+    assert AgentGrants(effort=level).effort == level
+
+
+@pytest.mark.parametrize("garbage", ["ultra", "highest", "x-high"])
+def test_agent_grants_effort_rejects_garbage(garbage: str) -> None:
+    from anna.config import AgentGrants
+
+    with pytest.raises(ValueError):
+        AgentGrants(effort=garbage)
+
+
+# ---------------------------------------------------------------------------
 # integrations block (web mission-control subtask 8)
 # ---------------------------------------------------------------------------
 

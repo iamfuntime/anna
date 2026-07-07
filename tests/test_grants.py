@@ -374,3 +374,57 @@ def test_model_is_not_clamped_for_untrusted_frontmatter() -> None:
     fm = AgentGrants(model="opus")
     rg = resolve_effective_grant(cfg, "r", fm)
     assert rg.model == "opus"
+
+
+# ---------------------------------------------------------------------------
+# effort resolution — fallback is None (NOT runtime.effort); overrides REPLACE
+# ---------------------------------------------------------------------------
+
+
+def test_effort_defaults_to_none_when_unset_everywhere() -> None:
+    """No effort anywhere → resolved effort is None (SDK default 'high')."""
+    cfg = _cfg()
+    rg = resolve_effective_grant(cfg, "anyone", None)
+    assert rg.effort is None
+
+
+def test_effort_fallback_does_not_inherit_runtime_effort() -> None:
+    """Unlike model, runtime.effort is main-loop only — the fallback layer
+    seeds None, so an override-less sub-agent gets the SDK default."""
+    cfg = AnnaConfig.model_validate({"runtime": {"effort": "xhigh"}})
+    rg = resolve_effective_grant(cfg, "anyone", None)
+    assert rg.effort is None
+
+
+def test_effort_per_agent_yaml_override_applies() -> None:
+    """subagents.agents.<slug>.effort sets the effort for that slug only."""
+    cfg = AnnaConfig.model_validate(
+        {
+            "runtime": {"effort": "xhigh"},
+            "subagents": {"agents": {"r": {"effort": "low"}}},
+        }
+    )
+    rg = resolve_effective_grant(cfg, "r", None)
+    assert rg.effort == "low"
+    # Other slugs still fall through to None (SDK default), NOT runtime.effort.
+    assert resolve_effective_grant(cfg, "other", None).effort is None
+
+
+def test_effort_frontmatter_overrides_per_agent() -> None:
+    """Frontmatter grants.effort is most-specific and wins over yaml."""
+    cfg = AnnaConfig.model_validate(
+        {"subagents": {"agents": {"r": {"effort": "low"}}}}
+    )
+    fm = AgentGrants(effort="max")
+    rg = resolve_effective_grant(cfg, "r", fm)
+    assert rg.effort == "max"
+
+
+def test_effort_frontmatter_absent_passes_per_agent_through() -> None:
+    """Frontmatter with no effort leaves the per-agent override in place."""
+    cfg = AnnaConfig.model_validate(
+        {"subagents": {"agents": {"r": {"effort": "medium"}}}}
+    )
+    fm = AgentGrants(write_dirs=[])  # no effort field
+    rg = resolve_effective_grant(cfg, "r", fm)
+    assert rg.effort == "medium"

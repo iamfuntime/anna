@@ -35,6 +35,13 @@ runtime:
   # behavior. Restart-gated: anna.yaml has no hot-reload, so a change here
   # only takes effect after a daemon restart.
   # model: opus
+  # Reasoning-effort level for the MAIN conversation loop. Guides how much
+  # thinking the model spends per turn. Main-loop only: sub-agents do NOT
+  # inherit this — an override-less sub-agent falls through to the SDK
+  # default (set per-agent via subagents.agents.<slug>.effort or persona
+  # frontmatter grants.effort). Restart-gated like the rest of this file.
+  # Also overridable via the ANNA_RUNTIME_EFFORT env var (env wins).
+  # effort: xhigh  # low|medium|high|xhigh|max; unset = SDK default (high)
   # ----------------------------------------------------------
   # Cadence-visibility hooks (Inbox/2026-06-02 plan).
   #
@@ -466,6 +473,10 @@ subagents:
   #     # inherit runtime.model / CLI default. Restart-gated like the rest of
   #     # this file — takes effect on the next daemon restart.
   #     model: sonnet
+  #     # Per-agent reasoning-effort override. Sub-agents do NOT inherit
+  #     # runtime.effort — unset here (and in frontmatter) means the SDK
+  #     # default.
+  #     effort: xhigh  # low|medium|high|xhigh|max; unset = SDK default (high)
   #
   # The same grant shape can live in a persona file's frontmatter, where
   # it REPLACES the agents.<slug> layer for that field:
@@ -480,6 +491,9 @@ subagents:
   #     # delegation (no restart needed) — it applies on the NEXT delegation,
   #     # unlike anna.yaml model changes which require a restart.
   #     model: haiku
+  #     # Frontmatter effort override (same values as above). Like model,
+  #     # read fresh on every delegation.
+  #     effort: low  # low|medium|high|xhigh|max; unset = SDK default (high)
   #   ---
   #   # Persona body...
 
