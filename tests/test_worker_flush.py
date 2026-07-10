@@ -98,12 +98,17 @@ def _patch_sdk_types(monkeypatch):
 def _make_worker(
     tmp_path: Path,
     send_target: list[OutboundMessage],
+    *,
+    consolidate: bool = False,
 ) -> ConversationWorker:
     cfg = AnnaConfig()
     object.__setattr__(cfg, "anna_home", tmp_path / "anna_home")
     cfg.vault.path = str(tmp_path / "vault")
     cfg.logging.audit.fsync_on_write = False
     cfg.core_dir.mkdir(parents=True, exist_ok=True)
+    # Read at worker construction (no hot-reload), so set it before the
+    # ConversationWorker(...) call below.
+    cfg.runtime.visibility.consolidate_interactive_turns = consolidate
     supervisor = Supervisor(config=cfg)
 
     async def _send(msg: OutboundMessage) -> None:
@@ -243,3 +248,110 @@ async def test_tool_use_only_no_text_falls_back_to_no_response(tmp_path: Path) -
 
     assert len(sent) == 1
     assert sent[0].text == "(no response)"
+
+
+# ---------------------------------------------------------------------------
+# Turn-consolidation mode (config: consolidate_interactive_turns)
+#
+# When ON, an interactive Slack/Telegram turn accumulates ALL narration and
+# emits exactly ONE message at turn end — the tool-use-boundary flush is
+# skipped AND the timed drip is never started. When OFF (default), the
+# per-boundary flush contract above is preserved unchanged. The scheduler
+# (``completion_future``) path stays consolidated regardless of the flag.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_consolidate_on_single_message_across_tool_uses(tmp_path: Path) -> None:
+    """Flag ON: narration interleaved across MULTIPLE ToolUseBlocks lands as
+    exactly ONE consolidated turn-end message, and the timed-drip loop is
+    never entered.
+
+    Same block script as ``test_flush_at_tool_use_emits_three_messages`` (which
+    yields three sends with the flag OFF); consolidation collapses it to one.
+    """
+    sent: list[OutboundMessage] = []
+    worker = _make_worker(tmp_path, sent, consolidate=True)
+
+    # Spy: prove the timed-drip task is never started under consolidation.
+    # ``_handle`` only calls ``_periodic_flush_loop`` when
+    # ``_periodic_flush_active`` is True, so a never-invoked spy is proof.
+    loop_starts: list[int] = []
+    orig_loop = worker._periodic_flush_loop
+
+    async def _spy_loop(event, buffer):  # type: ignore[no-untyped-def]
+        loop_starts.append(1)
+        await orig_loop(event, buffer)
+
+    worker._periodic_flush_loop = _spy_loop  # type: ignore[method-assign]
+
+    worker._client = _FakeBlocksClient(
+        blocks=[
+            _FakeTextBlock(text="a"),
+            _FakeTextBlock(text="b"),
+            _FakeToolUseBlock(),
+            _FakeTextBlock(text="c"),
+            _FakeToolUseBlock(),
+            _FakeTextBlock(text="d"),
+        ]
+    )
+
+    await worker._handle(_make_event())
+
+    # One message carrying the WHOLE turn's narration, joined in order.
+    assert [m.text for m in sent] == ["a\nb\nc\nd"]
+    # The drip loop was never entered, and the gate reports inactive.
+    assert loop_starts == []
+    assert worker._periodic_flush_active(_make_event()) is False
+
+
+@pytest.mark.asyncio
+async def test_consolidate_off_preserves_boundary_flush(tmp_path: Path) -> None:
+    """Flag OFF (default): the per-boundary flush contract is unchanged.
+
+    Explicit contrast to the ON case above — same block script yields one
+    message per non-empty boundary plus the trailing final send.
+    """
+    sent: list[OutboundMessage] = []
+    worker = _make_worker(tmp_path, sent, consolidate=False)
+    worker._client = _FakeBlocksClient(
+        blocks=[
+            _FakeTextBlock(text="a"),
+            _FakeTextBlock(text="b"),
+            _FakeToolUseBlock(),
+            _FakeTextBlock(text="c"),
+            _FakeToolUseBlock(),
+            _FakeTextBlock(text="d"),
+        ]
+    )
+
+    await worker._handle(_make_event())
+
+    assert [m.text for m in sent] == ["a\nb", "c", "d"]
+
+
+@pytest.mark.asyncio
+async def test_consolidate_on_scheduler_path_still_consolidated(tmp_path: Path) -> None:
+    """Flag ON does not disturb the scheduler path: a ``completion_future``
+    turn still resolves with one consolidated string and sends nothing.
+
+    The scheduler path was already consolidated (it skips the boundary flush
+    branch), so the flag is a no-op for it.
+    """
+    sent: list[OutboundMessage] = []
+    worker = _make_worker(tmp_path, sent, consolidate=True)
+    worker._client = _FakeBlocksClient(
+        blocks=[
+            _FakeTextBlock(text="a"),
+            _FakeToolUseBlock(),
+            _FakeTextBlock(text="b"),
+        ]
+    )
+
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[str] = loop.create_future()
+    await worker._handle(_make_event(future=future))
+
+    assert sent == []
+    assert future.done()
+    assert future.result() == "a\nb"

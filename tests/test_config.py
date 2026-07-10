@@ -369,7 +369,19 @@ def test_runtime_visibility_defaults() -> None:
     assert vis.slack_emoji == "thinking_face"
     assert vis.telegram_typing_max_seconds == 180
     assert vis.periodic_flush_seconds == 30
+    assert vis.consolidate_interactive_turns is False
     assert len(vis.lint_patterns) == 5
+
+
+def test_consolidate_interactive_turns_default_is_false() -> None:
+    """Turn-consolidation is off by default (preserves today's cadence)."""
+    assert RuntimeVisibilityConfig().consolidate_interactive_turns is False
+
+
+def test_consolidate_interactive_turns_accepts_true() -> None:
+    """The consolidation switch round-trips a True override."""
+    vis = RuntimeVisibilityConfig(consolidate_interactive_turns=True)
+    assert vis.consolidate_interactive_turns is True
 
 
 def test_runtime_visibility_rejects_bad_regex() -> None:

@@ -65,6 +65,14 @@ runtime:
   #                     (final + tool-use flushes only); negatives are
   #                     rejected. Scheduler and voice-only paths never
   #                     drip. Takes effect on restart.
+  #   consolidate_interactive_turns
+  #                     when true, interactive Slack/Telegram turns
+  #                     accumulate ALL narration and emit exactly one
+  #                     message at turn end — suppresses BOTH the
+  #                     tool-use-boundary flush AND the timed drip so a
+  #                     long multi-tool turn can't fragment into dozens
+  #                     of messages. Default false keeps today's cadence.
+  #                     Takes effect on restart.
   # Defaults are on. lint_patterns ships with five seed regexes for
   # known bad-cadence phrases; bad regex fails fast at boot.
   # ----------------------------------------------------------
@@ -73,6 +81,7 @@ runtime:
   #   cadence_reminder: true
   #   response_lint: true
   #   periodic_flush_seconds: 30
+  #   consolidate_interactive_turns: false
   #   slack_emoji: thinking_face
   #   telegram_typing_max_seconds: 180
   #   lint_patterns:

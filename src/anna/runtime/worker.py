@@ -335,6 +335,15 @@ class ConversationWorker:
         # ``0`` (or negative, already rejected at load) disables the timed
         # drip — the timer task is simply never started for any turn.
         self._flush_interval: int = config.runtime.visibility.periodic_flush_seconds
+        # Turn-consolidation switch (same plan). When true, interactive
+        # buffered transports (Slack/Telegram; ``completion_future is None``)
+        # accumulate the whole turn's narration and emit exactly one message
+        # at turn end: the timed drip is never started and the
+        # tool-use-boundary flush is skipped. Cached at construction for the
+        # same no-hot-reload reason as ``_flush_interval``.
+        self._consolidate_interactive: bool = (
+            config.runtime.visibility.consolidate_interactive_turns
+        )
         # Phase 2 §5 subtask 7: when true the worker skips the checkpoint
         # write and the per-core-file eviction sweep at closeout. Set by
         # the router from the first event's ``ephemeral`` flag when the
@@ -1810,7 +1819,11 @@ class ConversationWorker:
         Active only for an interactive (non-scheduler), non-voice-only turn
         on a buffered transport with a positive interval. The scheduler path
         (``completion_future`` set) and voice-only outbound stay consolidated.
+        Turn-consolidation mode (``consolidate_interactive_turns``) also
+        suppresses the drip so the whole turn lands as one turn-end message.
         """
+        if self._consolidate_interactive:
+            return False
         if self._flush_interval <= 0:
             return False
         if event.completion_future is not None:
@@ -2289,7 +2302,19 @@ class ConversationWorker:
                                 # clears/stamps. A cancel/exception inside the
                                 # send leaves the text in ``pending`` for the
                                 # final turn-end send.
-                                if event.completion_future is None:
+                                #
+                                # Turn-consolidation mode
+                                # (``consolidate_interactive_turns``) also
+                                # skips this boundary send and leaves
+                                # ``pending`` untouched, so the whole turn's
+                                # narration accumulates for a single turn-end
+                                # message. ``tool_used`` is already recorded
+                                # above (outside this guard), so the
+                                # regeneration guard is unaffected.
+                                if (
+                                    event.completion_future is None
+                                    and not self._consolidate_interactive
+                                ):
                                     async with buffer.lock:
                                         if buffer.pending:
                                             txt = "\n".join(

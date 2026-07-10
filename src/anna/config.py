@@ -164,6 +164,19 @@ class RuntimeVisibilityConfig(BaseModel):
     # only; no hot-reload — takes effect on restart.
     periodic_flush_seconds: int = 30
 
+    # Turn-consolidation switch for interactive buffered transports
+    # (Slack/Telegram; i.e. ``completion_future is None``). When True the
+    # worker accumulates the WHOLE turn's narration and emits exactly one
+    # OutboundMessage at turn end — it suppresses BOTH the tool-use-boundary
+    # flush AND the timed periodic drip above, so a long multi-tool turn can
+    # no longer fragment into dozens of separate Slack/Telegram messages.
+    # Default False preserves today's cadence-aligned behavior (one message
+    # per non-empty tool-use boundary plus the drip). The scheduler /
+    # ``completion_future`` path and voice-only outbound are already
+    # consolidated and are unaffected either way. No validator needed for a
+    # bool; no hot-reload — takes effect on restart.
+    consolidate_interactive_turns: bool = False
+
     # Slack-specific knobs. Custom emojis may not exist on every workspace;
     # if reactions.add fails the worker logs a warning and the SDK turn
     # continues uninterrupted.
