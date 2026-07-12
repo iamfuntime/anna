@@ -177,6 +177,27 @@ class RuntimeVisibilityConfig(BaseModel):
     # bool; no hot-reload — takes effect on restart.
     consolidate_interactive_turns: bool = False
 
+    # Scheduled-turn consolidation (2026-07-12 weekly-synthesis incident).
+    # A scheduled / non-interactive turn (``completion_future`` set) resolves
+    # its future with the assistant text the worker captured, which the
+    # scheduler posts to the operator's DM. When True the worker resolves with
+    # ONLY the turn's TERMINAL assistant text — the final report the skill
+    # intends, i.e. the text emitted AFTER the last tool call — discarding
+    # mid-turn narration that accompanied tool calls (e.g. "Notion query is
+    # plan-gated… Let me try another way… Writing the note now."). When False
+    # the legacy behavior is kept: EVERY assistant text block across the turn
+    # is concatenated into the posted result (the root cause of narration
+    # leaking above the report). Default True (safe): scheduled skills are
+    # bound by an output-discipline contract to emit exactly one final report
+    # OR the bare ``[[ANNA_NO_OUTPUT]]`` quiet sentinel and nothing else, so
+    # terminal-only capture is precisely what that contract already promises.
+    # The quiet sentinel and explicit tool-based posts (slack_post /
+    # AdminAlerter) are unaffected, and INTERACTIVE turns are never touched by
+    # this flag. Env override: ``ANNA_CONSOLIDATE_SCHEDULED_TURNS`` (an
+    # explicit anna.yaml value wins). No validator needed for a bool; no
+    # hot-reload — takes effect on restart.
+    consolidate_scheduled_turns: bool = True
+
     # Slack-specific knobs. Custom emojis may not exist on every workspace;
     # if reactions.add fails the worker logs a warning and the SDK turn
     # continues uninterrupted.
@@ -1494,6 +1515,25 @@ def _apply_env_overrides(data: dict[str, Any]) -> dict[str, Any]:
         reports = data.setdefault("reports", {})
         if not reports.get("slack_channel_id"):
             reports["slack_channel_id"] = reports_slack
+
+    # Scheduled-turn narration consolidation override. Lets the operator flip
+    # the safe default off (restore legacy full-narration capture) from .env
+    # without editing anna.yaml. Accepts the usual truthy/falsy spellings; an
+    # unrecognized value is ignored so the YAML / model default stands. An
+    # explicit anna.yaml value WINS (``setdefault`` only fills when absent),
+    # matching the admin/reports precedence — the operator's explicit config
+    # is authoritative for a behavior/safety knob.
+    consolidate_sched = os.environ.get("ANNA_CONSOLIDATE_SCHEDULED_TURNS")
+    if consolidate_sched is not None:
+        token = consolidate_sched.strip().lower()
+        bool_val: bool | None = None
+        if token in ("1", "true", "yes", "on"):
+            bool_val = True
+        elif token in ("0", "false", "no", "off"):
+            bool_val = False
+        if bool_val is not None:
+            visibility = data.setdefault("runtime", {}).setdefault("visibility", {})
+            visibility.setdefault("consolidate_scheduled_turns", bool_val)
 
     return data
 

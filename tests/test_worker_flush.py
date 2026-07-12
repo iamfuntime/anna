@@ -100,6 +100,7 @@ def _make_worker(
     send_target: list[OutboundMessage],
     *,
     consolidate: bool = False,
+    consolidate_scheduled: bool = True,
 ) -> ConversationWorker:
     cfg = AnnaConfig()
     object.__setattr__(cfg, "anna_home", tmp_path / "anna_home")
@@ -109,6 +110,12 @@ def _make_worker(
     # Read at worker construction (no hot-reload), so set it before the
     # ConversationWorker(...) call below.
     cfg.runtime.visibility.consolidate_interactive_turns = consolidate
+    # Scheduled-turn consolidation defaults ON here to mirror the production
+    # config default (``consolidate_scheduled_turns: bool = True``): a
+    # scheduled turn resolves its future with ONLY the terminal report. The
+    # two legacy scheduler tests below pin it False to exercise the off
+    # switch (full-narration concatenation).
+    cfg.runtime.visibility.consolidate_scheduled_turns = consolidate_scheduled
     supervisor = Supervisor(config=cfg)
 
     async def _send(msg: OutboundMessage) -> None:
@@ -208,10 +215,13 @@ async def test_scheduler_path_stays_consolidated(tmp_path: Path) -> None:
     """When ``completion_future`` is set the worker MUST NOT flush mid-turn.
 
     Scheduled jobs receive one consolidated string via the future and
-    the send callback is never invoked.
+    the send callback is never invoked. Pinned to the legacy off switch
+    (``consolidate_scheduled=False``) so the future resolves with the FULL
+    narration concatenation; the on/default terminal-only behavior is
+    covered by ``test_scheduled_terminal_only_*`` below.
     """
     sent: list[OutboundMessage] = []
-    worker = _make_worker(tmp_path, sent)
+    worker = _make_worker(tmp_path, sent, consolidate_scheduled=False)
     worker._client = _FakeBlocksClient(
         blocks=[
             _FakeTextBlock(text="a"),
@@ -336,10 +346,15 @@ async def test_consolidate_on_scheduler_path_still_consolidated(tmp_path: Path) 
     turn still resolves with one consolidated string and sends nothing.
 
     The scheduler path was already consolidated (it skips the boundary flush
-    branch), so the flag is a no-op for it.
+    branch), so the ``consolidate_interactive_turns`` flag is a no-op for it.
+    Pinned to ``consolidate_scheduled=False`` so this isolates the
+    INTERACTIVE flag's non-effect on the scheduler path (full concatenation);
+    the scheduled terminal-only default is covered separately below.
     """
     sent: list[OutboundMessage] = []
-    worker = _make_worker(tmp_path, sent, consolidate=True)
+    worker = _make_worker(
+        tmp_path, sent, consolidate=True, consolidate_scheduled=False
+    )
     worker._client = _FakeBlocksClient(
         blocks=[
             _FakeTextBlock(text="a"),
@@ -355,3 +370,228 @@ async def test_consolidate_on_scheduler_path_still_consolidated(tmp_path: Path) 
     assert sent == []
     assert future.done()
     assert future.result() == "a\nb"
+
+
+# ---------------------------------------------------------------------------
+# Scheduled-turn terminal-only capture (config: consolidate_scheduled_turns)
+#
+# When ON (the production default), a SCHEDULED / non-interactive turn
+# (``completion_future`` set) resolves its future with ONLY the turn's
+# TERMINAL assistant text — the text emitted after the LAST tool call — so
+# mid-turn narration that accompanied tool calls never reaches the operator's
+# DM. The ``[[ANNA_NO_OUTPUT]]`` quiet sentinel, when it IS the terminal text,
+# survives verbatim (the scheduler then suppresses it downstream). A turn that
+# narrated but ended on a tool call with no closing report resolves EMPTY so
+# the scheduler's blank-output guard suppresses the tick. When OFF the legacy
+# full-narration concatenation is preserved. Interactive turns are never
+# touched by this flag regardless of its value.
+#
+# Real incident this locks down (2026-07-12, weekly-synthesis): the Notion
+# Leads query was plan-gated and the turn narrated its workaround
+# ("query is plan-gated… trying another way… writing the note now.") ABOVE
+# the intended digest; only the digest should be posted.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_scheduled_terminal_only_strips_midturn_narration(tmp_path: Path) -> None:
+    """Default (flag ON): a scheduled turn with mid-turn narration interleaved
+    across tool calls resolves the future with ONLY the terminal report.
+
+    Mirrors the 2026-07-12 weekly-synthesis incident block shape: two
+    narration+tool-call boundaries followed by the intended digest. The
+    narration is discarded; nothing is sent through the transport (the
+    scheduler routes the future result itself).
+    """
+    sent: list[OutboundMessage] = []
+    # No explicit flag → uses the helper/production default (ON).
+    worker = _make_worker(tmp_path, sent)
+    worker._client = _FakeBlocksClient(
+        blocks=[
+            _FakeTextBlock(text="Notion SQL query is plan-gated. Let me try another way."),
+            _FakeToolUseBlock(),
+            _FakeTextBlock(text="Both query tools are plan-gated. Writing the synthesis note now."),
+            _FakeToolUseBlock(),
+            _FakeTextBlock(text="Weekly synthesis: 3 leads advanced, 1 stalled."),
+        ]
+    )
+
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[str] = loop.create_future()
+    await worker._handle(_make_event(future=future))
+
+    assert sent == []
+    assert future.done()
+    assert future.result() == "Weekly synthesis: 3 leads advanced, 1 stalled."
+
+
+@pytest.mark.asyncio
+async def test_scheduled_terminal_only_multiblock_report_joined(tmp_path: Path) -> None:
+    """Flag ON: multiple text blocks AFTER the last tool call are joined into
+    the terminal report; earlier narration is still dropped.
+    """
+    sent: list[OutboundMessage] = []
+    worker = _make_worker(tmp_path, sent)
+    worker._client = _FakeBlocksClient(
+        blocks=[
+            _FakeTextBlock(text="narration before the tool"),
+            _FakeToolUseBlock(),
+            _FakeTextBlock(text="report line 1"),
+            _FakeTextBlock(text="report line 2"),
+        ]
+    )
+
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[str] = loop.create_future()
+    await worker._handle(_make_event(future=future))
+
+    assert sent == []
+    assert future.result() == "report line 1\nreport line 2"
+
+
+@pytest.mark.asyncio
+async def test_scheduled_terminal_quiet_sentinel_preserved(tmp_path: Path) -> None:
+    """Flag ON: when the TERMINAL text is exactly the quiet sentinel, the
+    future resolves with the bare sentinel (mid-turn narration dropped).
+
+    The scheduler's per-line sentinel check then suppresses the post to
+    nothing — that downstream suppression is exercised in the scheduler
+    tests; here we lock down that the worker hands the bare sentinel across
+    the future so that suppression still fires.
+    """
+    from anna.runtime.scheduler import QUIET_SENTINEL
+
+    sent: list[OutboundMessage] = []
+    worker = _make_worker(tmp_path, sent)
+    worker._client = _FakeBlocksClient(
+        blocks=[
+            _FakeTextBlock(text="Nothing new this tick, checking one more source."),
+            _FakeToolUseBlock(),
+            _FakeTextBlock(text=QUIET_SENTINEL),
+        ]
+    )
+
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[str] = loop.create_future()
+    await worker._handle(_make_event(future=future))
+
+    assert sent == []
+    assert future.result() == QUIET_SENTINEL
+
+
+@pytest.mark.asyncio
+async def test_scheduled_narration_then_no_terminal_report_resolves_empty(
+    tmp_path: Path,
+) -> None:
+    """Flag ON: a scheduled turn that narrated but ENDED on a tool call (no
+    closing report) resolves the future with an EMPTY string.
+
+    There is no terminal report to post, so the narration is discarded and the
+    future resolves empty; the scheduler's blank-output guard suppresses the
+    tick (a quiet success) rather than leaking the narration.
+    """
+    sent: list[OutboundMessage] = []
+    worker = _make_worker(tmp_path, sent)
+    worker._client = _FakeBlocksClient(
+        blocks=[
+            _FakeTextBlock(text="Working on it — writing the note now."),
+            _FakeToolUseBlock(),
+        ]
+    )
+
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[str] = loop.create_future()
+    await worker._handle(_make_event(future=future))
+
+    assert sent == []
+    assert future.result() == ""
+
+
+@pytest.mark.asyncio
+async def test_scheduled_no_tools_terminal_equals_full_reply(tmp_path: Path) -> None:
+    """Flag ON but no tool ran: the terminal report equals the whole reply, so
+    a tool-free scheduled turn is byte-identical to the legacy capture.
+    """
+    sent: list[OutboundMessage] = []
+    worker = _make_worker(tmp_path, sent)
+    worker._client = _FakeBlocksClient(
+        blocks=[
+            _FakeTextBlock(text="line one"),
+            _FakeTextBlock(text="line two"),
+        ]
+    )
+
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[str] = loop.create_future()
+    await worker._handle(_make_event(future=future))
+
+    assert sent == []
+    assert future.result() == "line one\nline two"
+
+
+@pytest.mark.asyncio
+async def test_scheduled_truly_empty_turn_keeps_no_response(tmp_path: Path) -> None:
+    """Flag ON: a scheduled turn that emitted NO assistant text at all keeps
+    the legacy "(no response)" placeholder (not an empty suppression).
+    """
+    sent: list[OutboundMessage] = []
+    worker = _make_worker(tmp_path, sent)
+    worker._client = _FakeBlocksClient(
+        blocks=[_FakeToolUseBlock(), _FakeToolUseBlock()]
+    )
+
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[str] = loop.create_future()
+    await worker._handle(_make_event(future=future))
+
+    assert sent == []
+    assert future.result() == "(no response)"
+
+
+@pytest.mark.asyncio
+async def test_scheduled_off_switch_keeps_full_narration(tmp_path: Path) -> None:
+    """Flag OFF: the legacy full-narration concatenation is preserved — the
+    future resolves with EVERY assistant text block joined in order.
+    """
+    sent: list[OutboundMessage] = []
+    worker = _make_worker(tmp_path, sent, consolidate_scheduled=False)
+    worker._client = _FakeBlocksClient(
+        blocks=[
+            _FakeTextBlock(text="narration"),
+            _FakeToolUseBlock(),
+            _FakeTextBlock(text="the report"),
+        ]
+    )
+
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[str] = loop.create_future()
+    await worker._handle(_make_event(future=future))
+
+    assert sent == []
+    assert future.result() == "narration\nthe report"
+
+
+@pytest.mark.asyncio
+async def test_interactive_unaffected_by_scheduled_flag(tmp_path: Path) -> None:
+    """The scheduled flag being ON must NOT change interactive-turn behavior.
+
+    Same block script as ``test_flush_at_tool_use_emits_three_messages`` with
+    the scheduled flag ON (default) and NO ``completion_future``: the
+    per-boundary interactive flush contract is unchanged — three sends.
+    """
+    sent: list[OutboundMessage] = []
+    worker = _make_worker(tmp_path, sent, consolidate_scheduled=True)
+    worker._client = _FakeBlocksClient(
+        blocks=[
+            _FakeTextBlock(text="a"),
+            _FakeTextBlock(text="b"),
+            _FakeToolUseBlock(),
+            _FakeTextBlock(text="c"),
+            _FakeToolUseBlock(),
+            _FakeTextBlock(text="d"),
+        ]
+    )
+
+    await worker._handle(_make_event())
+
+    assert [m.text for m in sent] == ["a\nb", "c", "d"]

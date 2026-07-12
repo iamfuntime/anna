@@ -344,6 +344,17 @@ class ConversationWorker:
         self._consolidate_interactive: bool = (
             config.runtime.visibility.consolidate_interactive_turns
         )
+        # Scheduled-turn consolidation (2026-07-12 weekly-synthesis incident).
+        # When true a scheduled / non-interactive turn (``completion_future``
+        # set) resolves its future with ONLY the turn's TERMINAL assistant
+        # text — the final report emitted after the last tool call —
+        # discarding mid-turn narration that accompanied tool calls. Cached
+        # at construction for the same no-hot-reload reason as the flags
+        # above. Interactive turns (``completion_future is None``) never read
+        # this, so their behavior is unchanged regardless of the flag.
+        self._consolidate_scheduled: bool = (
+            config.runtime.visibility.consolidate_scheduled_turns
+        )
         # Phase 2 §5 subtask 7: when true the worker skips the checkpoint
         # write and the per-core-file eviction sweep at closeout. Set by
         # the router from the first event's ``ephemeral`` flag when the
@@ -2011,11 +2022,22 @@ class ConversationWorker:
         we never raise out of here and never leave the caller's future unset.
         """
         try:
-            from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
+            from claude_agent_sdk import (
+                AssistantMessage,
+                ResultMessage,
+                TextBlock,
+                ToolUseBlock,
+            )
         except Exception:  # pragma: no cover - SDK always present in prod
-            AssistantMessage = ResultMessage = TextBlock = None  # type: ignore[assignment,misc]
+            AssistantMessage = ResultMessage = TextBlock = ToolUseBlock = None  # type: ignore[assignment,misc]
 
         reply_chunks: list[str] = []
+        # Terminal-report accumulator, mirroring the main drain loop: cleared
+        # at every tool-use boundary so it holds only the text emitted after
+        # the last tool call. Read only when ``consolidate_scheduled_turns`` is
+        # on, keeping the regenerated reply consistent with the primary
+        # scheduled-dispatch path (terminal-only, no mid-turn narration).
+        terminal_chunks: list[str] = []
         turn_queue = self._begin_turn()
         try:
             await self._client.query(correction_prompt)  # type: ignore[attr-defined]
@@ -2024,6 +2046,9 @@ class ConversationWorker:
                     for block in msg.content:
                         if TextBlock is not None and isinstance(block, TextBlock):
                             reply_chunks.append(block.text)
+                            terminal_chunks.append(block.text)
+                        elif ToolUseBlock is not None and isinstance(block, ToolUseBlock):
+                            terminal_chunks.clear()
                 if ResultMessage is not None and isinstance(msg, ResultMessage):
                     break
         except Exception as exc:
@@ -2037,9 +2062,14 @@ class ConversationWorker:
         finally:
             await self._end_turn(turn_queue)
 
-        reply_text = "\n".join(c for c in reply_chunks if c).strip()
-        if not reply_text:
-            reply_text = "(no response)"
+        if self._consolidate_scheduled:
+            reply_text = "\n".join(c for c in terminal_chunks if c).strip()
+            if not reply_text and not reply_chunks:
+                reply_text = "(no response)"
+        else:
+            reply_text = "\n".join(c for c in reply_chunks if c).strip()
+            if not reply_text:
+                reply_text = "(no response)"
         return reply_text
 
     async def _guarded_send(
@@ -2183,6 +2213,18 @@ class ConversationWorker:
         # no concurrent-mutation race. ``pending`` is always mutated in
         # place (extend/clear) — never rebound — so the timer sees writes.
         reply_chunks: list[str] = []
+        # Scheduled-turn TERMINAL-report accumulator (2026-07-12
+        # weekly-synthesis incident). Mirrors ``reply_chunks`` but is
+        # CLEARED at every tool-use boundary, so at turn end it holds ONLY
+        # the assistant text emitted AFTER the last tool call — the final
+        # report a scheduled skill intends, with mid-turn narration
+        # discarded. Read ONLY on the scheduler (``completion_future``) path
+        # when ``self._consolidate_scheduled`` is on; the interactive send
+        # path never touches it, so interactive behavior is unchanged. When
+        # no tool runs this turn it is never cleared and therefore equals
+        # ``reply_chunks`` (terminal == whole reply), keeping tool-free
+        # scheduled turns byte-identical to the legacy capture.
+        terminal_chunks: list[str] = []
         # Tracks whether ANY real tool actually executed this turn (a
         # ToolUseBlock was observed). Load-bearing for the scheduled-turn
         # regeneration guard below: regeneration is only safe when zero tools
@@ -2245,6 +2287,11 @@ class ConversationWorker:
                         for block in msg.content:
                             if TextBlock is not None and isinstance(block, TextBlock):
                                 reply_chunks.append(block.text)
+                                # Terminal-report tracking (scheduled path):
+                                # accumulate alongside ``reply_chunks``; the
+                                # ToolUseBlock branch below clears this so only
+                                # post-last-tool text survives to turn end.
+                                terminal_chunks.append(block.text)
                                 # Append the narration to the shared flush
                                 # buffer under the lock so the timer task
                                 # never reads a half-written ``pending``.
@@ -2274,6 +2321,15 @@ class ConversationWorker:
                                 # scheduled-turn regeneration guard reads this
                                 # to refuse a re-run that would double-execute.
                                 tool_used = True
+                                # Tool-use boundary for the scheduled TERMINAL
+                                # report: everything narrated up to this tool
+                                # call is mid-turn narration, not the final
+                                # report — drop it so only text emitted AFTER
+                                # the LAST tool call survives. Runs on BOTH the
+                                # interactive and scheduled paths (cheap, and
+                                # only READ on the scheduled path), so the
+                                # interactive send machinery is untouched.
+                                terminal_chunks.clear()
                                 # Tool-use boundary: the model has stopped
                                 # narrating to invoke a tool. Flush the
                                 # pending narration as its own outbound
@@ -2412,6 +2468,28 @@ class ConversationWorker:
         # output itself. Transport-originated events have completion_future
         # unset and use the standard send-back path.
         if event.completion_future is not None and not event.completion_future.done():
+            # Scheduled-turn narration consolidation (2026-07-12
+            # weekly-synthesis incident). Under ``consolidate_scheduled_turns``
+            # (default on), the future resolves with ONLY the turn's TERMINAL
+            # assistant text — the report the skill intends — and NOT the
+            # mid-turn narration that accompanied tool calls. ``terminal_chunks``
+            # holds exactly the text emitted after the last tool call (it is
+            # cleared at every tool-use boundary in the drain loop above). When
+            # the turn produced NO assistant text at all we keep the legacy
+            # "(no response)" placeholder (``reply_text`` already carries it);
+            # when the turn narrated but ended on a tool call with no closing
+            # report, ``scheduled_text`` stays empty and the scheduler's
+            # blank-output guard suppresses the tick rather than leaking the
+            # narration. The ``[[ANNA_NO_OUTPUT]]`` quiet sentinel, when it IS
+            # the terminal text, survives verbatim so the scheduler's per-line
+            # sentinel check still suppresses to nothing. When the flag is off,
+            # ``scheduled_text`` is the legacy full concatenation.
+            if self._consolidate_scheduled:
+                scheduled_text = "\n".join(c for c in terminal_chunks if c).strip()
+                if not scheduled_text and not reply_chunks:
+                    scheduled_text = reply_text
+            else:
+                scheduled_text = reply_text
             # Scheduled-turn guard: a degraded turn must not resolve the
             # future with leaked tool-call markup, which the scheduler would
             # otherwise route to the destination transport.
@@ -2433,7 +2511,7 @@ class ConversationWorker:
             # otherwise-good prose. STRONG markup, or any markup on a turn with
             # no real tool call, still enters this block and is regenerated or
             # suppressed exactly as before.
-            if _should_suppress_markup(reply_text, tool_used=tool_used):
+            if _should_suppress_markup(scheduled_text, tool_used=tool_used):
                 from anna.runtime.scheduler import QUIET_SENTINEL
 
                 # Exception-safe fallback used by every "give up and go quiet"
@@ -2479,7 +2557,7 @@ class ConversationWorker:
                 # and fall straight through to today's suppress + sentinel
                 # behavior.
                 if tool_used:
-                    await _suppress_and_resolve(reply_text)
+                    await _suppress_and_resolve(scheduled_text)
                     return
 
                 # Step 1: record (exception-isolated, mirroring the alert
@@ -2495,9 +2573,9 @@ class ConversationWorker:
                         fsync_on_write=self._config.logging.audit.fsync_on_write,
                         level="WARNING",
                         transport=self.transport,
-                        char_count=len(reply_text),
-                        markers=_matched_markers(reply_text),
-                        preview=reply_text[:280],
+                        char_count=len(scheduled_text),
+                        markers=_matched_markers(scheduled_text),
+                        preview=scheduled_text[:280],
                     )
                 except Exception as exc:
                     self._log.warning(
@@ -2558,9 +2636,9 @@ class ConversationWorker:
                 # alert) and resolve with the sentinel so the run is recorded
                 # quiet rather than erroring. Exception-safe so a raising audit
                 # can never strand the future.
-                await _suppress_and_resolve(reply_text)
+                await _suppress_and_resolve(scheduled_text)
                 return
-            event.completion_future.set_result(reply_text)
+            event.completion_future.set_result(scheduled_text)
             return
 
         # Interactive path: send the trailing pending buffer (text after the

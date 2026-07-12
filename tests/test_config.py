@@ -370,6 +370,7 @@ def test_runtime_visibility_defaults() -> None:
     assert vis.telegram_typing_max_seconds == 180
     assert vis.periodic_flush_seconds == 30
     assert vis.consolidate_interactive_turns is False
+    assert vis.consolidate_scheduled_turns is True
     assert len(vis.lint_patterns) == 5
 
 
@@ -382,6 +383,82 @@ def test_consolidate_interactive_turns_accepts_true() -> None:
     """The consolidation switch round-trips a True override."""
     vis = RuntimeVisibilityConfig(consolidate_interactive_turns=True)
     assert vis.consolidate_interactive_turns is True
+
+
+def test_consolidate_scheduled_turns_default_is_true() -> None:
+    """Scheduled-turn terminal-only capture is ON by default (safe)."""
+    assert RuntimeVisibilityConfig().consolidate_scheduled_turns is True
+
+
+def test_consolidate_scheduled_turns_accepts_false() -> None:
+    """The scheduled-consolidation switch round-trips a False override
+    (restores the legacy full-narration concatenation)."""
+    vis = RuntimeVisibilityConfig(consolidate_scheduled_turns=False)
+    assert vis.consolidate_scheduled_turns is False
+
+
+def test_consolidate_scheduled_turns_env_override_applies_when_unset() -> None:
+    """ANNA_CONSOLIDATE_SCHEDULED_TURNS fills the value when YAML omits it."""
+    from anna.config import _apply_env_overrides
+
+    import os
+
+    prev = os.environ.get("ANNA_CONSOLIDATE_SCHEDULED_TURNS")
+    os.environ["ANNA_CONSOLIDATE_SCHEDULED_TURNS"] = "false"
+    try:
+        data = _apply_env_overrides({})
+        assert data["runtime"]["visibility"]["consolidate_scheduled_turns"] is False
+        # And it validates through the model to the same value.
+        cfg = AnnaConfig.model_validate(data)
+        assert cfg.runtime.visibility.consolidate_scheduled_turns is False
+    finally:
+        if prev is None:
+            del os.environ["ANNA_CONSOLIDATE_SCHEDULED_TURNS"]
+        else:
+            os.environ["ANNA_CONSOLIDATE_SCHEDULED_TURNS"] = prev
+
+
+def test_consolidate_scheduled_turns_env_does_not_clobber_yaml_value() -> None:
+    """An explicit anna.yaml value wins over the env override (setdefault)."""
+    from anna.config import _apply_env_overrides
+
+    import os
+
+    prev = os.environ.get("ANNA_CONSOLIDATE_SCHEDULED_TURNS")
+    os.environ["ANNA_CONSOLIDATE_SCHEDULED_TURNS"] = "false"
+    try:
+        data = _apply_env_overrides(
+            {"runtime": {"visibility": {"consolidate_scheduled_turns": True}}}
+        )
+        assert data["runtime"]["visibility"]["consolidate_scheduled_turns"] is True
+    finally:
+        if prev is None:
+            del os.environ["ANNA_CONSOLIDATE_SCHEDULED_TURNS"]
+        else:
+            os.environ["ANNA_CONSOLIDATE_SCHEDULED_TURNS"] = prev
+
+
+def test_consolidate_scheduled_turns_env_ignores_garbage() -> None:
+    """An unrecognized env value is ignored; the model default stands."""
+    from anna.config import _apply_env_overrides
+
+    import os
+
+    prev = os.environ.get("ANNA_CONSOLIDATE_SCHEDULED_TURNS")
+    os.environ["ANNA_CONSOLIDATE_SCHEDULED_TURNS"] = "maybe"
+    try:
+        data = _apply_env_overrides({})
+        # No visibility key injected for garbage input.
+        assert "consolidate_scheduled_turns" not in data.get("runtime", {}).get(
+            "visibility", {}
+        )
+        cfg = AnnaConfig.model_validate(data)
+        assert cfg.runtime.visibility.consolidate_scheduled_turns is True
+    finally:
+        if prev is None:
+            del os.environ["ANNA_CONSOLIDATE_SCHEDULED_TURNS"]
+        else:
+            os.environ["ANNA_CONSOLIDATE_SCHEDULED_TURNS"] = prev
 
 
 def test_runtime_visibility_rejects_bad_regex() -> None:

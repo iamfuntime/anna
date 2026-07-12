@@ -73,6 +73,19 @@ runtime:
   #                     long multi-tool turn can't fragment into dozens
   #                     of messages. Default false keeps today's cadence.
   #                     Takes effect on restart.
+  #   consolidate_scheduled_turns
+  #                     when true, a SCHEDULED / non-interactive turn
+  #                     resolves with ONLY its TERMINAL assistant text —
+  #                     the final report the skill intends (the text after
+  #                     the last tool call) — discarding mid-turn narration
+  #                     that accompanied tool calls (e.g. "query is
+  #                     plan-gated… trying another way… writing the note
+  #                     now."). The [[ANNA_NO_OUTPUT]] quiet sentinel and
+  #                     explicit tool posts (slack_post/AdminAlerter) are
+  #                     unaffected; interactive turns are never touched.
+  #                     Default true (safe). Env override:
+  #                     ANNA_CONSOLIDATE_SCHEDULED_TURNS (an explicit value
+  #                     here wins). Takes effect on restart.
   # Defaults are on. lint_patterns ships with five seed regexes for
   # known bad-cadence phrases; bad regex fails fast at boot.
   # ----------------------------------------------------------
@@ -82,6 +95,7 @@ runtime:
   #   response_lint: true
   #   periodic_flush_seconds: 30
   #   consolidate_interactive_turns: false
+  #   consolidate_scheduled_turns: true
   #   slack_emoji: thinking_face
   #   telegram_typing_max_seconds: 180
   #   lint_patterns:
