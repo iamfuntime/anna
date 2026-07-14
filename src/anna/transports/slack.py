@@ -1001,7 +1001,13 @@ class SlackAdapter(ChannelAdapter):
         if thread_ts:
             return f"slack:ch:{channel_id}:{thread_ts}"
         if event_type == "app_mention":
-            return f"slack:ch:{channel_id}:{event_ts}:oneshot"
+            # A top-level @-mention must share the key of the thread it spawns:
+            # ANNA's reply opens a thread, so the operator's follow-ups arrive as
+            # thread replies keyed slack:ch:<ch>:<thread_ts> with thread_ts ==
+            # this event_ts. Dropping the ":oneshot" suffix makes the mention and
+            # every in-thread reply reuse one worker/session so context persists —
+            # the same continuity model as a DM.
+            return f"slack:ch:{channel_id}:{event_ts}"
         # Fallback: treat top-level channel messages as one-shot.
         return f"slack:ch:{channel_id}:{event_ts}:oneshot"
 

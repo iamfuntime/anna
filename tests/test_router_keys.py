@@ -39,7 +39,10 @@ def test_slack_channel_thread_reply_key() -> None:
     assert SlackAdapter.conversation_key_for(event) == expected
 
 
-def test_slack_app_mention_oneshot_key() -> None:
+def test_slack_app_mention_top_level_key() -> None:
+    # A top-level @-mention keys WITHOUT the ":oneshot" suffix so it shares the
+    # key of the thread ANNA's reply spawns (see
+    # test_slack_app_mention_and_thread_reply_share_key).
     event = {
         "type": "app_mention",
         "channel_type": "channel",
@@ -48,8 +51,38 @@ def test_slack_app_mention_oneshot_key() -> None:
         "ts": "1716832700.000700",
         "text": "<@U0BOT> hi",
     }
-    expected = "slack:ch:C0AEY346WRL:1716832700.000700:oneshot"
+    expected = "slack:ch:C0AEY346WRL:1716832700.000700"
     assert SlackAdapter.conversation_key_for(event) == expected
+
+
+def test_slack_app_mention_and_thread_reply_share_key() -> None:
+    # Regression guard: a top-level @-mention (turn 1) and the operator's
+    # follow-up thread reply (turn 2) must derive the SAME conversation_key so
+    # turn 2 reuses turn 1's worker/session instead of spawning a cold one.
+    # ANNA's reply opens a thread whose thread_ts == the mention's event_ts.
+    mention = {
+        "type": "app_mention",
+        "channel_type": "channel",
+        "channel": "C0AEY346WRL",
+        "user": "U0ABCD123",
+        "ts": "T1",
+        "text": "<@U0BOT> kick off a task",
+    }
+    thread_reply = {
+        "type": "message",
+        "channel_type": "channel",
+        "channel": "C0AEY346WRL",
+        "thread_ts": "T1",
+        "user": "U0ABCD123",
+        "ts": "T2",
+        "text": "and one more thing",
+    }
+    expected = "slack:ch:C0AEY346WRL:T1"
+    assert SlackAdapter.conversation_key_for(mention) == expected
+    assert SlackAdapter.conversation_key_for(thread_reply) == expected
+    assert SlackAdapter.conversation_key_for(mention) == SlackAdapter.conversation_key_for(
+        thread_reply
+    )
 
 
 def test_slack_app_mention_in_thread_uses_thread_key() -> None:
