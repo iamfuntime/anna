@@ -34,6 +34,12 @@ from anna.tools.slack_alerts_server import (
 from anna.tools.vault_tools import VaultTools
 from anna.tools.web_server import WEB_TOOL_NAMES, build_web_server
 from anna.tools.web_tools import WebTools
+from anna.runtime.turn_watchdog import (
+    TurnWatchdog,
+    WatchdogAction,
+    hard_reminder,
+    soft_reminder,
+)
 from anna.runtime.visibility import NULL_VISIBILITY, VisibilityCallbacks
 from anna.transports.base import (
     ChannelAdapter,
@@ -355,6 +361,16 @@ class ConversationWorker:
         self._consolidate_scheduled: bool = (
             config.runtime.visibility.consolidate_scheduled_turns
         )
+        # Interactive-turn watchdog (channel-hostage guard). Cached at
+        # construction for the same no-hot-reload reason as the flags above.
+        # A forcing ``<system-reminder>`` produced at a soft/hard breach is
+        # stashed here and prepended to ANNA's NEXT turn (the moment she
+        # yields) — see ``turn_watchdog.py`` for why deferred prepend, not
+        # mid-turn SDK steering, is the safe realization under the
+        # single-owned-stream drain. Hard overrides soft when both fire in one
+        # turn; consumed and cleared at the top of the next ``_dispatch_turn``.
+        self._turn_watchdog_cfg = config.runtime.turn_watchdog
+        self._pending_watchdog_reminder: str | None = None
         # Phase 2 §5 subtask 7: when true the worker skips the checkpoint
         # write and the per-core-file eviction sweep at closeout. Set by
         # the router from the first event's ``ephemeral`` flag when the
@@ -1920,6 +1936,225 @@ class ConversationWorker:
         except asyncio.CancelledError:
             raise
 
+    def _turn_watchdog_active(self, event: InboundEvent) -> bool:
+        """Whether to run the interactive-turn watchdog for this turn.
+
+        Active only for an enabled, INTERACTIVE (non-scheduler) turn on a
+        buffered transport (Slack/Telegram) — the exact place the buffered
+        transport can hold the operator's channel hostage. The scheduler path
+        (``completion_future`` set) is exempt, and the CLI transport streams
+        deltas live so its channel never goes dead. Unlike the drip gate this
+        stays active under ``consolidate_interactive_turns``: a breach flush is
+        a deliberate override of consolidation because a dead channel outweighs
+        the one-message preference.
+        """
+        if not self._turn_watchdog_cfg.enabled:
+            return False
+        if event.completion_future is not None:
+            return False
+        return self.transport in ("slack", "telegram")
+
+    async def _turn_watchdog_loop(
+        self,
+        event: InboundEvent,
+        buffer: _FlushBuffer,
+        watchdog: TurnWatchdog,
+    ) -> None:
+        """Drive the watchdog on the drip cadence; act on soft/hard breaches.
+
+        Started at turn begin only when :meth:`_turn_watchdog_active`, and
+        cancelled-and-awaited in the turn's ``finally`` (mirrors the timed-drip
+        teardown). Each ~1s tick polls the watchdog (injectable clock in the
+        state machine; ``loop.time`` here). On a breach it flushes the pending
+        narration to the operator — reusing the same lock/last_flush discipline
+        as the drip loop so the two never race — stashes the forcing reminder
+        for ANNA's next turn, and on the HARD breach records a breach audit row
+        and fires exactly ONE admin alert. ``poll`` fires each level at most
+        once, so the alert is inherently idempotent.
+        """
+        try:
+            while True:
+                await asyncio.sleep(1.0)
+                # Defensive isolation: a breach action (flush/reminder/alert)
+                # that raises unexpectedly must not silently stop escalation
+                # handling for the rest of the turn — log and keep ticking so
+                # a soft-breach hiccup still lets the later hard breach fire.
+                # ``_record_watchdog_hard_breach`` and ``_flush_buffer_now`` are
+                # already exception-isolated; this is belt-and-suspenders for
+                # anything they miss (e.g. ``watchdog.poll`` / ``elapsed``).
+                try:
+                    action = watchdog.poll()
+                    if action is WatchdogAction.NONE:
+                        continue
+                    await self._flush_buffer_now(event, buffer)
+                    if action is WatchdogAction.SOFT:
+                        self._pending_watchdog_reminder = soft_reminder(
+                            self._turn_watchdog_cfg.soft_threshold_seconds
+                        )
+                        self._log.info(
+                            "worker.turn_watchdog.soft_breach",
+                            conv_key=event.conversation_key,
+                            transport=self.transport,
+                            elapsed_seconds=round(watchdog.elapsed_seconds(), 1),
+                            tool_call_count=watchdog.tool_call_count,
+                        )
+                    else:  # WatchdogAction.HARD
+                        self._pending_watchdog_reminder = hard_reminder(
+                            self._turn_watchdog_cfg.hard_threshold_seconds
+                        )
+                        await self._record_watchdog_hard_breach(event, watchdog)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 — keep the ticker alive
+                    self._log.warning(
+                        "worker.turn_watchdog.tick_failed",
+                        error=str(exc),
+                        conv_key=event.conversation_key,
+                        transport=self.transport,
+                    )
+        except asyncio.CancelledError:
+            raise
+
+    async def _flush_buffer_now(
+        self, event: InboundEvent, buffer: _FlushBuffer
+    ) -> None:
+        """Flush ``buffer.pending`` to the operator immediately, if non-empty.
+
+        Mirrors the timed-drip send: taken under ``buffer.lock`` with the send
+        BEFORE the clear so the text is loss-safe, and ``last_flush`` restamped
+        so the drip timer measures its interval from this message. A no-op when
+        the buffer is empty (the reminder/alert still fire around it). Send
+        failures are logged and swallowed so a breach action never crashes the
+        ticker.
+        """
+        async with buffer.lock:
+            if not buffer.pending:
+                return
+            txt = "\n".join(c for c in buffer.pending if c).strip()
+            if not txt:
+                buffer.pending.clear()
+                buffer.last_flush = asyncio.get_running_loop().time()
+                return
+            try:
+                await self._guarded_send(
+                    OutboundMessage(
+                        conversation_key=event.conversation_key,
+                        text=txt,
+                    )
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._log.warning(
+                    "worker.turn_watchdog.flush_failed",
+                    error=str(exc),
+                    conv_key=event.conversation_key,
+                    transport=self.transport,
+                )
+                return
+            buffer.pending.clear()
+            buffer.last_flush = asyncio.get_running_loop().time()
+
+    async def _record_watchdog_hard_breach(
+        self, event: InboundEvent, watchdog: TurnWatchdog
+    ) -> None:
+        """Audit the hard breach and fire ONE best-effort admin alert.
+
+        Called at most once per turn (``poll`` returns HARD once). The admin
+        alert is skipped when the turn's own conversation IS the admin channel
+        (feedback-loop break, mirroring the markup-suppression guard). Never
+        raises — a breach record must not crash the turn.
+        """
+        elapsed = round(watchdog.elapsed_seconds(), 1)
+        self._log.warning(
+            "worker.turn_watchdog.hard_breach",
+            conv_key=event.conversation_key,
+            transport=self.transport,
+            elapsed_seconds=elapsed,
+            tool_call_count=watchdog.tool_call_count,
+        )
+        # Exception-isolated (mirrors ``_emit_turn_telemetry``): an audit/disk
+        # IO error while recording the breach must NOT crash the ticker task
+        # nor suppress the admin alert below — the alert is the operator-facing
+        # half and matters more than the durable row. "Never raises" (docstring)
+        # depends on this: without it a failed write kills the watchdog loop and
+        # the operator is never alerted.
+        try:
+            audit_event(
+                "audit.turn.watchdog_breach",
+                audit_dir=self._config.audit_dir,
+                actor="anna",
+                conv_key=event.conversation_key,
+                fsync_on_write=self._config.logging.audit.fsync_on_write,
+                level="WARNING",
+                transport=self.transport,
+                duration_seconds=elapsed,
+                tool_call_count=watchdog.tool_call_count,
+                backgrounded=watchdog.backgrounded,
+                soft_threshold_seconds=self._turn_watchdog_cfg.soft_threshold_seconds,
+                hard_threshold_seconds=self._turn_watchdog_cfg.hard_threshold_seconds,
+            )
+        except Exception as exc:  # noqa: BLE001 — breach record must not crash
+            self._log.warning(
+                "worker.turn_watchdog.breach_audit_failed",
+                error=str(exc),
+                conv_key=event.conversation_key,
+                transport=self.transport,
+            )
+        if self._alerter is None:
+            return
+        if self._suppression_in_admin_channel(event.conversation_key):
+            return
+        message = (
+            "Interactive turn held the operator's channel for "
+            f"{elapsed:.0f}s on {self.transport} (conv "
+            f"{event.conversation_key}) without backgrounding — "
+            f"{watchdog.tool_call_count} tool call(s), delegated="
+            f"{watchdog.backgrounded}. ANNA was reminded to background the "
+            "work and end the turn."
+        )
+        try:
+            await self._alerter.warn(message, exclude_channel=None)
+        except Exception as exc:
+            self._log.warning(
+                "worker.turn_watchdog.alert_failed",
+                error=str(exc),
+                conv_key=event.conversation_key,
+                transport=self.transport,
+            )
+
+    def _emit_turn_telemetry(
+        self, event: InboundEvent, watchdog: TurnWatchdog
+    ) -> None:
+        """Write the per-interactive-turn telemetry audit row.
+
+        Emitted once at turn end for every armed interactive turn — duration,
+        tool count, whether it backgrounded work, and the soft/hard breach
+        flags. WARNING level when the turn breached (soft or hard) so it stays
+        visible in journald, INFO otherwise. Exception-isolated: telemetry must
+        never break turn teardown.
+        """
+        telemetry = watchdog.telemetry()
+        breached = telemetry["soft_breached"] or telemetry["hard_breached"]
+        try:
+            audit_event(
+                "audit.turn.telemetry",
+                audit_dir=self._config.audit_dir,
+                actor="anna",
+                conv_key=event.conversation_key,
+                fsync_on_write=self._config.logging.audit.fsync_on_write,
+                level="WARNING" if breached else "INFO",
+                transport=self.transport,
+                **telemetry,
+            )
+        except Exception as exc:  # noqa: BLE001 — never break turn teardown
+            self._log.warning(
+                "worker.turn_watchdog.telemetry_failed",
+                error=str(exc),
+                conv_key=event.conversation_key,
+                transport=self.transport,
+            )
+
     def _suppression_in_admin_channel(self, conv_key: str) -> bool:
         """True when ``conv_key`` targets the admin alert destination for this
         transport. Used to break the alert feedback loop: a suppression that
@@ -2174,6 +2409,23 @@ class ConversationWorker:
                     f"{event.text}"
                 )
 
+        # Consume a forcing watchdog reminder stashed by a PRIOR turn's breach
+        # ticker (deferred prepend — see turn_watchdog.py). Prepended ahead of
+        # any cadence reminder so it leads ANNA's context, then cleared so it
+        # fires exactly once. Gated to INTERACTIVE turns (``completion_future
+        # is None`` — the same interactive-vs-scheduled signal
+        # ``_turn_watchdog_active`` uses): a scheduled/heartbeat turn that
+        # happens to run on the same worker/conv_key must NOT inherit a "you're
+        # holding the operator's channel, background and end the turn" reminder
+        # meant for the operator's live channel. The stash survives (still
+        # ``None``-cleared here) so the next INTERACTIVE turn carries it.
+        if (
+            self._pending_watchdog_reminder is not None
+            and event.completion_future is None
+        ):
+            query_text = f"{self._pending_watchdog_reminder}\n\n{query_text}"
+            self._pending_watchdog_reminder = None
+
         # Thinking-signal start. Captured handle (possibly None) is
         # cleared in the outer ``finally`` below so the cleanup path
         # runs on success, exception, and cancellation alike. A start
@@ -2244,6 +2496,23 @@ class ConversationWorker:
             flush_task = asyncio.create_task(
                 self._periodic_flush_loop(event, buffer),
                 name=f"worker.flush.{self.conversation_key}",
+            )
+        # Interactive-turn watchdog (channel-hostage guard). Armed ONLY for a
+        # buffered interactive turn; ticks on its own ~1s cadence, shares the
+        # same ``buffer`` (and its lock) as the drip so their flushes never
+        # race. The state machine uses ``loop.time`` as its clock (tests inject
+        # a fake); telemetry is emitted in the ``finally`` below.
+        watchdog: TurnWatchdog | None = None
+        watchdog_task: asyncio.Task[None] | None = None
+        if self._turn_watchdog_active(event):
+            watchdog = TurnWatchdog(
+                soft_seconds=self._turn_watchdog_cfg.soft_threshold_seconds,
+                hard_seconds=self._turn_watchdog_cfg.hard_threshold_seconds,
+                clock=loop.time,
+            )
+            watchdog_task = asyncio.create_task(
+                self._turn_watchdog_loop(event, buffer, watchdog),
+                name=f"worker.watchdog.{self.conversation_key}",
             )
         try:
             # Send the user message into the SDK. NOTE: ``query_text``
@@ -2321,6 +2590,17 @@ class ConversationWorker:
                                 # scheduled-turn regeneration guard reads this
                                 # to refuse a re-run that would double-execute.
                                 tool_used = True
+                                # Feed the interactive-turn watchdog: bump its
+                                # tool count and let it notice when work was
+                                # backgrounded (delegate / background Bash), at
+                                # which point it goes quiet for the rest of the
+                                # turn. No-op on the scheduled path (watchdog is
+                                # None there).
+                                if watchdog is not None:
+                                    watchdog.note_tool_call(
+                                        getattr(block, "name", "") or "",
+                                        getattr(block, "input", None),
+                                    )
                                 # Tool-use boundary for the scheduled TERMINAL
                                 # report: everything narrated up to this tool
                                 # call is mid-turn narration, not the final
@@ -2428,6 +2708,29 @@ class ConversationWorker:
                         conv_key=event.conversation_key,
                         transport=self.transport,
                     )
+            # Tear down the watchdog ticker on the same terms as the flush
+            # task (its OWN cancellation suppressed; a stop/restart cancel of
+            # the current task re-raised), then stamp + emit per-turn
+            # telemetry. Runs on every exit path so an interactive turn is
+            # always recorded, breach or not.
+            if watchdog_task is not None:
+                watchdog_task.cancel()
+                try:
+                    await watchdog_task
+                except asyncio.CancelledError:
+                    current = asyncio.current_task()
+                    if current is not None and current.cancelling() > 0:
+                        raise
+                except Exception as exc:
+                    self._log.warning(
+                        "worker.turn_watchdog.teardown_failed",
+                        error=str(exc),
+                        conv_key=event.conversation_key,
+                        transport=self.transport,
+                    )
+            if watchdog is not None:
+                watchdog.mark_ended()
+                self._emit_turn_telemetry(event, watchdog)
             # ALWAYS clear, even on exception, cancellation, or early
             # return inside the try-block above. The clear callable is
             # itself exception-isolated — defense-in-depth keeps a

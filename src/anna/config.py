@@ -252,6 +252,52 @@ class RuntimeVisibilityConfig(BaseModel):
         return v
 
 
+class TurnWatchdogConfig(BaseModel):
+    """Interactive-turn watchdog (mechanical channel-hostage guard).
+
+    A long INTERACTIVE turn on a buffered transport (Slack/Telegram) holds
+    the operator's channel until it terminates — inbound messages queue
+    behind it. When ANNA does heavy work inline instead of backgrounding it
+    to a sub-agent, the channel goes dead. The watchdog times the turn's
+    wall-clock (piggybacking the existing drip/flush cadence) and, when the
+    turn has NOT yielded and NO sub-agent / background task has been spawned:
+
+    * ``soft_threshold_seconds`` — flush pending narration to the operator
+      and inject a forcing ``<system-reminder>`` telling ANNA to background
+      the remaining work and end the turn.
+    * ``hard_threshold_seconds`` — escalate: flush again, inject a stronger
+      reminder, record a breach, and fire ONE admin alert.
+
+    Applies to interactive turns only (the scheduler / ``completion_future``
+    path is exempt). Default-on but conservative (60s / 120s). Per-turn
+    telemetry (duration, tool count, whether it delegated, breach flags) is
+    written to the audit log for every interactive turn regardless. No
+    hot-reload — takes effect on the next restart.
+    """
+
+    enabled: bool = True
+    soft_threshold_seconds: int = 60
+    hard_threshold_seconds: int = 120
+
+    @field_validator("soft_threshold_seconds", "hard_threshold_seconds")
+    @classmethod
+    def _positive(cls, v: int, info: Any) -> int:
+        if v <= 0:
+            raise ValueError(
+                f"runtime.turn_watchdog.{info.field_name} must be a positive integer"
+            )
+        return v
+
+    @model_validator(mode="after")
+    def _hard_above_soft(self) -> "TurnWatchdogConfig":
+        if self.hard_threshold_seconds <= self.soft_threshold_seconds:
+            raise ValueError(
+                "runtime.turn_watchdog.hard_threshold_seconds must be greater "
+                "than soft_threshold_seconds"
+            )
+        return self
+
+
 class RuntimeConfig(BaseModel):
     """SDK runtime options applied to every conversation worker.
 
@@ -298,6 +344,7 @@ class RuntimeConfig(BaseModel):
     effort: str | None = None
 
     visibility: RuntimeVisibilityConfig = Field(default_factory=RuntimeVisibilityConfig)
+    turn_watchdog: TurnWatchdogConfig = Field(default_factory=TurnWatchdogConfig)
 
     @field_validator("model", "fallback_model")
     @classmethod

@@ -104,6 +104,33 @@ runtime:
   #     - "^Synthesizing:"
   #     - "^Let me \\w+\\s+[—-]\\s+"
   #     - "backgrounded so\\b"
+  # ----------------------------------------------------------
+  # Interactive-turn watchdog (channel-hostage guard).
+  #
+  # A long INTERACTIVE turn on a buffered transport (Slack/Telegram)
+  # holds the operator's channel until it terminates — inbound messages
+  # queue behind it. When ANNA does heavy work inline instead of
+  # backgrounding it to a sub-agent, the channel goes dead. The watchdog
+  # times the turn's wall-clock (on the drip/flush cadence) and, when the
+  # turn has NOT yielded and NO sub-agent / background task was spawned:
+  #   soft_threshold_seconds  flush pending narration to the operator and
+  #                           inject a forcing <system-reminder> telling
+  #                           ANNA to background the remaining work and end
+  #                           the turn (delivered on her next turn).
+  #   hard_threshold_seconds  escalate: flush again, inject a stronger
+  #                           reminder, record a breach, and fire ONE admin
+  #                           alert summarizing the turn.
+  # A turn that delegated/backgrounded early stays silent. Per-turn
+  # telemetry (duration, tool count, delegated?, breach flags) is written
+  # to the audit log for every buffered interactive turn regardless.
+  # Applies to interactive turns only (scheduler path exempt). Defaults
+  # are on but conservative. hard must be > soft; both must be positive.
+  # Takes effect on restart.
+  # ----------------------------------------------------------
+  # turn_watchdog:
+  #   enabled: true
+  #   soft_threshold_seconds: 60
+  #   hard_threshold_seconds: 120
 
 # ============================================================
 # Transports
