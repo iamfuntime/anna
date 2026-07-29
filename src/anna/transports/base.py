@@ -135,6 +135,16 @@ class InboundEvent:
     constructor; subsequent events on the same conv_key reuse the
     already-flagged worker.
 
+    ``turn_meta`` is an optional caller-owned dict the worker writes
+    per-turn telemetry into before it resolves ``completion_future`` —
+    currently just ``tool_call_count``. It is the return channel the
+    future itself cannot be (the future carries the reply text only).
+    The Phase 2 scheduler passes a fresh dict per fire and reads
+    ``tool_call_count`` to detect a scheduled turn that produced prose
+    without executing a single tool. Left ``None`` by every
+    transport-originated event; when ``None`` the worker writes nothing
+    and every consumer must treat the count as UNKNOWN (fail open).
+
     ``images`` carries inbound image attachments (Slack drag-and-drop)
     as :class:`ImageAttachment` records the worker base64-encodes into
     SDK image content blocks. Empty for every text and voice turn; voice
@@ -168,6 +178,9 @@ class InboundEvent:
     )
     images: list[ImageAttachment] = field(
         default_factory=list, compare=False, hash=False, repr=False
+    )
+    turn_meta: dict[str, Any] | None = field(
+        default=None, compare=False, hash=False, repr=False
     )
 
 

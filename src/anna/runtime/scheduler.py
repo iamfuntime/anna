@@ -243,13 +243,20 @@ class Scheduler:
             if not tasks:
                 del self._tasks_by_schedule[schedule_id]
 
-    async def fire(self, schedule_id: str) -> str:
+    async def fire(
+        self, schedule_id: str, *, turn_meta: dict[str, object] | None = None
+    ) -> str:
         """Fire one schedule by id. Returns the reply text the worker produced.
 
         Caller is responsible for routing the returned text to the
         schedule's destination. :meth:`_guarded_fire` is the normal
         entrypoint; ``fire`` is exposed for tests and for a future
         ``fire_now`` operator command.
+
+        ``turn_meta``, when passed, is handed to the worker on the event and
+        comes back populated with per-turn telemetry (``tool_call_count``).
+        :meth:`_guarded_fire` uses it for the no-tool-call backstop; callers
+        that do not care leave it ``None``.
         """
         schedule = self._store.get(schedule_id)
         if schedule is None:
@@ -269,6 +276,7 @@ class Scheduler:
             raw={"schedule_id": schedule.id},
             completion_future=completion,
             ephemeral=schedule.ephemeral,
+            turn_meta=turn_meta,
         )
 
         await self._router.dispatch(event)
@@ -292,10 +300,51 @@ class Scheduler:
             self._log.info("scheduler.fire", schedule_id=schedule.id)
 
             try:
+                meta: dict[str, object] = {}
                 reply = await asyncio.wait_for(
-                    self.fire(schedule.id),
+                    self.fire(schedule.id, turn_meta=meta),
                     timeout=schedule.timeout_seconds,
                 )
+                # No-tool-call backstop (2026-07-29 incident:
+                # oem-slide-restock-watch resolved in 2.5s with zero tool
+                # calls and the bare text "I'll read the skill file first",
+                # which the scheduler dutifully posted to the operator's DM;
+                # deals-watch did the same on 2026-07-25). A scheduled run
+                # exists to DO something — a turn that executed no tool
+                # produced an intent, not a result, and its text must never
+                # reach the destination. Retry ONCE into the same session,
+                # exactly like the worker's markup regeneration: zero tools
+                # ran, so the aborted turn has no side effects and the re-run
+                # carries no double-execution risk. AT MOST one retry — a
+                # persistently narrating model degrades to a recorded
+                # failure, never to a loop.
+                if self._is_no_tool_call_prose(reply, meta):
+                    first_reply = reply
+                    audit_event(
+                        "audit.schedule.no_tool_call_retry",
+                        audit_dir=self._audit_dir,
+                        actor="anna",
+                        fsync_on_write=self._fsync,
+                        level="WARNING",
+                        schedule_id=schedule.id,
+                        output_length=len(first_reply),
+                        preview=first_reply[:280],
+                    )
+                    self._log.warning(
+                        "scheduler.no_tool_call_retry",
+                        schedule_id=schedule.id,
+                        output_length=len(first_reply),
+                    )
+                    meta = {}
+                    reply = await asyncio.wait_for(
+                        self.fire(schedule.id, turn_meta=meta),
+                        timeout=schedule.timeout_seconds,
+                    )
+                    if self._is_no_tool_call_prose(reply, meta):
+                        await self._handle_no_tool_call_abort(
+                            schedule, first_reply=first_reply, retry_reply=reply
+                        )
+                        return
             except asyncio.TimeoutError:
                 await self._handle_failure(
                     schedule, reason=f"timeout after {schedule.timeout_seconds}s", kind="timeout"
@@ -319,9 +368,7 @@ class Scheduler:
             # sentinel, the skill signaled "stay quiet" — honor it and suppress,
             # matching the quiet-by-default bias. A sentinel embedded mid-line in
             # genuine alert prose is NOT a quiet signal and still posts.
-            if reply is not None and any(
-                line.strip() == QUIET_SENTINEL for line in reply.splitlines()
-            ):
+            if reply is not None and self._is_quiet_sentinel(reply):
                 self._log.info(
                     "scheduler.quiet_suppress",
                     schedule_id=schedule.id,
@@ -342,7 +389,7 @@ class Scheduler:
             # lone punctuation mark — is never a legitimate scheduled post.
             # Suppress it identically to the quiet-sentinel path so the run
             # still counts as a success and last_fired_at advances.
-            if reply is not None and not any(ch.isalnum() for ch in reply):
+            if reply is not None and self._is_blank_output(reply):
                 self._log.warning(
                     "scheduler.blank_output_suppress",
                     schedule_id=schedule.id,
@@ -380,6 +427,82 @@ class Scheduler:
                 return
 
             await self._record_success(schedule, reply, started_at=started_at)
+
+    @staticmethod
+    def _is_quiet_sentinel(reply: str) -> bool:
+        """True when ANY line of ``reply`` is exactly the quiet sentinel."""
+        return any(line.strip() == QUIET_SENTINEL for line in reply.splitlines())
+
+    @staticmethod
+    def _is_blank_output(reply: str) -> bool:
+        """True when ``reply`` carries no alphanumeric character at all."""
+        return not any(ch.isalnum() for ch in reply)
+
+    @classmethod
+    def _is_no_tool_call_prose(
+        cls, reply: str | None, meta: dict[str, object]
+    ) -> bool:
+        """True when a scheduled turn produced postable prose without running
+        a single tool — the shape the backstop retries and, on a repeat,
+        fails.
+
+        Gated on ``tool_call_count`` ALONE, never on duration: a legitimately
+        fast run is fine, and slow narration is still narration. A count the
+        worker did not report (key absent — e.g. an event that never reached
+        the completion-future path) reads as UNKNOWN and fails OPEN, so a
+        plumbing regression can only restore today's behavior rather than
+        start failing every tick.
+
+        The three suppression guards in :meth:`_guarded_fire` take
+        precedence. A run that returns the quiet sentinel, blank output, or
+        leaked markup already has a correct home — it posts nothing and is
+        recorded a success — and must not be re-run or marked failed. The
+        sentinel case is the load-bearing one: a skill that early-exits on
+        already-resolved state legitimately returns the sentinel with zero
+        tool calls, and that is a healthy quiet tick, not a failure.
+        """
+        if reply is None:
+            return False
+        count = meta.get("tool_call_count")
+        if not isinstance(count, int) or count > 0:
+            return False
+        if cls._is_quiet_sentinel(reply) or cls._is_blank_output(reply):
+            return False
+        return not _contains_unparsed_toolcall_markup(reply)
+
+    async def _handle_no_tool_call_abort(
+        self, schedule: Schedule, *, first_reply: str, retry_reply: str
+    ) -> None:
+        """Both attempts narrated instead of acting: suppress and fail.
+
+        Neither attempt's text goes anywhere, so this audit row is the only
+        record of what the model actually said — it carries both replies in
+        full so the run stays reconstructable from the audit log. Failure
+        bookkeeping goes through the shared :meth:`_handle_failure` path, so
+        the run counts toward ``consecutive_failures`` and trips the
+        three-strikes auto-disable exactly as a timeout does.
+        """
+        audit_event(
+            "audit.schedule.no_tool_call_abort",
+            audit_dir=self._audit_dir,
+            actor="anna",
+            fsync_on_write=self._fsync,
+            level="WARNING",
+            schedule_id=schedule.id,
+            first_output=first_reply,
+            retry_output=retry_reply,
+        )
+        self._log.warning(
+            "scheduler.no_tool_call_abort",
+            schedule_id=schedule.id,
+            first_output_length=len(first_reply),
+            retry_output_length=len(retry_reply),
+        )
+        await self._handle_failure(
+            schedule,
+            reason="no tool call on either attempt (output suppressed)",
+            kind="no_tool_call",
+        )
 
     async def _record_success(
         self,

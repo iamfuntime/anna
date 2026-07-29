@@ -2284,6 +2284,14 @@ class ConversationWorker:
                             terminal_chunks.append(block.text)
                         elif ToolUseBlock is not None and isinstance(block, ToolUseBlock):
                             terminal_chunks.clear()
+                            # Keep the caller's tool-call count truthful across
+                            # the regeneration: a re-run that DID execute tools
+                            # is a real run, and the scheduler's no-tool-call
+                            # backstop must not then retry it a third time.
+                            if event.turn_meta is not None:
+                                event.turn_meta["tool_call_count"] = (
+                                    int(event.turn_meta.get("tool_call_count", 0)) + 1
+                                )
                 if ResultMessage is not None and isinstance(msg, ResultMessage):
                     break
         except Exception as exc:
@@ -2486,6 +2494,11 @@ class ConversationWorker:
         # EVERY path (interactive and scheduled) because the ToolUseBlock is
         # visible in the drain loop regardless of the flush sub-branch.
         tool_used = False
+        # Same signal as ``tool_used`` but counted, published to the caller
+        # via ``event.turn_meta`` on the completion-future path. The
+        # scheduler's no-tool-call backstop reads it to tell a real run from
+        # a turn that only narrated (2026-07-29 oem-slide-restock-watch).
+        tool_call_count = 0
         loop = asyncio.get_running_loop()
         buffer = _FlushBuffer(last_flush=loop.time())
         # Timed-drip timer (Inbox/2026-06-04 plan). Started ONLY for an
@@ -2590,6 +2603,7 @@ class ConversationWorker:
                                 # scheduled-turn regeneration guard reads this
                                 # to refuse a re-run that would double-execute.
                                 tool_used = True
+                                tool_call_count += 1
                                 # Feed the interactive-turn watchdog: bump its
                                 # tool count and let it notice when work was
                                 # backgrounded (delegate / background Bash), at
@@ -2771,6 +2785,13 @@ class ConversationWorker:
         # output itself. Transport-originated events have completion_future
         # unset and use the standard send-back path.
         if event.completion_future is not None and not event.completion_future.done():
+            # Publish the turn's tool-call count to the caller BEFORE any
+            # branch below can resolve the future. The future carries text
+            # only, so ``turn_meta`` is the scheduler's sole view of whether
+            # this turn actually did anything; the regeneration path further
+            # down keeps bumping the same dict.
+            if event.turn_meta is not None:
+                event.turn_meta["tool_call_count"] = tool_call_count
             # Scheduled-turn narration consolidation (2026-07-12
             # weekly-synthesis incident). Under ``consolidate_scheduled_turns``
             # (default on), the future resolves with ONLY the turn's TERMINAL
