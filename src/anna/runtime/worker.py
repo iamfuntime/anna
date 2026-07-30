@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import re
+import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -290,6 +291,93 @@ def _user_message_text(msg: Any) -> str:
     return "\n".join(parts)
 
 
+# Wrapper blocks the harness puts around machine-generated inbound it surfaces
+# as user text: a finished background task
+# (``<task-notification>…</task-notification>``) and injected context
+# (``<system-reminder>…</system-reminder>``, which also carries our own cadence
+# and turn-watchdog reminders). Whatever survives their removal was typed by a
+# PERSON. See :func:`_operator_text_of`.
+_MACHINE_INBOUND_BLOCK_RE = re.compile(
+    r"<(task-notification|system-reminder)\b.*?</\1>",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _operator_text_of(msg: Any) -> str:
+    """Genuine operator text carried by a stream ``UserMessage``, or ``""``.
+
+    A user message inside a turn is normally machinery: a tool result (its
+    blocks are ``ToolResultBlock``, which carry no ``text``, so
+    :func:`_user_message_text` already yields ``""``), a background-task
+    completion notification, or an injected ``<system-reminder>``. The harness
+    does, however, surface a REAL operator message inside a running turn by
+    appending a ``TextBlock`` to the same user message that carries a tool
+    result — so the presence of ``tool_use_result`` / ``parent_tool_use_id``
+    deliberately does NOT disqualify a message here (unlike
+    :meth:`ConversationWorker._is_injected_user_message`, which is answering a
+    different question).
+
+    Strip every machine-generated wrapper block; non-whitespace left over is a
+    person talking. Fails OPEN by construction — unrecognized machine text
+    reads as operator text, which can only make the notification-only guard
+    inert (today's behavior), never silence a human.
+    """
+    text = _user_message_text(msg)
+    if not text:
+        return ""
+    return _MACHINE_INBOUND_BLOCK_RE.sub("", text).strip()
+
+
+@dataclass
+class _NotificationOnlyTurn:
+    """Per-turn ledger for the notification-only text guard.
+
+    2026-07-30 incident: ANNA launched 13 background sub-agents; each
+    completion notification re-invoked her, she narrated on every one, and the
+    buffered Slack transport flushed 184k accumulated characters as ~47
+    messages in one second. Prompt-layer rules had failed to stop this six
+    times, so the decision moved into the daemon.
+
+    ``sources`` names every background-completion notification that triggered
+    the turn — empty means the guard is inert and NOTHING is suppressed.
+    ``user_inbound`` latches True the instant ANY genuine operator message is
+    seen as part of the same turn's inbound (including one the harness
+    surfaces MID-TURN alongside a tool result) and never unlatches: once a
+    real person is in the turn, its text ships. Scoped to one turn; never
+    long-lived worker state.
+    """
+
+    turn_id: str
+    sources: list[str] = field(default_factory=list)
+    user_inbound: bool = False
+    suppressed_chars: int = 0
+    suppressed_sends: int = 0
+    preview: str = ""
+
+    @property
+    def suppressing(self) -> bool:
+        """True when this turn's user-facing text must not reach a transport."""
+        return bool(self.sources) and not self.user_inbound
+
+    def note_source(self, source: str) -> None:
+        """Record one notification that triggered this turn (deduplicated).
+
+        Several notifications landing on ONE turn stay one ledger, so the
+        audit row is per-turn rather than per-notification.
+        """
+        if source not in self.sources:
+            self.sources.append(source)
+
+    def note_user_inbound(self) -> None:
+        self.user_inbound = True
+
+    def note_suppressed(self, text: str) -> None:
+        self.suppressed_chars += len(text)
+        self.suppressed_sends += 1
+        if not self.preview:
+            self.preview = text[:280]
+
+
 class ConversationWorker:
     """An async worker that owns one Claude SDK session for one conversation."""
 
@@ -404,6 +492,23 @@ class ConversationWorker:
         # registered. Delivery is deferred to ``_end_turn`` so the live
         # turn's own reply always reaches the transport first.
         self._deferred_unsolicited: list[str] = []
+        # Notification-only text guard (2026-07-30 sub-agent flood). Two
+        # per-turn ledgers, one per kind of turn a background completion can
+        # trigger, deliberately kept SEPARATE so an unsolicited turn that
+        # straddles a live turn cannot inherit the other's verdict:
+        #
+        # * ``_notification_turn`` — a DISPATCHED turn (an ``InboundEvent`` the
+        #   router injected for a finished background delegation). Set in
+        #   ``_handle``, read by ``_guarded_send``, settled before ``_end_turn``.
+        # * ``_notification_unsolicited`` — an UNSOLICITED turn the CLI ran off
+        #   its own task notification while no turn was registered (the incident
+        #   path). Accumulated in ``_route_idle_locked`` and settled at that
+        #   turn's ResultMessage.
+        #
+        # ``None`` on both means the guard is inert, which is the state EVERY
+        # operator-originated turn is in. See :meth:`_notification_turn_for`.
+        self._notification_turn: _NotificationOnlyTurn | None = None
+        self._notification_unsolicited: _NotificationOnlyTurn | None = None
         self._closed_out = False
         self._operator_short_name: str | None = None
         # Set true once the idle watcher has fired its close callback so we
@@ -967,6 +1072,9 @@ class ConversationWorker:
             )
         self._idle_chunks.clear()
         self._unsolicited_open = False
+        # The discarded chunks were this ledger's only subject; a stale ledger
+        # would otherwise judge the NEXT unsolicited turn.
+        self._notification_unsolicited = None
 
     async def _stop_stream_consumer(self) -> None:
         """Cancel-and-await the consumer task and reset the idle-route state.
@@ -1141,6 +1249,19 @@ class ConversationWorker:
             self._unsolicited_open = False
             text = "\n".join(c for c in self._idle_chunks if c).strip()
             self._idle_chunks.clear()
+            # Settle the notification-only guard for THIS unsolicited turn (the
+            # 2026-07-30 flood path: task notifications woke the CLI while no
+            # turn was registered, and the accumulated narration went out as one
+            # 184k-character burst). Read and cleared together so the next
+            # unsolicited turn starts from a clean ledger.
+            ledger = self._notification_unsolicited
+            self._notification_unsolicited = None
+            if text and ledger is not None and ledger.suppressing:
+                ledger.note_suppressed(text)
+                self._emit_notification_suppressed(
+                    ledger, conv_key=self.conversation_key
+                )
+                return
             if text:
                 if self._turn_queue is not None:
                     # A live turn is registered: defer delivery to
@@ -1157,6 +1278,12 @@ class ConversationWorker:
             self._unsolicited_open = True
             if self._is_injected_user_message(msg):
                 self._log.info("worker.stream.task_notification_user")
+                self._note_unsolicited_notification("task_notification_user")
+            elif _operator_text_of(msg):
+                # Genuine operator text opened (or joined) this unsolicited
+                # turn. Latch it so the reply is delivered even if a task
+                # notification also lands before the turn closes.
+                self._unsolicited_ledger().note_user_inbound()
             return
         if AssistantMessage is not None and isinstance(msg, AssistantMessage):
             self._unsolicited_open = True
@@ -1177,6 +1304,30 @@ class ConversationWorker:
                 "worker.stream.task_notification",
                 status=getattr(msg, "status", None),
             )
+            # It DOES, however, record why the model turn that follows exists.
+            # This is the shape the 2026-07-30 flood arrived in: twelve of these
+            # on one idle worker, then one enormous accumulated reply.
+            self._note_unsolicited_notification("system_task_notification")
+
+    def _unsolicited_ledger(self) -> _NotificationOnlyTurn:
+        """The current unsolicited turn's ledger, created on first use.
+
+        Lazily built so the common case — an unsolicited turn with no
+        notification and no operator text anywhere near it — allocates nothing
+        and leaves the guard inert.
+        """
+        ledger = self._notification_unsolicited
+        if ledger is None:
+            ledger = _NotificationOnlyTurn(turn_id=uuid.uuid4().hex[:12])
+            self._notification_unsolicited = ledger
+        return ledger
+
+    def _note_unsolicited_notification(self, source: str) -> None:
+        """Record one background-completion notification against the current
+        unsolicited turn. Repeats collapse into the one ledger, so a turn woken
+        by a dozen simultaneous completions still audits exactly once.
+        """
+        self._unsolicited_ledger().note_source(source)
 
     async def _deliver_unsolicited_text(self, text: str) -> None:
         """Send a completed unsolicited turn's text via the guarded path."""
@@ -2235,6 +2386,81 @@ class ConversationWorker:
                 name=f"worker.markup_alert.{conv_key}",
             )
 
+    def _notification_turn_for(
+        self, event: InboundEvent
+    ) -> _NotificationOnlyTurn | None:
+        """Ledger for a dispatched turn NOTHING but a background completion
+        triggered, or ``None`` when the guard must stay inert.
+
+        Interactive DM turns are unreachable BY CONSTRUCTION rather than by a
+        runtime check, the same design principle as
+        :meth:`_periodic_flush_active` and :meth:`_turn_watchdog_active`. The
+        sole trigger is ``raw["background_delegation"]``, which ONLY
+        ``ConversationRouter.deliver_background_completion`` ever stamps — no
+        transport populates ``raw`` with it, so no message an operator can type
+        produces a ledger. Deliberately NOT keyed on the ``<task-notification>``
+        text marker: on a dispatched event that marker could only come from
+        inbound the operator authored, and silencing her because she quoted a
+        string is precisely the failure this guard must not introduce. That
+        marker is authored by the CLI on the SDK stream, where
+        :meth:`_is_injected_user_message` handles it.
+
+        The scheduler path (``completion_future`` set) is excluded too: it
+        resolves a future instead of sending, and already owns the quiet
+        sentinel, blank-output and no-tool-call guards.
+        """
+        if event.completion_future is not None:
+            return None
+        if not event.raw.get("background_delegation"):
+            return None
+        ledger = _NotificationOnlyTurn(turn_id=uuid.uuid4().hex[:12])
+        ledger.note_source("background_delegation")
+        return ledger
+
+    def _emit_notification_suppressed(
+        self, ledger: _NotificationOnlyTurn, *, conv_key: str
+    ) -> None:
+        """Audit + log exactly ONE row for a turn whose text was suppressed.
+
+        Called once per turn at the point the turn is settled — never per
+        suppressed send and never per notification — so a turn woken by a dozen
+        simultaneous completions produces a single record naming all of them.
+        No admin alert: an alert-per-suppression would rebuild in the admin
+        channel the very flood this guard exists to stop. Exception-isolated,
+        because a turn must never fail on its own bookkeeping.
+        """
+        try:
+            audit_event(
+                "audit.reply.notification_only_suppressed",
+                audit_dir=self._config.audit_dir,
+                actor="anna",
+                conv_key=conv_key,
+                fsync_on_write=self._config.logging.audit.fsync_on_write,
+                level="INFO",
+                transport=self.transport,
+                turn_id=ledger.turn_id,
+                sources=list(ledger.sources),
+                char_count=ledger.suppressed_chars,
+                send_count=ledger.suppressed_sends,
+                preview=ledger.preview,
+            )
+        except Exception as exc:  # noqa: BLE001 — never break turn teardown
+            self._log.warning(
+                "worker.reply.notification_only_audit_failed",
+                error=str(exc),
+                conv_key=conv_key,
+                transport=self.transport,
+            )
+        self._log.info(
+            "worker.reply.notification_only_suppressed",
+            conv_key=conv_key,
+            transport=self.transport,
+            turn_id=ledger.turn_id,
+            sources=list(ledger.sources),
+            char_count=ledger.suppressed_chars,
+            send_count=ledger.suppressed_sends,
+        )
+
     async def _regenerate_scheduled_reply(
         self, event: InboundEvent, correction_prompt: str
     ) -> str | None:
@@ -2334,7 +2560,20 @@ class ConversationWorker:
         prose-instead-of-tool-call failure). ``tool_used`` defaults to
         ``False`` so callers with no notion of tool execution keep the strict,
         fail-closed behavior.
+
+        The notification-only guard is checked FIRST and short-circuits: when
+        nothing this turn may be posted, whether the text ALSO leaked markup is
+        moot, and the turn keeps its single audit row. Only the outbound post is
+        dropped — the turn ran, its tools executed and its state landed. Every
+        interactive assistant-text send site funnels through here (the
+        tool-use-boundary flush, the timed drip, the watchdog flush, the final
+        trailing send, the ``(no response)`` fallback), which is what makes the
+        drop total rather than best-effort.
         """
+        ledger = self._notification_turn
+        if ledger is not None and ledger.suppressing:
+            ledger.note_suppressed(msg.text)
+            return
         if _should_suppress_markup(msg.text, tool_used=tool_used):
             await self._emit_markup_suppressed(
                 msg.text, conv_key=msg.conversation_key
@@ -2368,10 +2607,27 @@ class ConversationWorker:
         # own reply always precedes any re-routed leftover (unsolicited)
         # messages; ``_end_turn`` then deregisters and replays post-Result
         # leftovers to the idle path on every exit path.
+        #
+        # Notification-only text guard. Armed BEFORE the turn runs (so every
+        # send site inside it sees the same verdict) and settled in the
+        # ``finally`` BEFORE ``_end_turn``: the deferred unsolicited replies
+        # ``_end_turn`` flushes belong to a DIFFERENT turn and are judged by
+        # their own ledger, never by this one.
+        self._notification_turn = self._notification_turn_for(event)
         turn_queue = self._begin_turn()
         try:
             await self._dispatch_turn(event, turn_queue)
         finally:
+            ledger = self._notification_turn
+            self._notification_turn = None
+            # Emit on ``suppressed_sends`` alone, not on the final verdict: if a
+            # mid-turn operator message disarmed the guard AFTER some narration
+            # was already dropped, that drop still happened and is still owed a
+            # record.
+            if ledger is not None and ledger.suppressed_sends:
+                self._emit_notification_suppressed(
+                    ledger, conv_key=event.conversation_key
+                )
             await self._end_turn(turn_queue)
 
     async def _dispatch_turn(
@@ -2385,9 +2641,15 @@ class ConversationWorker:
         queue (via ``_turn_messages``) instead of ``receive_response()``.
         """
         try:
-            from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock, ToolUseBlock
+            from claude_agent_sdk import (
+                AssistantMessage,
+                ResultMessage,
+                TextBlock,
+                ToolUseBlock,
+                UserMessage,
+            )
         except ImportError:
-            AssistantMessage = ResultMessage = TextBlock = ToolUseBlock = None  # type: ignore[assignment,misc]
+            AssistantMessage = ResultMessage = TextBlock = ToolUseBlock = UserMessage = None  # type: ignore[assignment,misc]
 
         # Cadence-Visibility Hooks plan (Inbox/2026-06-02) subtask 5:
         # for buffered transports (Slack, Telegram) prepend the
@@ -2565,6 +2827,29 @@ class ConversationWorker:
 
             try:
                 async for msg in self._turn_messages(turn_queue):
+                    # Mid-turn operator message. The harness surfaces a real
+                    # person's message INSIDE a running turn by appending a text
+                    # block to the user message that carries a tool result. That
+                    # is genuine inbound: it disarms the notification-only guard
+                    # for the rest of the turn so the reply she is owed is
+                    # delivered. A notification-marked user message never
+                    # reaches here (``_route_message`` diverts it to the idle
+                    # path), but the marker is checked first regardless so the
+                    # precedence is explicit rather than incidental.
+                    if (
+                        self._notification_turn is not None
+                        and UserMessage is not None
+                        and isinstance(msg, UserMessage)
+                        and not self._is_injected_user_message(msg)
+                        and _operator_text_of(msg)
+                    ):
+                        self._notification_turn.note_user_inbound()
+                        self._log.info(
+                            "worker.turn.operator_message_mid_turn",
+                            conv_key=event.conversation_key,
+                            transport=self.transport,
+                            turn_id=self._notification_turn.turn_id,
+                        )
                     if AssistantMessage is not None and isinstance(msg, AssistantMessage):
                         for block in msg.content:
                             if TextBlock is not None and isinstance(block, TextBlock):
