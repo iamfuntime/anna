@@ -785,6 +785,43 @@ async def test_ledger_cleared_so_next_turn_is_unaffected(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
+async def test_deferred_unsolicited_reply_not_judged_by_the_live_ledger(
+    tmp_path: Path,
+) -> None:
+    """The two ledgers stay separate.
+
+    A notification-only DISPATCHED turn is running when an unrelated
+    unsolicited turn — no notification behind it — completes and is deferred to
+    ``_end_turn``. The dispatched turn's verdict must not travel to it: the
+    live turn's own narration is dropped, the deferred text still ships. This
+    is why the live ledger is settled BEFORE ``_end_turn`` rather than after.
+    """
+    sent: list[OutboundMessage] = []
+    worker = _make_worker(tmp_path, sent)
+    client = _StreamClient()
+    worker._client = client
+    client.on_query = lambda prompt: [
+        _FakeAssistantMessage(content=[_FakeTextBlock(text="suppress me")]),
+        _FakeResultMessage(),
+        # An unsolicited turn with NO notification, landing behind the live
+        # turn's Result so it is deferred rather than delivered inline.
+        _FakeAssistantMessage(content=[_FakeTextBlock(text="unrelated unsolicited")]),
+        _FakeResultMessage(),
+    ]
+
+    try:
+        await worker._handle(_background_completion_event())
+        await _spin()
+
+        assert [m.text for m in sent] == ["unrelated unsolicited"]
+        rows = _suppression_rows(worker._config)
+        assert len(rows) == 1
+        assert rows[0]["char_count"] == len("suppress me")
+    finally:
+        await worker._stop_stream_consumer()
+
+
+@pytest.mark.asyncio
 async def test_audit_failure_does_not_break_the_turn(tmp_path: Path) -> None:
     """Bookkeeping must never crash a turn: a raising ``audit_event`` is
     logged and swallowed, and the send is still suppressed."""
