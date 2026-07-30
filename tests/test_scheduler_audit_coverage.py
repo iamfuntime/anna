@@ -1,8 +1,14 @@
-"""Verify every audit event the scheduler is meant to emit actually lands.
+"""Verify every audit event the scheduled/background paths must emit lands.
 
-Walks each of the ten events in the Phase 2 spec audit vocabulary, exercises
-the code path that emits it, and checks the JSONL audit file for the
-corresponding record. This is the §12 audit-event-coverage gate.
+Walks each event in the audit vocabulary, exercises the code path that emits
+it, and checks the JSONL audit file for the corresponding record. This is the
+§12 audit-event-coverage gate.
+
+The vocabulary must grow whenever a guard on these paths gains an audit row,
+or the gate silently stops covering it. Two omissions were closed on
+2026-07-30: the tool-free-scheduled-turn guard's ``no_tool_call_retry`` /
+``no_tool_call_abort`` rows (added 2026-07-29) and the notification-only reply
+guard's ``notification_only_suppressed`` row.
 """
 
 from __future__ import annotations
@@ -19,6 +25,8 @@ from anna.runtime.schedule_store import ScheduleStore
 from anna.runtime.schedule_types import Schedule, ScheduleDestination, ScheduleState
 from anna.runtime.scheduler import Scheduler
 from anna.runtime.supervisor import Supervisor
+from anna.runtime.visibility import NULL_VISIBILITY
+from anna.runtime.worker import ConversationWorker
 from anna.transports.base import ChannelAdapter, InboundEvent, OutboundMessage
 
 
@@ -32,6 +40,11 @@ EXPECTED_EVENTS = (
     "audit.schedule.fire",
     "audit.schedule.complete",
     "audit.schedule.fail",
+    # Tool-free-scheduled-turn guard (2026-07-29 oem-slide-restock-watch).
+    "audit.schedule.no_tool_call_retry",
+    "audit.schedule.no_tool_call_abort",
+    # Notification-only reply guard (2026-07-30 sub-agent flood).
+    "audit.reply.notification_only_suppressed",
 )
 
 
@@ -64,14 +77,53 @@ class _FakeAdapter(ChannelAdapter):
 class _FakeRouter:
     def __init__(self) -> None:
         self.raise_on_dispatch: Exception | None = None
+        # When set, every dispatch publishes this tool-call count into
+        # ``turn_meta`` exactly as the worker does on the completion-future
+        # path. Left ``None`` for the happy-path sections so the scheduler's
+        # no-tool-call backstop reads UNKNOWN and fails open (today's
+        # behavior), keeping schedule.complete coverage intact.
+        self.tool_call_count: int | None = None
+        self.reply = "ok"
 
     async def dispatch(self, event: InboundEvent) -> None:
         if self.raise_on_dispatch is not None:
             if event.completion_future is not None and not event.completion_future.done():
                 event.completion_future.set_exception(self.raise_on_dispatch)
             return
+        if event.turn_meta is not None and self.tool_call_count is not None:
+            event.turn_meta["tool_call_count"] = self.tool_call_count
         if event.completion_future is not None and not event.completion_future.done():
-            event.completion_future.set_result("ok")
+            event.completion_future.set_result(self.reply)
+
+
+class _StubClient:
+    """Minimal SDK client stand-in for the worker-side coverage section.
+
+    Yields REAL ``claude_agent_sdk`` messages so the worker's ``isinstance``
+    checks match without patching the SDK module.
+    """
+
+    def __init__(self, text: str) -> None:
+        self._text = text
+        self.queries: list[str] = []
+
+    async def query(self, prompt: str) -> None:
+        self.queries.append(prompt)
+
+    async def receive_response(self):
+        from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
+
+        yield AssistantMessage(
+            content=[TextBlock(text=self._text)], model="claude-opus-5"
+        )
+        yield ResultMessage(
+            subtype="success",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=False,
+            num_turns=1,
+            session_id="audit-coverage",
+        )
 
 
 class _FakeAlerter:
@@ -83,6 +135,12 @@ class _FakeAlerter:
 
     async def notify_startup(self, *_a, **_kw) -> bool:  # pragma: no cover
         return True
+
+
+async def _never_send(message: OutboundMessage) -> None:
+    """Send sink for the worker-side section: the notification-only guard must
+    drop the text before it ever gets here."""
+    raise AssertionError(f"notification-only turn posted text: {message.text!r}")
 
 
 def _read_audit_records(audit_dir: Path) -> list[dict]:
@@ -158,6 +216,46 @@ async def test_every_expected_event_emits(tmp_path: Path) -> None:
     router.raise_on_dispatch = RuntimeError("synthetic failure")
     for _ in range(3):
         await sched._guarded_fire(store.get("will-fail"))  # type: ignore[arg-type]
+
+    # 7b: the tool-free-scheduled-turn guard (2026-07-29). Postable prose with
+    # a REPORTED tool-call count of zero on both attempts drives
+    # no_tool_call_retry (first detection) and then no_tool_call_abort.
+    router.raise_on_dispatch = None
+    router.tool_call_count = 0
+    router.reply = "I'll read the skill file first"
+    await store.create(_make_schedule(id="narrates-only"))
+    await sched._guarded_fire(store.get("narrates-only"))  # type: ignore[arg-type]
+    # Restore the fail-open default so nothing below inherits the zero count.
+    router.tool_call_count = None
+    router.reply = "ok"
+
+    # 7c: the notification-only reply guard (2026-07-30). A turn triggered by
+    # NOTHING but a finished background delegation runs to completion and has
+    # its user-facing text dropped at the send boundary, which is the row.
+    worker = ConversationWorker(
+        conversation_key="slack:dm:UAUDIT",
+        transport="slack",
+        config=cfg,
+        supervisor=Supervisor(config=cfg),
+        send=_never_send,
+        visibility=NULL_VISIBILITY,
+    )
+    worker._client = _StubClient("Sub-agent finished; here is the report...")
+    try:
+        await worker._handle(
+            InboundEvent(
+                transport="slack",
+                conversation_key="slack:dm:UAUDIT",
+                sender_id="anna.subagent",
+                sender_display="ANNA Sub-agent",
+                text="Background delegation abc123 (researcher) finished.",
+                is_dm=False,
+                is_thread=False,
+                raw={"background_delegation": True},
+            )
+        )
+    finally:
+        await worker._stop_stream_consumer()
 
     # 8: scheduler.start - exercise via run() with a single-cycle short-circuit
     cfg.scheduler.poll_interval_seconds = 100  # avoid polling during the brief window

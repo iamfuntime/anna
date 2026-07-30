@@ -9,8 +9,17 @@ on the stale ResultMessage — every turn thereafter ran one-turn-behind until
 restart.
 
 Now one long-lived consumer task owns the stream: live turns read a per-turn
-queue, and idle-time (unsolicited) turns are delivered immediately through
-the guarded send path with their ResultMessage discarded.
+queue, and idle-time (unsolicited) turns are handled immediately through the
+guarded send path with their ResultMessage discarded.
+
+Since 2026-07-30 an unsolicited turn that NOTHING but a task notification
+triggered has its text suppressed at that guarded send (see
+``test_worker_notification_guard.py``), so the assertions below pin the
+ROUTING invariants — the live turn sees only its own reply, the stale
+ResultMessage never terminates a live drain, nothing runs one-turn-behind —
+rather than the notification text arriving. Unsolicited text with no
+notification behind it is still delivered, which
+``test_post_result_leftovers_without_marker_reroute_to_idle`` covers.
 """
 
 from __future__ import annotations
@@ -187,10 +196,15 @@ async def _spin(n: int = 20) -> None:
 
 
 @pytest.mark.asyncio
-async def test_unsolicited_turn_delivers_immediately_while_idle(tmp_path: Path) -> None:
-    """(a) An unsolicited turn completing while idle is delivered via the
+async def test_unsolicited_turn_handled_immediately_while_idle(tmp_path: Path) -> None:
+    """(a) An unsolicited turn completing while idle is handled via the
     guarded send path right away; its ResultMessage is discarded so the next
-    live turn is unaffected."""
+    live turn is unaffected.
+
+    A task notification is the only thing that triggered this turn, so its text
+    is suppressed rather than posted (2026-07-30 guard) — but the routing this
+    test exists to protect is unchanged, which the clean next live turn proves.
+    """
     sent: list[OutboundMessage] = []
     worker = _make_worker(tmp_path, sent)
     client = _StreamClient()
@@ -200,17 +214,14 @@ async def test_unsolicited_turn_delivers_immediately_while_idle(tmp_path: Path) 
         client.push(_notification_user_message(), *_reply("bg agent finished: report ready"))
         await _spin()
 
-        assert [m.text for m in sent] == ["bg agent finished: report ready"]
-        assert sent[0].conversation_key == CONV_KEY
+        assert sent == []
 
         # Next live turn must see ONLY its own messages — the unsolicited
         # ResultMessage was discarded, not left to terminate this drain.
         client.on_query = lambda prompt: _reply("live reply")
         await worker._handle(_make_event())
-        assert [m.text for m in sent] == [
-            "bg agent finished: report ready",
-            "live reply",
-        ]
+        assert [m.text for m in sent] == ["live reply"]
+        assert sent[0].conversation_key == CONV_KEY
     finally:
         await worker._stop_stream_consumer()
 
@@ -238,9 +249,9 @@ async def test_regression_unsolicited_turn_does_not_offset_live_turn(
 ) -> None:
     """(c) The one-turn-behind regression: an unsolicited turn's messages are
     already buffered in the stream when a live turn starts. The live turn
-    must receive ONLY its own reply; the stale text is delivered separately
-    through the idle path and its ResultMessage never terminates the live
-    drain."""
+    must receive ONLY its own reply; the stale text is handled separately
+    through the idle path (and, being notification-only, suppressed there) and
+    its ResultMessage never terminates the live drain."""
     sent: list[OutboundMessage] = []
     worker = _make_worker(tmp_path, sent)
     client = _StreamClient()
@@ -259,26 +270,26 @@ async def test_regression_unsolicited_turn_does_not_offset_live_turn(
 
         assert future.done()
         assert future.result() == "FRESH live reply"
-        # The stale unsolicited text is delivered as its own message, not as
-        # any turn's reply.
-        assert [m.text for m in sent] == ["STALE background reply"]
+        # The stale unsolicited text was never mistaken for a turn's reply —
+        # it went to the idle path, where the notification-only guard dropped
+        # it. Either way it must not appear as any turn's outbound.
+        assert sent == []
 
         # And the turn AFTER that is also unaffected (no lingering offset).
         client.on_query = lambda prompt: _reply("second live reply")
         await worker._handle(_make_event())
-        assert [m.text for m in sent] == [
-            "STALE background reply",
-            "second live reply",
-        ]
+        assert [m.text for m in sent] == ["second live reply"]
     finally:
         await worker._stop_stream_consumer()
 
 
 @pytest.mark.asyncio
-async def test_background_completion_mid_turn_delivered_after(tmp_path: Path) -> None:
+async def test_background_completion_mid_turn_routed_to_idle(tmp_path: Path) -> None:
     """(d) A background task completing mid-turn: the CLI serializes turns,
     so the notification turn's messages arrive after the live turn's
-    ResultMessage. They must be delivered by the idle path afterward."""
+    ResultMessage. They must be picked up by the idle path afterward — where,
+    having been triggered by nothing but the notification, the text is
+    suppressed. The operator's own reply still lands, and lands first."""
     sent: list[OutboundMessage] = []
     worker = _make_worker(tmp_path, sent)
     client = _StreamClient()
@@ -291,10 +302,7 @@ async def test_background_completion_mid_turn_delivered_after(tmp_path: Path) ->
     try:
         await worker._handle(_make_event())
         await _spin()
-        assert [m.text for m in sent] == [
-            "live reply",
-            "bg done while you were talking",
-        ]
+        assert [m.text for m in sent] == ["live reply"]
     finally:
         await worker._stop_stream_consumer()
 
