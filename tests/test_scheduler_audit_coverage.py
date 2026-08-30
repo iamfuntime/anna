@@ -103,19 +103,34 @@ class _StubClient:
     checks match without patching the SDK module.
     """
 
-    def __init__(self, text: str) -> None:
+    def __init__(self, text: str, *, end_on_tool_use: bool = False) -> None:
         self._text = text
+        self._end_on_tool_use = end_on_tool_use
         self.queries: list[str] = []
 
     async def query(self, prompt: str) -> None:
         self.queries.append(prompt)
 
     async def receive_response(self):
-        from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
+        from claude_agent_sdk import (
+            AssistantMessage,
+            ResultMessage,
+            TextBlock,
+            ToolUseBlock,
+        )
 
         yield AssistantMessage(
             content=[TextBlock(text=self._text)], model="claude-opus-5"
         )
+        if self._end_on_tool_use:
+            # Turn ends ON a tool call: everything above it is mid-turn
+            # narration and there is NO terminal report, so the
+            # notification-only guard drops the whole turn (2026-08-30
+            # terminal-report delivery has nothing to hand back).
+            yield AssistantMessage(
+                content=[ToolUseBlock(id="toolu_a", name="Write", input={})],
+                model="claude-opus-5",
+            )
         yield ResultMessage(
             subtype="success",
             duration_ms=1,
@@ -232,6 +247,8 @@ async def test_every_expected_event_emits(tmp_path: Path) -> None:
     # 7c: the notification-only reply guard (2026-07-30). A turn triggered by
     # NOTHING but a finished background delegation runs to completion and has
     # its user-facing text dropped at the send boundary, which is the row.
+    # Shaped to end ON a tool call so there is no terminal report to deliver
+    # (2026-08-30), keeping ``_never_send`` a valid assertion.
     worker = ConversationWorker(
         conversation_key="slack:dm:UAUDIT",
         transport="slack",
@@ -240,7 +257,9 @@ async def test_every_expected_event_emits(tmp_path: Path) -> None:
         send=_never_send,
         visibility=NULL_VISIBILITY,
     )
-    worker._client = _StubClient("Sub-agent finished; here is the report...")
+    worker._client = _StubClient(
+        "Sub-agent finished; here is the report...", end_on_tool_use=True
+    )
     try:
         await worker._handle(
             InboundEvent(

@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import re
+import time
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -345,6 +346,15 @@ class _NotificationOnlyTurn:
     surfaces MID-TURN alongside a tool result) and never unlatches: once a
     real person is in the turn, its text ships. Scoped to one turn; never
     long-lived worker state.
+
+    2026-08-30 amendment: dropping ALL text also swallowed the closing REPORT
+    the operator wanted. ``terminal_chunks`` / ``tool_boundaries`` reproduce, on
+    the DISPATCHED path, the terminal-report boundary the scheduled path already
+    uses (see ``terminal_chunks`` in :meth:`ConversationWorker._dispatch_turn`):
+    accumulate assistant text, clear at every tool call, and what survives to
+    turn end is the text emitted after the LAST tool call. ``delivery_outcome``
+    / ``delivered_text`` record what the settle step decided so the audit row
+    can say both what shipped and what did not.
     """
 
     turn_id: str
@@ -353,11 +363,28 @@ class _NotificationOnlyTurn:
     suppressed_chars: int = 0
     suppressed_sends: int = 0
     preview: str = ""
+    tail_preview: str = ""
+    terminal_chunks: list[str] = field(default_factory=list)
+    tool_boundaries: int = 0
+    delivery_outcome: str = ""
+    delivered_text: str = ""
 
     @property
     def suppressing(self) -> bool:
         """True when this turn's user-facing text must not reach a transport."""
         return bool(self.sources) and not self.user_inbound
+
+    @property
+    def terminal_text(self) -> str:
+        """The turn's terminal report: text emitted after the LAST tool call.
+
+        Empty when the turn ended ON a tool call with no closing report — the
+        caller then stays silent rather than inventing a placeholder. A turn
+        that ran NO tools never cleared the accumulator, so its whole text is
+        terminal, which is the correct reading: there was no narration to
+        separate the report from.
+        """
+        return "\n".join(c for c in self.terminal_chunks if c).strip()
 
     def note_source(self, source: str) -> None:
         """Record one notification that triggered this turn (deduplicated).
@@ -376,6 +403,28 @@ class _NotificationOnlyTurn:
         self.suppressed_sends += 1
         if not self.preview:
             self.preview = text[:280]
+        # Tail-side preview, kept alongside the head one rather than replacing
+        # it. On the unsolicited path the whole turn arrives as ONE joined blob
+        # whose head is narration and whose tail is the report, so a head-only
+        # preview structurally hides the thing worth knowing was dropped.
+        # Overwritten per send so it always describes the LAST text withheld,
+        # which is the closest thing to a terminal report the guard saw.
+        self.tail_preview = text[-280:]
+
+    def note_terminal_text(self, text: str) -> None:
+        """Accumulate one assistant text block as candidate terminal report."""
+        self.terminal_chunks.append(text)
+
+    def note_tool_boundary(self) -> None:
+        """A real tool call ran: everything narrated up to here is mid-turn
+        narration, not the final report, so drop it from the accumulator."""
+        self.tool_boundaries += 1
+        self.terminal_chunks.clear()
+
+    def note_delivery(self, outcome: str, text: str) -> None:
+        """Record the settle step's verdict for the audit row."""
+        self.delivery_outcome = outcome
+        self.delivered_text = text if outcome == "delivered" else ""
 
 
 class ConversationWorker:
@@ -486,6 +535,15 @@ class ConversationWorker:
         self._consumer_task: asyncio.Task[None] | None = None
         self._turn_queue: asyncio.Queue[Any] | None = None
         self._idle_chunks: list[str] = []
+        # Terminal-report accumulator for the UNSOLICITED path, maintained in
+        # lockstep with ``_idle_chunks`` (appended on every assistant TextBlock,
+        # cleared at every ToolUseBlock) so the turn's report can be separated
+        # from its narration at the ResultMessage. Kept on the WORKER rather
+        # than on the unsolicited ledger because that ledger is built lazily on
+        # the first notification, which is not guaranteed to precede the first
+        # text block; this list exists from construction and so can never miss
+        # a boundary.
+        self._idle_terminal_chunks: list[str] = []
         self._unsolicited_open = False
         self._idle_route_lock = asyncio.Lock()
         # Unsolicited-turn texts that completed WHILE a live turn was
@@ -509,6 +567,23 @@ class ConversationWorker:
         # operator-originated turn is in. See :meth:`_notification_turn_for`.
         self._notification_turn: _NotificationOnlyTurn | None = None
         self._notification_unsolicited: _NotificationOnlyTurn | None = None
+        # Terminal-report delivery on a suppressing turn (2026-08-30). Cached at
+        # construction for the same no-hot-reload reason as the flags above.
+        self._deliver_notification_terminal: bool = (
+            config.runtime.visibility.deliver_notification_terminal_reports
+        )
+        self._notification_terminal_max: int = (
+            config.runtime.visibility.notification_terminal_max_per_window
+        )
+        self._notification_terminal_window: int = (
+            config.runtime.visibility.notification_terminal_window_seconds
+        )
+        # Flood cap, per worker, as a COUNT IN A WINDOW: monotonic timestamps of
+        # terminal reports actually delivered, pruned on the send path. A
+        # deliberate non-choice of a timer/delayed flush — real coalescing needs
+        # a background task, and a background task on this class is exactly the
+        # kind of moving part the 2026-07-30 guard was written to avoid.
+        self._notification_terminal_sends: list[float] = []
         self._closed_out = False
         self._operator_short_name: str | None = None
         # Set true once the idle watcher has fired its close callback so we
@@ -1071,6 +1146,7 @@ class ConversationWorker:
                 reason=reason,
             )
         self._idle_chunks.clear()
+        self._idle_terminal_chunks.clear()
         self._unsolicited_open = False
         # The discarded chunks were this ledger's only subject; a stale ledger
         # would otherwise judge the NEXT unsolicited turn.
@@ -1240,15 +1316,23 @@ class ConversationWorker:
                 ResultMessage,
                 SystemMessage,
                 TextBlock,
+                ToolUseBlock,
                 UserMessage,
             )
         except ImportError:
-            AssistantMessage = ResultMessage = SystemMessage = TextBlock = UserMessage = None  # type: ignore[assignment,misc]
+            AssistantMessage = ResultMessage = SystemMessage = TextBlock = ToolUseBlock = UserMessage = None  # type: ignore[assignment,misc]
 
         if ResultMessage is not None and isinstance(msg, ResultMessage):
             self._unsolicited_open = False
             text = "\n".join(c for c in self._idle_chunks if c).strip()
+            # Terminal report: text after the LAST tool call of this unsolicited
+            # turn. Read BEFORE the clears below, and cleared with them so the
+            # next unsolicited turn starts empty whatever this one decided.
+            terminal_text = "\n".join(
+                c for c in self._idle_terminal_chunks if c
+            ).strip()
             self._idle_chunks.clear()
+            self._idle_terminal_chunks.clear()
             # Settle the notification-only guard for THIS unsolicited turn (the
             # 2026-07-30 flood path: task notifications woke the CLI while no
             # turn was registered, and the accumulated narration went out as one
@@ -1258,10 +1342,23 @@ class ConversationWorker:
             self._notification_unsolicited = None
             if text and ledger is not None and ledger.suppressing:
                 ledger.note_suppressed(text)
+                # 2026-08-30: the guard drops the NARRATION but hands the
+                # terminal report back to the normal delivery path below. When
+                # nothing is deliverable (flag off, cap tripped, or the turn
+                # ended on a tool call with no closing report) this returns
+                # False and the whole turn stays silent, exactly as before.
+                deliver_terminal = self._decide_notification_terminal(
+                    ledger, terminal_text, conv_key=self.conversation_key
+                )
                 self._emit_notification_suppressed(
                     ledger, conv_key=self.conversation_key
                 )
-                return
+                if not deliver_terminal:
+                    return
+                # Fall through with the report ONLY. The deferred-vs-immediate
+                # split below is reused as-is: if a live turn is registered its
+                # own reply must still land first.
+                text = ledger.delivered_text
             if text:
                 if self._turn_queue is not None:
                     # A live turn is registered: defer delivery to
@@ -1290,6 +1387,16 @@ class ConversationWorker:
             for block in msg.content:
                 if TextBlock is not None and isinstance(block, TextBlock):
                     self._idle_chunks.append(block.text)
+                    self._idle_terminal_chunks.append(block.text)
+                elif ToolUseBlock is not None and isinstance(block, ToolUseBlock):
+                    # Tool-use boundary for the unsolicited TERMINAL report,
+                    # mirroring the dispatched drain loop: everything narrated
+                    # up to this tool call is mid-turn narration, so only text
+                    # emitted AFTER the LAST tool call survives to the
+                    # ResultMessage. ``_idle_chunks`` is deliberately left
+                    # whole — it still feeds the unsuppressed delivery path and
+                    # the suppressed-chars audit.
+                    self._idle_terminal_chunks.clear()
             return
         if (
             SystemMessage is not None
@@ -2417,6 +2524,103 @@ class ConversationWorker:
         ledger.note_source("background_delegation")
         return ledger
 
+    def _decide_notification_terminal(
+        self, ledger: _NotificationOnlyTurn, terminal_text: str, *, conv_key: str
+    ) -> bool:
+        """Decide whether a suppressing turn's TERMINAL report may be delivered.
+
+        Returns True when the caller must ship ``ledger.delivered_text``. The
+        SEND is left to the caller because the two notification-turn shapes go
+        out through different funnels (``_guarded_send`` on the dispatched path,
+        the deferred/immediate split in ``_route_idle_locked`` on the
+        unsolicited one), and keeping this function synchronous and
+        side-effect-light means the verdict is recorded on the ledger BEFORE the
+        audit row is written.
+
+        Four outcomes, all recorded on the ledger as ``delivery_outcome`` so the
+        audit row explains itself:
+
+        * ``disabled`` — the config flag is off (or the cap is 0). Exactly the
+          pre-2026-08-30 behavior: everything suppressed.
+        * ``empty`` — the turn ended on a tool call with no closing report, or
+          produced no text at all. Stay silent; never post a placeholder.
+        * ``rate_limited`` — the flood cap tripped. Falls back to suppression
+          and audits its own distinct event so a storm is visible as a storm and
+          not as N ordinary suppressions.
+        * ``delivered`` — ship it.
+
+        The window is pruned here, on the send path, rather than by a timer:
+        the list only ever holds at most ``_notification_terminal_max`` live
+        entries plus whatever has aged out since the previous call, so it cannot
+        grow, and the worker needs no background task to keep it honest.
+        """
+        if not self._deliver_notification_terminal or self._notification_terminal_max <= 0:
+            ledger.note_delivery("disabled", "")
+            return False
+        if not terminal_text:
+            ledger.note_delivery("empty", "")
+            return False
+        now = time.monotonic()
+        cutoff = now - self._notification_terminal_window
+        self._notification_terminal_sends = [
+            t for t in self._notification_terminal_sends if t > cutoff
+        ]
+        if len(self._notification_terminal_sends) >= self._notification_terminal_max:
+            ledger.note_delivery("rate_limited", "")
+            self._emit_notification_terminal_rate_limited(
+                ledger, terminal_text, conv_key=conv_key
+            )
+            return False
+        # Stamped BEFORE the caller's await: the caller sends outside this
+        # function, and two turns settling across that await must not both see
+        # a slot free. Recording the intent is the conservative direction — a
+        # send that then fails costs us one slot, not an uncapped burst.
+        self._notification_terminal_sends.append(now)
+        ledger.note_delivery("delivered", terminal_text)
+        return True
+
+    def _emit_notification_terminal_rate_limited(
+        self, ledger: _NotificationOnlyTurn, terminal_text: str, *, conv_key: str
+    ) -> None:
+        """Audit + log the flood cap tripping on a terminal report.
+
+        A DISTINCT event from ``notification_only_suppressed`` (which is still
+        emitted for the same turn) so "the guard dropped narration" and "we are
+        in a completion storm and are now dropping reports too" are separable in
+        the log. No admin alert, for the same reason the suppression path has
+        none: an alert per drop rebuilds the flood in the admin channel.
+        """
+        try:
+            audit_event(
+                "audit.reply.notification_terminal_rate_limited",
+                audit_dir=self._config.audit_dir,
+                actor="anna",
+                conv_key=conv_key,
+                fsync_on_write=self._config.logging.audit.fsync_on_write,
+                level="WARNING",
+                transport=self.transport,
+                turn_id=ledger.turn_id,
+                sources=list(ledger.sources),
+                char_count=len(terminal_text),
+                window_seconds=self._notification_terminal_window,
+                max_per_window=self._notification_terminal_max,
+                preview=terminal_text[:280],
+            )
+        except Exception as exc:  # noqa: BLE001 — never break turn teardown
+            self._log.warning(
+                "worker.reply.notification_terminal_audit_failed",
+                error=str(exc),
+                conv_key=conv_key,
+                transport=self.transport,
+            )
+        self._log.warning(
+            "worker.reply.notification_terminal_rate_limited",
+            conv_key=conv_key,
+            transport=self.transport,
+            turn_id=ledger.turn_id,
+            char_count=len(terminal_text),
+        )
+
     def _emit_notification_suppressed(
         self, ledger: _NotificationOnlyTurn, *, conv_key: str
     ) -> None:
@@ -2428,6 +2632,22 @@ class ConversationWorker:
         No admin alert: an alert-per-suppression would rebuild in the admin
         channel the very flood this guard exists to stop. Exception-isolated,
         because a turn must never fail on its own bookkeeping.
+
+        Field contract (other tooling reads this row, so existing names keep
+        their existing meanings and new ones are ADDED alongside):
+
+        * ``char_count`` / ``send_count`` / ``preview`` — unchanged: what the
+          guard withheld at the send sites, and the HEAD of it.
+        * ``tail_preview`` — the tail of the last withheld text. Added because
+          on the unsolicited path the withheld blob is narration-then-report and
+          a head-only preview structurally hid the report.
+        * ``delivered_chars`` / ``delivered_preview`` / ``delivery_outcome`` —
+          what the terminal-report settle step then SHIPPED, if anything. Note
+          that a delivered terminal report is counted in BOTH ``char_count``
+          (it was dropped at the send site) and ``delivered_chars`` (it was
+          re-delivered at settle); the two are not disjoint by design, because
+          ``char_count`` describes the guard and ``delivered_chars`` describes
+          the exception to it.
         """
         try:
             audit_event(
@@ -2443,6 +2663,10 @@ class ConversationWorker:
                 char_count=ledger.suppressed_chars,
                 send_count=ledger.suppressed_sends,
                 preview=ledger.preview,
+                tail_preview=ledger.tail_preview,
+                delivered_chars=len(ledger.delivered_text),
+                delivered_preview=ledger.delivered_text[:280],
+                delivery_outcome=ledger.delivery_outcome,
             )
         except Exception as exc:  # noqa: BLE001 — never break turn teardown
             self._log.warning(
@@ -2459,6 +2683,8 @@ class ConversationWorker:
             sources=list(ledger.sources),
             char_count=ledger.suppressed_chars,
             send_count=ledger.suppressed_sends,
+            delivered_chars=len(ledger.delivered_text),
+            delivery_outcome=ledger.delivery_outcome,
         )
 
     async def _regenerate_scheduled_reply(
@@ -2619,7 +2845,21 @@ class ConversationWorker:
             await self._dispatch_turn(event, turn_queue)
         finally:
             ledger = self._notification_turn
+            # Cleared BEFORE anything below can send. ``_guarded_send`` consults
+            # exactly this attribute, so leaving it set would re-suppress the
+            # terminal report we are about to decide to deliver. Nothing between
+            # here and ``_end_turn`` sends on this turn's behalf except the
+            # report itself, so the early clear is not observable elsewhere.
             self._notification_turn = None
+            # Terminal-report delivery (2026-08-30). The guard was built to stop
+            # mid-turn NARRATION; dropping the closing report as well was
+            # collateral damage. Decide first, audit second, send third, so a
+            # transport failure can never cost us the audit row.
+            deliver_terminal = ledger is not None and ledger.suppressing and (
+                self._decide_notification_terminal(
+                    ledger, ledger.terminal_text, conv_key=event.conversation_key
+                )
+            )
             # Emit on ``suppressed_sends`` alone, not on the final verdict: if a
             # mid-turn operator message disarmed the guard AFTER some narration
             # was already dropped, that drop still happened and is still owed a
@@ -2627,6 +2867,21 @@ class ConversationWorker:
             if ledger is not None and ledger.suppressed_sends:
                 self._emit_notification_suppressed(
                     ledger, conv_key=event.conversation_key
+                )
+            if deliver_terminal and ledger is not None:
+                # Ordered BEFORE ``_end_turn`` for the same reason the ledger is
+                # settled before it: this turn's own report must reach the
+                # transport ahead of the deferred unsolicited replies
+                # ``_end_turn`` flushes, which belong to a different turn.
+                # ``tool_used`` is true iff a real tool ran, so a weak markup
+                # fragment quoted inside a genuine report is delivered rather
+                # than eaten — same rule the boundary flush uses.
+                await self._guarded_send(
+                    OutboundMessage(
+                        conversation_key=event.conversation_key,
+                        text=ledger.delivered_text,
+                    ),
+                    tool_used=bool(ledger.tool_boundaries),
                 )
             await self._end_turn(turn_queue)
 
@@ -2859,6 +3114,19 @@ class ConversationWorker:
                                 # ToolUseBlock branch below clears this so only
                                 # post-last-tool text survives to turn end.
                                 terminal_chunks.append(block.text)
+                                # Same boundary, second consumer: the
+                                # notification-only ledger needs its own copy
+                                # because ``terminal_chunks`` is local to this
+                                # method and the terminal report is settled by
+                                # ``_handle`` after this method returns. Guarded
+                                # on the ledger existing, which for a dispatched
+                                # turn it does from before the query — armed at
+                                # the top of ``_handle`` — so no boundary can be
+                                # missed.
+                                if self._notification_turn is not None:
+                                    self._notification_turn.note_terminal_text(
+                                        block.text
+                                    )
                                 # Append the narration to the shared flush
                                 # buffer under the lock so the timer task
                                 # never reads a half-written ``pending``.
@@ -2889,6 +3157,15 @@ class ConversationWorker:
                                 # to refuse a re-run that would double-execute.
                                 tool_used = True
                                 tool_call_count += 1
+                                # Mirror of the ``terminal_chunks.clear()``
+                                # below, for the notification-only ledger. Kept
+                                # HERE next to the other unconditional
+                                # bookkeeping rather than inside the flush guard
+                                # further down, so the boundary is recorded on
+                                # the scheduled path too even though only the
+                                # dispatched path ever reads it.
+                                if self._notification_turn is not None:
+                                    self._notification_turn.note_tool_boundary()
                                 # Feed the interactive-turn watchdog: bump its
                                 # tool count and let it notice when work was
                                 # backgrounded (delegate / background Bash), at

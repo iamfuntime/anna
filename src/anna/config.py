@@ -198,6 +198,41 @@ class RuntimeVisibilityConfig(BaseModel):
     # hot-reload — takes effect on restart.
     consolidate_scheduled_turns: bool = True
 
+    # Notification-only TERMINAL report delivery (2026-08-30 follow-up to the
+    # 2026-07-30 sub-agent flood). The notification-only guard drops ALL
+    # user-facing text on a turn nothing but a background completion triggered,
+    # which also swallows the closing REPORT the operator actually wanted ("the
+    # research finished, here is what it found"). When True the worker still
+    # drops the mid-turn narration but delivers the turn's TERMINAL text — the
+    # assistant text emitted AFTER the last tool call, the same boundary
+    # ``consolidate_scheduled_turns`` uses. A turn with no tool call at all is
+    # terminal in its entirety. An empty/whitespace terminal block is still
+    # suppressed silently (no ``(no response)`` placeholder — that was itself
+    # part of the flood). Set False to restore the pre-2026-08-30 total-drop
+    # behavior without a code revert. Default True: the guard was aimed at
+    # narration, and swallowing the report was collateral damage. No validator
+    # needed for a bool; no hot-reload — edits take effect on the next
+    # ``systemctl --user restart anna``.
+    deliver_notification_terminal_reports: bool = True
+
+    # Flood cap for the delivery above, expressed as a COUNT IN A WINDOW rather
+    # than a timer: no background task, no delayed flush, just a per-worker list
+    # of send timestamps pruned on the send path. The 2026-07-30 incident was 13
+    # concurrent completions; terminal-only delivery bounds that to one message
+    # per completion, i.e. still 13 messages in one second. Past
+    # ``notification_terminal_max_per_window`` terminal sends inside
+    # ``notification_terminal_window_seconds``, delivery falls back to today's
+    # suppression and audits ``audit.reply.notification_terminal_rate_limited``.
+    # 5-per-60s is chosen to pass every realistic serial case (a handful of
+    # delegations reporting back over a minute) while clipping a fan-out storm
+    # to a fifth of its size; the dropped reports remain in the audit log's
+    # tail-side preview. ``0`` for the max disables terminal delivery entirely
+    # (equivalent to the flag above being False); negatives are rejected at
+    # load. No hot-reload — edits take effect on the next ``systemctl --user
+    # restart anna``.
+    notification_terminal_max_per_window: int = 5
+    notification_terminal_window_seconds: int = 60
+
     # Slack-specific knobs. Custom emojis may not exist on every workspace;
     # if reactions.add fails the worker logs a warning and the SDK turn
     # continues uninterrupted.
@@ -229,6 +264,29 @@ class RuntimeVisibilityConfig(BaseModel):
             raise ValueError(
                 "runtime.visibility.periodic_flush_seconds must be >= 0 "
                 "(0 disables the timed drip)"
+            )
+        return v
+
+    @field_validator("notification_terminal_max_per_window")
+    @classmethod
+    def _terminal_max_non_negative(cls, v: int) -> int:
+        """Reject a negative cap; ``0`` is the explicit off switch."""
+        if v < 0:
+            raise ValueError(
+                "runtime.visibility.notification_terminal_max_per_window must "
+                "be >= 0 (0 disables notification terminal-report delivery)"
+            )
+        return v
+
+    @field_validator("notification_terminal_window_seconds")
+    @classmethod
+    def _terminal_window_positive(cls, v: int) -> int:
+        """Reject a non-positive window: a zero-length window would let an
+        unbounded number of sends through, defeating the cap it belongs to."""
+        if v <= 0:
+            raise ValueError(
+                "runtime.visibility.notification_terminal_window_seconds must "
+                "be > 0"
             )
         return v
 

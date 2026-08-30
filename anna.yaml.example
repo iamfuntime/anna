@@ -86,6 +86,28 @@ runtime:
   #                     Default true (safe). Env override:
   #                     ANNA_CONSOLIDATE_SCHEDULED_TURNS (an explicit value
   #                     here wins). Takes effect on restart.
+  #   deliver_notification_terminal_reports
+  #                     the notification-only guard (2026-07-30 sub-agent
+  #                     flood) drops ALL user-facing text on a turn that
+  #                     nothing but a background completion triggered —
+  #                     which also swallowed the closing REPORT. When true
+  #                     the mid-turn narration is still dropped but the
+  #                     TERMINAL text (after the last tool call) is
+  #                     delivered; a turn with no tool call is terminal in
+  #                     full; an empty terminal block stays silent (never a
+  #                     "(no response)" placeholder). Set false to restore
+  #                     the pre-2026-08-30 total drop. Default true.
+  #                     Takes effect on restart.
+  #   notification_terminal_max_per_window
+  #   notification_terminal_window_seconds
+  #                     flood cap for the above, as a count-in-a-window
+  #                     (no timer, no delayed flush). Past N terminal
+  #                     reports in W seconds on one worker, delivery falls
+  #                     back to suppression and audits
+  #                     audit.reply.notification_terminal_rate_limited.
+  #                     Defaults 5 / 60. max 0 disables delivery entirely;
+  #                     negatives and a non-positive window are rejected.
+  #                     Takes effect on restart.
   # Defaults are on. lint_patterns ships with five seed regexes for
   # known bad-cadence phrases; bad regex fails fast at boot.
   # ----------------------------------------------------------
@@ -96,6 +118,9 @@ runtime:
   #   periodic_flush_seconds: 30
   #   consolidate_interactive_turns: false
   #   consolidate_scheduled_turns: true
+  #   deliver_notification_terminal_reports: true
+  #   notification_terminal_max_per_window: 5
+  #   notification_terminal_window_seconds: 60
   #   slack_emoji: thinking_face
   #   telegram_typing_max_seconds: 180
   #   lint_patterns:
