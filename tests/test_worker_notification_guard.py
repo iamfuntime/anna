@@ -156,13 +156,21 @@ def _patch_sdk_types(monkeypatch):
 
 
 def _make_worker(
-    tmp_path: Path, send_target: list[OutboundMessage]
+    tmp_path: Path,
+    send_target: list[OutboundMessage],
+    *,
+    configure: Any = None,
 ) -> ConversationWorker:
     cfg = AnnaConfig()
     object.__setattr__(cfg, "anna_home", tmp_path / "anna_home")
     cfg.vault.path = str(tmp_path / "vault")
     cfg.logging.audit.fsync_on_write = False
     cfg.core_dir.mkdir(parents=True, exist_ok=True)
+    # Applied BEFORE construction: the worker caches these flags in __init__
+    # (the no-hot-reload contract), so mutating the config afterwards would
+    # have no effect and the test would silently prove nothing.
+    if configure is not None:
+        configure(cfg)
     supervisor = Supervisor(config=cfg)
 
     async def _send(msg: OutboundMessage) -> None:
@@ -230,6 +238,25 @@ def _reply(*texts: str) -> list[Any]:
     msgs: list[Any] = [
         _FakeAssistantMessage(content=[_FakeTextBlock(text=t)]) for t in texts
     ]
+    msgs.append(_FakeResultMessage())
+    return msgs
+
+
+def _narrated_reply(*narration: str, terminal: str | None = None) -> list[Any]:
+    """The realistic shape of a completion-triggered turn.
+
+    Mid-turn ``narration`` blocks, a real tool call, then (optionally) the
+    closing TERMINAL report. The tool call is what makes the two separable:
+    everything before the LAST tool call is narration, everything after it is
+    the report. ``terminal=None`` models a turn that ended ON its tool call
+    with no closing report — nothing deliverable.
+    """
+    msgs: list[Any] = [
+        _FakeAssistantMessage(content=[_FakeTextBlock(text=t)]) for t in narration
+    ]
+    msgs.append(_FakeAssistantMessage(content=[_FakeToolUseBlock()]))
+    if terminal is not None:
+        msgs.append(_FakeAssistantMessage(content=[_FakeTextBlock(text=terminal)]))
     msgs.append(_FakeResultMessage())
     return msgs
 
@@ -350,46 +377,69 @@ def test_ledger_dedupes_repeated_sources() -> None:
 
 
 @pytest.mark.asyncio
-async def test_idle_notification_only_turn_text_suppressed(tmp_path: Path) -> None:
-    """The incident path: a system task notification wakes an idle worker, the
-    model narrates, and the narration never reaches Slack."""
+async def test_idle_notification_only_turn_narration_suppressed(tmp_path: Path) -> None:
+    """PATH B — the incident path, and 26 of the 29 observed real cases.
+
+    A system task notification wakes an idle worker; the model narrates, calls
+    a tool, then writes its report. The narration never reaches Slack and the
+    REPORT does. Before 2026-08-30 both were dropped, which is what made the
+    guard feel like a black hole.
+    """
     sent: list[OutboundMessage] = []
     worker = _make_worker(tmp_path, sent)
     client = _StreamClient()
     worker._client = client
     worker._ensure_stream_consumer()
     try:
-        client.push(_system_notification(), *_reply("Sub-agent 4 finished. Here's what it found..."))
+        client.push(
+            _system_notification(),
+            *_narrated_reply(
+                "Checking what agent 4 produced...",
+                terminal="Sub-agent 4 finished: all six sources check out.",
+            ),
+        )
         await _spin()
 
-        assert sent == []
+        assert [m.text for m in sent] == [
+            "Sub-agent 4 finished: all six sources check out."
+        ]
         rows = _suppression_rows(worker._config)
         assert len(rows) == 1
         assert rows[0]["sources"] == ["system_task_notification"]
-        assert rows[0]["char_count"] == len("Sub-agent 4 finished. Here's what it found...")
+        assert rows[0]["delivery_outcome"] == "delivered"
+        # The withheld blob is still recorded whole, and the head preview still
+        # shows the narration it starts with.
+        assert rows[0]["preview"].startswith("Checking what agent 4 produced")
         assert rows[0]["turn_id"]
     finally:
         await worker._stop_stream_consumer()
 
 
 @pytest.mark.asyncio
-async def test_dispatched_background_completion_text_suppressed(tmp_path: Path) -> None:
-    """The other notification-only turn shape: the router injects a synthetic
-    event for a finished background delegation. Same verdict."""
+async def test_dispatched_background_completion_narration_suppressed(
+    tmp_path: Path,
+) -> None:
+    """PATH A — the router injects a synthetic event for a finished background
+    delegation. Same split: narration dropped, terminal report delivered."""
     sent: list[OutboundMessage] = []
     worker = _make_worker(tmp_path, sent)
     client = _StreamClient()
     worker._client = client
-    client.on_query = lambda prompt: _reply("Got the sub-agent's report, logging it.")
+    client.on_query = lambda prompt: _narrated_reply(
+        "Got the sub-agent's report, logging it.",
+        terminal="Researcher done: the migration window is 03:00-05:00 UTC.",
+    )
 
     try:
         await worker._handle(_background_completion_event())
 
-        assert sent == []
+        assert [m.text for m in sent] == [
+            "Researcher done: the migration window is 03:00-05:00 UTC."
+        ]
         rows = _suppression_rows(worker._config)
         assert len(rows) == 1
         assert rows[0]["sources"] == ["background_delegation"]
-        assert rows[0]["char_count"] == len("Got the sub-agent's report, logging it.")
+        assert rows[0]["delivery_outcome"] == "delivered"
     finally:
         await worker._stop_stream_consumer()
 
@@ -634,17 +684,29 @@ async def test_thirteen_notifications_one_turn_one_audit_row(tmp_path: Path) -> 
     try:
         for _ in range(13):
             client.push(_system_notification())
-        client.push(*_reply("agent 1 done", "agent 2 done", "agent 3 done"))
+        client.push(
+            *_narrated_reply(
+                "agent 1 done",
+                "agent 2 done",
+                "agent 3 done",
+                terminal="All 13 agents are in; three found nothing new.",
+            )
+        )
         await _spin()
 
-        assert sent == []
+        # Thirteen completions collapsing onto ONE turn still cost exactly one
+        # message: the turn's single terminal report.
+        assert [m.text for m in sent] == [
+            "All 13 agents are in; three found nothing new."
+        ]
         rows = _suppression_rows(worker._config)
         assert len(rows) == 1
         # Thirteen notifications collapse to one deduplicated source list.
         assert rows[0]["sources"] == ["system_task_notification"]
         assert rows[0]["send_count"] == 1
         assert rows[0]["char_count"] == len(
-            "agent 1 done\nagent 2 done\nagent 3 done"
+            "agent 1 done\nagent 2 done\nagent 3 done\n"
+            "All 13 agents are in; three found nothing new."
         )
     finally:
         await worker._stop_stream_consumer()
@@ -663,11 +725,11 @@ async def test_both_notification_kinds_recorded_on_one_row(tmp_path: Path) -> No
             _system_notification(),
             _notification_user_message(),
             _system_notification(),
-            *_reply("both kinds landed"),
+            *_narrated_reply("both kinds landed", terminal="Both are filed."),
         )
         await _spin()
 
-        assert sent == []
+        assert [m.text for m in sent] == ["Both are filed."]
         rows = _suppression_rows(worker._config)
         assert len(rows) == 1
         assert sorted(rows[0]["sources"]) == [
@@ -688,16 +750,26 @@ async def test_consecutive_notification_turns_audit_once_each(tmp_path: Path) ->
     worker._client = client
     worker._ensure_stream_consumer()
     try:
-        client.push(_system_notification(), *_reply("first"))
+        client.push(
+            _system_notification(), *_narrated_reply("first", terminal="first report")
+        )
         await _spin()
-        client.push(_system_notification(), *_reply("second"))
+        client.push(
+            _system_notification(), *_narrated_reply("second", terminal="second report")
+        )
         await _spin()
 
-        assert sent == []
+        assert [m.text for m in sent] == ["first report", "second report"]
         rows = _suppression_rows(worker._config)
         assert len(rows) == 2
-        assert [r["char_count"] for r in rows] == [len("first"), len("second")]
+        assert [r["char_count"] for r in rows] == [
+            len("first\nfirst report"),
+            len("second\nsecond report"),
+        ]
         assert rows[0]["turn_id"] != rows[1]["turn_id"]
+        # Each turn's terminal accumulator starts empty: turn 2 must not
+        # re-deliver turn 1's report.
+        assert worker._idle_terminal_chunks == []
     finally:
         await worker._stop_stream_consumer()
 
@@ -756,8 +828,9 @@ async def test_suppressed_turn_still_queries_and_runs_tools(tmp_path: Path) -> N
         # Turn bookkeeping advanced exactly as on any other real turn.
         assert worker._turns_since_checkpoint == before + 1
         assert worker._dirty is True
-        # And nothing was posted.
-        assert sent == []
+        # And only the terminal report was posted — "Filing the report" is
+        # mid-turn narration ahead of two tool calls and stays dropped.
+        assert [m.text for m in sent] == ["done"]
     finally:
         await worker._stop_stream_consumer()
 
@@ -772,11 +845,14 @@ async def test_ledger_cleared_so_next_turn_is_unaffected(tmp_path: Path) -> None
     worker._client = client
 
     try:
-        client.on_query = lambda prompt: _reply("suppressed narration")
+        client.on_query = lambda prompt: _narrated_reply(
+            "suppressed narration", terminal="report"
+        )
         await worker._handle(_background_completion_event())
-        assert sent == []
+        assert [m.text for m in sent] == ["report"]
         assert worker._notification_turn is None
 
+        sent.clear()
         client.on_query = lambda prompt: _reply("here you go")
         await worker._handle(_operator_event())
         assert [m.text for m in sent] == ["here you go"]
@@ -795,6 +871,10 @@ async def test_deferred_unsolicited_reply_not_judged_by_the_live_ledger(
     ``_end_turn``. The dispatched turn's verdict must not travel to it: the
     live turn's own narration is dropped, the deferred text still ships. This
     is why the live ledger is settled BEFORE ``_end_turn`` rather than after.
+
+    Also pins the ORDERING the terminal-report delivery introduced: the live
+    turn's own report is sent in ``_handle``'s finally, ahead of the deferred
+    unsolicited text ``_end_turn`` flushes.
     """
     sent: list[OutboundMessage] = []
     worker = _make_worker(tmp_path, sent)
@@ -802,6 +882,8 @@ async def test_deferred_unsolicited_reply_not_judged_by_the_live_ledger(
     worker._client = client
     client.on_query = lambda prompt: [
         _FakeAssistantMessage(content=[_FakeTextBlock(text="suppress me")]),
+        _FakeAssistantMessage(content=[_FakeToolUseBlock()]),
+        _FakeAssistantMessage(content=[_FakeTextBlock(text="live report")]),
         _FakeResultMessage(),
         # An unsolicited turn with NO notification, landing behind the live
         # turn's Result so it is deferred rather than delivered inline.
@@ -813,10 +895,10 @@ async def test_deferred_unsolicited_reply_not_judged_by_the_live_ledger(
         await worker._handle(_background_completion_event())
         await _spin()
 
-        assert [m.text for m in sent] == ["unrelated unsolicited"]
+        assert [m.text for m in sent] == ["live report", "unrelated unsolicited"]
         rows = _suppression_rows(worker._config)
         assert len(rows) == 1
-        assert rows[0]["char_count"] == len("suppress me")
+        assert rows[0]["char_count"] == len("suppress me") + len("live report")
     finally:
         await worker._stop_stream_consumer()
 
@@ -824,12 +906,13 @@ async def test_deferred_unsolicited_reply_not_judged_by_the_live_ledger(
 @pytest.mark.asyncio
 async def test_audit_failure_does_not_break_the_turn(tmp_path: Path) -> None:
     """Bookkeeping must never crash a turn: a raising ``audit_event`` is
-    logged and swallowed, and the send is still suppressed."""
+    logged and swallowed, the narration is still suppressed, and the terminal
+    report still ships (delivery must not depend on the audit succeeding)."""
     sent: list[OutboundMessage] = []
     worker = _make_worker(tmp_path, sent)
     client = _StreamClient()
     worker._client = client
-    client.on_query = lambda prompt: _reply("narration")
+    client.on_query = lambda prompt: _narrated_reply("narration", terminal="report")
 
     import anna.runtime.worker as worker_mod
 
@@ -840,7 +923,380 @@ async def test_audit_failure_does_not_break_the_turn(tmp_path: Path) -> None:
     worker_mod.audit_event = _boom  # type: ignore[assignment]
     try:
         await worker._handle(_background_completion_event())
-        assert sent == []
+        assert [m.text for m in sent] == ["report"]
     finally:
         worker_mod.audit_event = original  # type: ignore[assignment]
         await worker._stop_stream_consumer()
+
+
+# ---------------------------------------------------------------------------
+# (f) terminal-report delivery (2026-08-30)
+#
+# The guard was aimed at mid-turn NARRATION; dropping the closing REPORT too
+# was collateral damage, and it is the report the operator actually wanted.
+# Rule: on a suppressing notification-only turn, deliver the text emitted AFTER
+# the last tool call and nothing else. A turn with no tool call is terminal in
+# its entirety. An empty terminal block stays silent — never a placeholder.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_path_b_delivers_terminal_report_only(tmp_path: Path) -> None:
+    """PATH B (unsolicited / ``system_task_notification``) — 26 of 29 real
+    cases, and the one that fails hardest against HEAD.
+
+    Three narration blocks straddling two tool calls, then the report. Only the
+    report ships; none of the narration does, including the block emitted
+    BETWEEN the two tool calls.
+    """
+    sent: list[OutboundMessage] = []
+    worker = _make_worker(tmp_path, sent)
+    client = _StreamClient()
+    worker._client = client
+    worker._ensure_stream_consumer()
+    try:
+        client.push(
+            _system_notification(),
+            _FakeAssistantMessage(content=[_FakeTextBlock(text="Reading the output")]),
+            _FakeAssistantMessage(content=[_FakeToolUseBlock(name="Read")]),
+            _FakeAssistantMessage(content=[_FakeTextBlock(text="Now cross-checking")]),
+            _FakeAssistantMessage(content=[_FakeToolUseBlock(name="Grep")]),
+            _FakeAssistantMessage(
+                content=[_FakeTextBlock(text="REPORT: three of five links are dead.")]
+            ),
+            _FakeResultMessage(),
+        )
+        await _spin()
+
+        assert [m.text for m in sent] == ["REPORT: three of five links are dead."]
+        assert "Reading the output" not in "".join(m.text for m in sent)
+        assert "Now cross-checking" not in "".join(m.text for m in sent)
+    finally:
+        await worker._stop_stream_consumer()
+
+
+@pytest.mark.asyncio
+async def test_path_a_delivers_terminal_report_only(tmp_path: Path) -> None:
+    """PATH A (dispatched / ``background_delegation``) — same split on the
+    other turn shape, including narration between two tool calls."""
+    sent: list[OutboundMessage] = []
+    worker = _make_worker(tmp_path, sent)
+    client = _StreamClient()
+    worker._client = client
+    client.on_query = lambda prompt: [
+        _FakeAssistantMessage(content=[_FakeTextBlock(text="Opening the report")]),
+        _FakeAssistantMessage(content=[_FakeToolUseBlock(name="Read")]),
+        _FakeAssistantMessage(content=[_FakeTextBlock(text="Filing it")]),
+        _FakeAssistantMessage(content=[_FakeToolUseBlock(name="Write")]),
+        _FakeAssistantMessage(
+            content=[_FakeTextBlock(text="REPORT: the researcher found nothing new.")]
+        ),
+        _FakeResultMessage(),
+    ]
+
+    try:
+        await worker._handle(_background_completion_event())
+
+        assert [m.text for m in sent] == [
+            "REPORT: the researcher found nothing new."
+        ]
+    finally:
+        await worker._stop_stream_consumer()
+
+
+@pytest.mark.asyncio
+async def test_no_tool_call_turn_delivers_everything(tmp_path: Path) -> None:
+    """No tool call means no narration/report boundary exists — the whole turn
+    IS the report. Suppressing it would be the black-hole behavior again."""
+    sent: list[OutboundMessage] = []
+    worker = _make_worker(tmp_path, sent)
+    client = _StreamClient()
+    worker._client = client
+    worker._ensure_stream_consumer()
+    try:
+        client.push(_system_notification(), *_reply("Agent 4 is done.", "Nothing new."))
+        await _spin()
+
+        assert [m.text for m in sent] == ["Agent 4 is done.\nNothing new."]
+    finally:
+        await worker._stop_stream_consumer()
+
+
+@pytest.mark.asyncio
+async def test_empty_terminal_block_stays_silent_path_b(tmp_path: Path) -> None:
+    """A turn that ends ON its tool call has narrated but never reported.
+    There is nothing to deliver, so it stays as silent as it was before."""
+    sent: list[OutboundMessage] = []
+    worker = _make_worker(tmp_path, sent)
+    client = _StreamClient()
+    worker._client = client
+    worker._ensure_stream_consumer()
+    try:
+        client.push(
+            _system_notification(),
+            *_narrated_reply("Kicking off the follow-up", terminal=None),
+        )
+        await _spin()
+
+        assert sent == []
+        rows = _suppression_rows(worker._config)
+        assert len(rows) == 1
+        assert rows[0]["delivery_outcome"] == "empty"
+        assert rows[0]["delivered_chars"] == 0
+    finally:
+        await worker._stop_stream_consumer()
+
+
+@pytest.mark.asyncio
+async def test_whitespace_only_terminal_block_stays_silent(tmp_path: Path) -> None:
+    """Whitespace is not a report."""
+    sent: list[OutboundMessage] = []
+    worker = _make_worker(tmp_path, sent)
+    client = _StreamClient()
+    worker._client = client
+    client.on_query = lambda prompt: _narrated_reply("narration", terminal="   \n  ")
+
+    try:
+        await worker._handle(_background_completion_event())
+        assert sent == []
+        rows = _suppression_rows(worker._config)
+        assert rows[0]["delivery_outcome"] == "empty"
+    finally:
+        await worker._stop_stream_consumer()
+
+
+@pytest.mark.asyncio
+async def test_flood_cap_falls_back_to_suppression(tmp_path: Path) -> None:
+    """The 2026-07-30 shape with the fix applied: 13 SEPARATE completion turns
+    would be 13 messages. The per-worker count-in-window cap clips that to the
+    configured maximum and audits the rest under a DISTINCT event."""
+    sent: list[OutboundMessage] = []
+
+    def _cap_at_three(cfg: AnnaConfig) -> None:
+        cfg.runtime.visibility.notification_terminal_max_per_window = 3
+
+    worker = _make_worker(tmp_path, sent, configure=_cap_at_three)
+    client = _StreamClient()
+    worker._client = client
+
+    try:
+        for i in range(6):
+            client.on_query = lambda prompt, i=i: _narrated_reply(
+                f"narration {i}", terminal=f"report {i}"
+            )
+            await worker._handle(_background_completion_event())
+
+        assert [m.text for m in sent] == ["report 0", "report 1", "report 2"]
+        rows = _suppression_rows(worker._config)
+        assert len(rows) == 6
+        assert [r["delivery_outcome"] for r in rows] == [
+            "delivered",
+            "delivered",
+            "delivered",
+            "rate_limited",
+            "rate_limited",
+            "rate_limited",
+        ]
+        limited = [
+            r
+            for r in _audit_records(worker._config)
+            if r.get("event") == "audit.reply.notification_terminal_rate_limited"
+        ]
+        assert len(limited) == 3
+        # The report we refused to send is recoverable from the log.
+        assert limited[0]["preview"] == "report 3"
+        assert limited[0]["max_per_window"] == 3
+    finally:
+        await worker._stop_stream_consumer()
+
+
+@pytest.mark.asyncio
+async def test_flood_cap_window_expiry_reopens_delivery(tmp_path: Path) -> None:
+    """The cap is a count IN A WINDOW, not a lifetime budget: once the window
+    has passed, delivery resumes. Exercised by ageing the recorded timestamps
+    rather than sleeping, since there is no timer to wait on."""
+    sent: list[OutboundMessage] = []
+
+    def _cap_at_one(cfg: AnnaConfig) -> None:
+        cfg.runtime.visibility.notification_terminal_max_per_window = 1
+        cfg.runtime.visibility.notification_terminal_window_seconds = 60
+
+    worker = _make_worker(tmp_path, sent, configure=_cap_at_one)
+    client = _StreamClient()
+    worker._client = client
+    client.on_query = lambda prompt: _narrated_reply("n", terminal="report")
+
+    try:
+        await worker._handle(_background_completion_event())
+        await worker._handle(_background_completion_event())
+        assert [m.text for m in sent] == ["report"]
+
+        # Age the single recorded send past the window.
+        worker._notification_terminal_sends = [
+            t - 61 for t in worker._notification_terminal_sends
+        ]
+        await worker._handle(_background_completion_event())
+        assert [m.text for m in sent] == ["report", "report"]
+    finally:
+        await worker._stop_stream_consumer()
+
+
+@pytest.mark.asyncio
+async def test_config_flag_off_restores_total_suppression_path_a(
+    tmp_path: Path,
+) -> None:
+    """The revert switch. With the flag off, a dispatched notification turn
+    behaves exactly as it did before 2026-08-30: nothing ships."""
+    sent: list[OutboundMessage] = []
+
+    def _off(cfg: AnnaConfig) -> None:
+        cfg.runtime.visibility.deliver_notification_terminal_reports = False
+
+    worker = _make_worker(tmp_path, sent, configure=_off)
+    client = _StreamClient()
+    worker._client = client
+    client.on_query = lambda prompt: _narrated_reply("narration", terminal="report")
+
+    try:
+        await worker._handle(_background_completion_event())
+        assert sent == []
+        rows = _suppression_rows(worker._config)
+        assert rows[0]["delivery_outcome"] == "disabled"
+        assert rows[0]["delivered_chars"] == 0
+    finally:
+        await worker._stop_stream_consumer()
+
+
+@pytest.mark.asyncio
+async def test_config_flag_off_restores_total_suppression_path_b(
+    tmp_path: Path,
+) -> None:
+    """Same switch, unsolicited path — including the no-tool-call turn that
+    the new behavior would otherwise deliver whole."""
+    sent: list[OutboundMessage] = []
+
+    def _off(cfg: AnnaConfig) -> None:
+        cfg.runtime.visibility.deliver_notification_terminal_reports = False
+
+    worker = _make_worker(tmp_path, sent, configure=_off)
+    client = _StreamClient()
+    worker._client = client
+    worker._ensure_stream_consumer()
+    try:
+        client.push(_system_notification(), *_reply("no tools, all report"))
+        await _spin()
+
+        assert sent == []
+        rows = _suppression_rows(worker._config)
+        assert rows[0]["delivery_outcome"] == "disabled"
+    finally:
+        await worker._stop_stream_consumer()
+
+
+@pytest.mark.asyncio
+async def test_user_inbound_latch_still_forces_full_delivery(tmp_path: Path) -> None:
+    """THE guarantee that must survive: once an operator is in the turn, the
+    terminal-report filter must NOT apply — she gets the mid-turn narration
+    too, not a report-only digest.
+
+    The turn narrates, calls a tool, the operator speaks (latch), then it
+    narrates again, calls a SECOND tool, and closes. Everything after the latch
+    ships: both the narration flushed at the second tool boundary and the
+    closing text. Under terminal-only filtering only the closing text would
+    survive, so this fails loudly if the filter ever leaks past the latch.
+    """
+    sent: list[OutboundMessage] = []
+    worker = _make_worker(tmp_path, sent)
+    client = _StreamClient()
+    worker._client = client
+    client.on_query = lambda prompt: [
+        _FakeAssistantMessage(content=[_FakeTextBlock(text="Checking on agent 4")]),
+        _FakeAssistantMessage(content=[_FakeToolUseBlock()]),
+        # The harness surfaces the operator alongside the tool result.
+        _FakeUserMessage(
+            content=[
+                _FakeToolResultBlock(),
+                _FakeTextBlock(text="what did it say?"),
+            ],
+            tool_use_result={"ok": True},
+            parent_tool_use_id="toolu_1",
+        ),
+        _FakeAssistantMessage(content=[_FakeTextBlock(text="It found three links.")]),
+        _FakeAssistantMessage(content=[_FakeToolUseBlock(name="Read")]),
+        _FakeAssistantMessage(content=[_FakeTextBlock(text="Two of them are dead.")]),
+        _FakeResultMessage(),
+    ]
+
+    try:
+        await worker._handle(_background_completion_event())
+
+        assert [m.text for m in sent] == [
+            "It found three links.",
+            "Two of them are dead.",
+        ]
+        # "Checking on agent 4" was flushed at the FIRST tool boundary, which
+        # happened BEFORE the operator's message arrived and so before the
+        # latch could be set — that drop is pre-existing guard behavior and is
+        # still owed its audit row. What matters here is that the ledger ends
+        # the turn NOT suppressing, so the terminal-report settle step never
+        # runs and never narrows what she receives.
+        rows = _suppression_rows(worker._config)
+        assert len(rows) == 1
+        assert rows[0]["send_count"] == 1
+        assert rows[0]["delivery_outcome"] == ""
+        assert rows[0]["delivered_chars"] == 0
+    finally:
+        await worker._stop_stream_consumer()
+
+
+@pytest.mark.asyncio
+async def test_audit_row_records_both_sides_of_the_split(tmp_path: Path) -> None:
+    """The audit row must not structurally hide what it dropped.
+
+    Head preview = the narration the blob starts with (unchanged field);
+    tail preview = the end of what was withheld; delivered_* = what shipped.
+    """
+    sent: list[OutboundMessage] = []
+    worker = _make_worker(tmp_path, sent)
+    client = _StreamClient()
+    worker._client = client
+    worker._ensure_stream_consumer()
+    try:
+        client.push(
+            _system_notification(),
+            *_narrated_reply(
+                "Kicking off the check", terminal="REPORT: everything is fine."
+            ),
+        )
+        await _spin()
+
+        rows = _suppression_rows(worker._config)
+        assert len(rows) == 1
+        row = rows[0]
+        # Pre-existing fields keep their pre-existing meanings.
+        assert row["preview"].startswith("Kicking off the check")
+        assert row["char_count"] == len(
+            "Kicking off the check\nREPORT: everything is fine."
+        )
+        assert row["send_count"] == 1
+        # Added fields.
+        assert row["tail_preview"].endswith("REPORT: everything is fine.")
+        assert row["delivered_chars"] == len("REPORT: everything is fine.")
+        assert row["delivered_preview"] == "REPORT: everything is fine."
+        assert row["delivery_outcome"] == "delivered"
+    finally:
+        await worker._stop_stream_consumer()
+
+
+def test_ledger_terminal_text_clears_at_each_tool_boundary() -> None:
+    """Unit-level pin on the accumulator: only post-last-tool text survives,
+    and a ledger that saw no tool at all keeps everything."""
+    ledger = _NotificationOnlyTurn(turn_id="t1")
+    ledger.note_terminal_text("a")
+    ledger.note_terminal_text("b")
+    assert ledger.terminal_text == "a\nb"
+    ledger.note_tool_boundary()
+    assert ledger.terminal_text == ""
+    ledger.note_terminal_text("report")
+    assert ledger.terminal_text == "report"
+    assert ledger.tool_boundaries == 1

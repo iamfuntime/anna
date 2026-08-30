@@ -190,6 +190,24 @@ def _reply(*texts: str) -> list[Any]:
     return msgs
 
 
+def _narration_only_reply(*texts: str) -> list[Any]:
+    """A notification turn that narrates and then ends ON a tool call.
+
+    Nothing follows the last tool call, so the notification-only guard has no
+    TERMINAL report to hand back (2026-08-30 terminal-report delivery) and the
+    whole turn stays silent. Used by the ROUTING tests below so their
+    ``sent == []`` assertions keep testing routing rather than accidentally
+    re-testing the guard's delivery policy, which has its own suite in
+    ``test_worker_notification_guard.py``.
+    """
+    msgs: list[Any] = [
+        _FakeAssistantMessage(content=[_FakeTextBlock(text=t)]) for t in texts
+    ]
+    msgs.append(_FakeAssistantMessage(content=[_FakeToolUseBlock()]))
+    msgs.append(_FakeResultMessage())
+    return msgs
+
+
 async def _spin(n: int = 20) -> None:
     for _ in range(n):
         await asyncio.sleep(0)
@@ -211,7 +229,10 @@ async def test_unsolicited_turn_handled_immediately_while_idle(tmp_path: Path) -
     worker._client = client
     worker._ensure_stream_consumer()
     try:
-        client.push(_notification_user_message(), *_reply("bg agent finished: report ready"))
+        client.push(
+            _notification_user_message(),
+            *_narration_only_reply("bg agent finished: report ready"),
+        )
         await _spin()
 
         assert sent == []
@@ -261,7 +282,10 @@ async def test_regression_unsolicited_turn_does_not_offset_live_turn(
         # Buffer a full unsolicited turn WITHOUT yielding to the event loop,
         # so the consumer has not processed it when the live turn begins —
         # the worst-case interleaving for the historic bug.
-        client.push(_notification_user_message(), *_reply("STALE background reply"))
+        client.push(
+            _notification_user_message(),
+            *_narration_only_reply("STALE background reply"),
+        )
 
         client.on_query = lambda prompt: _reply("FRESH live reply")
         loop = asyncio.get_running_loop()
@@ -297,7 +321,7 @@ async def test_background_completion_mid_turn_routed_to_idle(tmp_path: Path) -> 
     client.on_query = lambda prompt: [
         *_reply("live reply"),
         _notification_user_message(),
-        *_reply("bg done while you were talking"),
+        *_narration_only_reply("bg done while you were talking"),
     ]
     try:
         await worker._handle(_make_event())
