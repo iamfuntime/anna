@@ -137,11 +137,15 @@ class InboundEvent:
 
     ``turn_meta`` is an optional caller-owned dict the worker writes
     per-turn telemetry into before it resolves ``completion_future`` —
-    currently just ``tool_call_count``. It is the return channel the
-    future itself cannot be (the future carries the reply text only).
-    The Phase 2 scheduler passes a fresh dict per fire and reads
-    ``tool_call_count`` to detect a scheduled turn that produced prose
-    without executing a single tool. Left ``None`` by every
+    ``tool_call_count``, the resolved ``model`` id, the four billable
+    token counters (``input_tokens``, ``output_tokens``,
+    ``cache_creation_input_tokens``, ``cache_read_input_tokens``) summed
+    across every assistant message in the turn, and ``duration_s``. It is
+    the return channel the future itself cannot be (the future carries
+    the reply text only). The Phase 2 scheduler passes a fresh dict per
+    fire, reads ``tool_call_count`` to detect a scheduled turn that
+    produced prose without executing a single tool, and stamps the token
+    counts onto ``audit.schedule.complete``. Left ``None`` by every
     transport-originated event; when ``None`` the worker writes nothing
     and every consumer must treat the count as UNKNOWN (fail open).
 

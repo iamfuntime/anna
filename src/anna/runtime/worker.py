@@ -329,6 +329,139 @@ def _operator_text_of(msg: Any) -> str:
     return _MACHINE_INBOUND_BLOCK_RE.sub("", text).strip()
 
 
+# ---------------------------------------------------------------------------
+# Per-turn token accounting
+# ---------------------------------------------------------------------------
+#
+# The four fields the Anthropic API bills on. Names match the SDK's ``usage``
+# dict verbatim (see ``.claude-runtime/projects/*/**.jsonl``) so the audit row
+# can be summed straight out of the log with no rename table.
+TURN_USAGE_FIELDS: tuple[str, ...] = (
+    "input_tokens",
+    "output_tokens",
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+)
+
+# Dollar cost of the turn. NOT a key of the SDK's per-message ``usage`` dict:
+# it arrives once, as a float attribute on the closing ``ResultMessage``,
+# already summed by the CLI over every API call the turn made (main loop AND
+# sub-agents). Kept out of ``TURN_USAGE_FIELDS`` so the int-only usage-dict
+# extraction path stays int-only.
+TURN_COST_FIELD = "total_cost_usd"
+
+# Every numeric spend key a turn publishes onto ``turn_meta`` and the audit
+# row. Consumers that fold one turn into a running multi-turn total (the
+# scheduler's per-run tally) iterate THIS, not ``TURN_USAGE_FIELDS``.
+TURN_SPEND_FIELDS: tuple[str, ...] = (*TURN_USAGE_FIELDS, TURN_COST_FIELD)
+
+
+class _TurnUsage:
+    """Running token total for ONE turn, scraped off the SDK message stream.
+
+    Every ``AssistantMessage`` is a distinct API response and carries its own
+    ``usage`` dict, so a turn that ran N tool calls bills N+1 times. Summing
+    per-message usage is therefore the only correct turn total — reading the
+    last message alone undercounts by every tool round-trip. Sub-agent
+    assistant messages (``parent_tool_use_id`` set) DO count toward the token
+    total (they are real spend on this turn's behalf) but never overwrite
+    ``model``, which stays the resolved MAIN-LOOP model id.
+
+    ``ResultMessage.usage`` is used only as a fallback for a turn where no
+    assistant message carried usage — folding it in on top of the per-message
+    sum would double-count, since the CLI already aggregates it.
+    """
+
+    def __init__(self) -> None:
+        self.model: str | None = None
+        self.totals: dict[str, float] = dict.fromkeys(TURN_USAGE_FIELDS, 0)
+        # Float, and sourced from the ResultMessage rather than the per-message
+        # usage dict, so it rides along with the counters but is folded in by a
+        # separate path (see ``observe_result``). 0.0 when the SDK omits it.
+        self.totals[TURN_COST_FIELD] = 0.0
+        self._from_messages = False
+
+    @staticmethod
+    def _usage_ints(usage: Any) -> dict[str, int]:
+        """Extract the billable integer fields from an SDK ``usage`` dict."""
+        if not isinstance(usage, dict):
+            return {}
+        out: dict[str, int] = {}
+        for key in TURN_USAGE_FIELDS:
+            value = usage.get(key)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            out[key] = int(value)
+        return out
+
+    def observe_assistant(self, msg: Any) -> None:
+        """Fold one ``AssistantMessage`` into the turn total."""
+        model = getattr(msg, "model", None)
+        if (
+            isinstance(model, str)
+            and model
+            and getattr(msg, "parent_tool_use_id", None) is None
+        ):
+            self.model = model
+        fields = self._usage_ints(getattr(msg, "usage", None))
+        if not fields:
+            return
+        self._from_messages = True
+        for key, value in fields.items():
+            self.totals[key] += value
+
+    def observe_result(self, msg: Any) -> None:
+        """Fold the closing ``ResultMessage`` in (model id and cost always;
+        tokens only when no assistant message carried usage)."""
+        if self.model is None:
+            model_usage = getattr(msg, "model_usage", None)
+            if isinstance(model_usage, dict):
+                for name in model_usage:
+                    if isinstance(name, str) and name:
+                        self.model = name
+                        break
+        # Cost is ALWAYS taken from here, unconditionally: it is a whole-turn
+        # total the CLI already computed rather than a per-message field, so
+        # there is nothing on the assistant messages to double-count against.
+        cost = getattr(msg, "total_cost_usd", None)
+        if not isinstance(cost, bool) and isinstance(cost, (int, float)):
+            self.totals[TURN_COST_FIELD] = round(
+                self.totals[TURN_COST_FIELD] + float(cost), 6
+            )
+        if self._from_messages:
+            return
+        for key, value in self._usage_ints(getattr(msg, "usage", None)).items():
+            self.totals[key] += value
+
+    def as_audit_fields(self) -> dict[str, Any]:
+        """Additive audit-row keys: ``model``, the four token counters and
+        ``total_cost_usd``."""
+        return {"model": self.model, **self.totals}
+
+    def publish(self, turn_meta: dict[str, Any] | None) -> None:
+        """Accumulate this turn's usage into a caller-owned ``turn_meta``.
+
+        Additive (``+=``) rather than assignment so the scheduled-reply
+        regeneration path, which reuses the same dict for a second drain,
+        reports the COMBINED spend of both attempts.
+        """
+        if turn_meta is None:
+            return
+        for key, value in self.totals.items():
+            previous = turn_meta.get(key)
+            base = (
+                previous
+                if isinstance(previous, (int, float)) and not isinstance(previous, bool)
+                else 0
+            )
+            summed = base + value
+            # Re-round the float (cost) each fold so repeated accumulation
+            # across retries cannot drift into 1e-17 tails.
+            turn_meta[key] = round(summed, 6) if isinstance(summed, float) else summed
+        if self.model:
+            turn_meta["model"] = self.model
+
+
 @dataclass
 class _NotificationOnlyTurn:
     """Per-turn ledger for the notification-only text guard.
@@ -2382,7 +2515,10 @@ class ConversationWorker:
             )
 
     def _emit_turn_telemetry(
-        self, event: InboundEvent, watchdog: TurnWatchdog
+        self,
+        event: InboundEvent,
+        watchdog: TurnWatchdog,
+        usage: _TurnUsage | None = None,
     ) -> None:
         """Write the per-interactive-turn telemetry audit row.
 
@@ -2391,9 +2527,19 @@ class ConversationWorker:
         flags. WARNING level when the turn breached (soft or hard) so it stays
         visible in journald, INFO otherwise. Exception-isolated: telemetry must
         never break turn teardown.
+
+        ``usage``, when passed, adds the turn's resolved model id, its four
+        billable token counters (summed across every assistant message in the
+        turn), its ``total_cost_usd`` (from the closing ResultMessage; 0.0 when
+        absent) plus a ``duration_s`` alias of ``duration_seconds``. Purely
+        ADDITIVE — every pre-existing key keeps its name and meaning, so a log
+        parser written against the old row still works.
         """
         telemetry = watchdog.telemetry()
         breached = telemetry["soft_breached"] or telemetry["hard_breached"]
+        extra: dict[str, Any] = {"duration_s": telemetry["duration_seconds"]}
+        if usage is not None:
+            extra.update(usage.as_audit_fields())
         try:
             audit_event(
                 "audit.turn.telemetry",
@@ -2404,6 +2550,7 @@ class ConversationWorker:
                 level="WARNING" if breached else "INFO",
                 transport=self.transport,
                 **telemetry,
+                **extra,
             )
         except Exception as exc:  # noqa: BLE001 — never break turn teardown
             self._log.warning(
@@ -2725,11 +2872,18 @@ class ConversationWorker:
         # on, keeping the regenerated reply consistent with the primary
         # scheduled-dispatch path (terminal-only, no mid-turn narration).
         terminal_chunks: list[str] = []
+        # Regeneration burns real tokens on the caller's behalf, so its usage
+        # accumulates onto the SAME ``turn_meta`` the first attempt published:
+        # ``audit.schedule.complete`` must report the combined spend of both
+        # drains, not just the re-run.
+        regen_usage = _TurnUsage()
+        regen_started_at = time.monotonic()
         turn_queue = self._begin_turn()
         try:
             await self._client.query(correction_prompt)  # type: ignore[attr-defined]
             async for msg in self._turn_messages(turn_queue):
                 if AssistantMessage is not None and isinstance(msg, AssistantMessage):
+                    regen_usage.observe_assistant(msg)
                     for block in msg.content:
                         if TextBlock is not None and isinstance(block, TextBlock):
                             reply_chunks.append(block.text)
@@ -2745,6 +2899,7 @@ class ConversationWorker:
                                     int(event.turn_meta.get("tool_call_count", 0)) + 1
                                 )
                 if ResultMessage is not None and isinstance(msg, ResultMessage):
+                    regen_usage.observe_result(msg)
                     break
         except Exception as exc:
             self._log.error(
@@ -2755,6 +2910,15 @@ class ConversationWorker:
             )
             return None
         finally:
+            # Publish inside the finally so a mid-drain failure still reports
+            # the tokens already burned. ``publish`` is additive, and
+            # ``duration_s`` grows by this attempt's wall time.
+            regen_usage.publish(event.turn_meta)
+            if event.turn_meta is not None:
+                elapsed = round(time.monotonic() - regen_started_at, 3)
+                previous = event.turn_meta.get("duration_s")
+                base = previous if isinstance(previous, (int, float)) else 0.0
+                event.turn_meta["duration_s"] = round(base + elapsed, 3)
             await self._end_turn(turn_queue)
 
         if self._consolidate_scheduled:
@@ -3016,6 +3180,12 @@ class ConversationWorker:
         # scheduler's no-tool-call backstop reads it to tell a real run from
         # a turn that only narrated (2026-07-29 oem-slide-restock-watch).
         tool_call_count = 0
+        # Per-turn token accounting (Fable spend attribution). Summed across
+        # EVERY assistant message in the turn, then published two ways: into
+        # ``event.turn_meta`` for the scheduler's ``audit.schedule.complete``
+        # row, and into ``audit.turn.telemetry`` for interactive turns.
+        turn_usage = _TurnUsage()
+        turn_started_at = time.monotonic()
         loop = asyncio.get_running_loop()
         buffer = _FlushBuffer(last_flush=loop.time())
         # Timed-drip timer (Inbox/2026-06-04 plan). Started ONLY for an
@@ -3082,6 +3252,13 @@ class ConversationWorker:
 
             try:
                 async for msg in self._turn_messages(turn_queue):
+                    # Token accounting first, before any branch below can
+                    # ``continue``/``break`` past it, so the total covers every
+                    # billed message in the turn — not just the last one.
+                    if AssistantMessage is not None and isinstance(msg, AssistantMessage):
+                        turn_usage.observe_assistant(msg)
+                    elif ResultMessage is not None and isinstance(msg, ResultMessage):
+                        turn_usage.observe_result(msg)
                     # Mid-turn operator message. The harness surfaces a real
                     # person's message INSIDE a running turn by appending a text
                     # block to the user message that carries a tool result. That
@@ -3306,7 +3483,7 @@ class ConversationWorker:
                     )
             if watchdog is not None:
                 watchdog.mark_ended()
-                self._emit_turn_telemetry(event, watchdog)
+                self._emit_turn_telemetry(event, watchdog, turn_usage)
             # ALWAYS clear, even on exception, cancellation, or early
             # return inside the try-block above. The clear callable is
             # itself exception-isolated — defense-in-depth keeps a
@@ -3354,6 +3531,15 @@ class ConversationWorker:
             # down keeps bumping the same dict.
             if event.turn_meta is not None:
                 event.turn_meta["tool_call_count"] = tool_call_count
+                # Same channel, second payload: the turn's token spend and the
+                # resolved model, so the scheduler can stamp them onto
+                # ``audit.schedule.complete``. Published BEFORE the future
+                # resolves; the regeneration path below accumulates onto the
+                # same dict so a retried turn reports combined spend.
+                turn_usage.publish(event.turn_meta)
+                event.turn_meta["duration_s"] = round(
+                    time.monotonic() - turn_started_at, 3
+                )
             # Scheduled-turn narration consolidation (2026-07-12
             # weekly-synthesis incident). Under ``consolidate_scheduled_turns``
             # (default on), the future resolves with ONLY the turn's TERMINAL
