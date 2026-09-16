@@ -233,6 +233,26 @@ class RuntimeVisibilityConfig(BaseModel):
     notification_terminal_max_per_window: int = 5
     notification_terminal_window_seconds: int = 60
 
+    # CHARACTER cap on the terminal report above (2026-09-16 incident). A
+    # delegate completion returned a full sub-agent report and the worker
+    # shipped it verbatim; at ~4.5k characters it crossed the Slack
+    # transport's own SLACK_MAX_CHARS = 3900 split point, so it rendered as
+    # TWO messages with a list item orphaned at the top of the second. The
+    # count-in-window cap above bounds HOW MANY reports go out, not how big
+    # each one is, so a single completion could still blow the channel apart.
+    # Truncation happens at the last newline / sentence / word boundary at or
+    # before the cap (never mid-word) with a single `` […]`` marker appended,
+    # so the operator can see there is more and go read the delegation log.
+    # 1200 chars is roughly a screenful of Slack and comfortably under the
+    # transport split, which is the point: one message, always. Scoped to the
+    # NOTIFICATION-TERMINAL path only — interactive replies stay deliberately
+    # uncapped (a genuinely long answer to a genuinely long question is not a
+    # defect), and nothing here touches ``_guarded_send``. ``0`` means "no
+    # cap" (restores the pre-2026-09-16 behavior without a code revert);
+    # negatives are rejected at load. No hot-reload — edits take effect on the
+    # next ``systemctl --user restart anna``.
+    notification_terminal_max_chars: int = 1200
+
     # Slack-specific knobs. Custom emojis may not exist on every workspace;
     # if reactions.add fails the worker logs a warning and the SDK turn
     # continues uninterrupted.
@@ -275,6 +295,22 @@ class RuntimeVisibilityConfig(BaseModel):
             raise ValueError(
                 "runtime.visibility.notification_terminal_max_per_window must "
                 "be >= 0 (0 disables notification terminal-report delivery)"
+            )
+        return v
+
+    @field_validator("notification_terminal_max_chars")
+    @classmethod
+    def _terminal_max_chars_non_negative(cls, v: int) -> int:
+        """Reject a negative character cap; ``0`` is the explicit off switch.
+
+        A negative value would be silently read as "truncate to nothing" by
+        the worker's slice arithmetic, which is exactly the silent-report-loss
+        failure the 2026-09-16 cap exists to make visible.
+        """
+        if v < 0:
+            raise ValueError(
+                "runtime.visibility.notification_terminal_max_chars must be "
+                ">= 0 (0 disables the terminal-report character cap)"
             )
         return v
 
