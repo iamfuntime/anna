@@ -10,13 +10,22 @@ sequence of messages instead of being rejected (Telegram) or degraded
 
 from __future__ import annotations
 
+from pathlib import Path
+from typing import Any
+
 import pytest
 
+from anna.config import AnnaConfig
 from anna.transports.base import (
     SLACK_MAX_CHARS,
     TELEGRAM_MAX_CHARS,
+    OutboundMessage,
+    split_headline,
     split_message_text,
+    split_on_paragraphs,
 )
+from anna.transports.slack import SlackAdapter
+from anna.transports.slack_thread_state import ThreadParticipation
 
 
 def test_under_limit_returns_single_chunk() -> None:
@@ -86,3 +95,117 @@ def test_slack_limit_is_conservative() -> None:
 def test_zero_limit_rejected() -> None:
     with pytest.raises(ValueError):
         split_message_text("anything", 0)
+
+
+# ---------------------------------------------------------------------------
+# Slack: over-SLACK_MAX_CHARS replies go out as headline + thread overflow
+# (2026-09-18). Never an arbitrary split, never lost content.
+# ---------------------------------------------------------------------------
+
+_HEADLINE = "Audit finished: 80 findings, all fixed."
+_LONG_BODY = _HEADLINE + "\n\n" + "\n\n".join(
+    f"Finding {i:02d}: the schedule store entry was stale and has been fixed."
+    for i in range(80)
+)
+
+
+class _StubSlackClient:
+    def __init__(self, *, upload_fails: bool = False) -> None:
+        self.post_calls: list[dict[str, Any]] = []
+        self.upload_calls: list[dict[str, Any]] = []
+        self._upload_fails = upload_fails
+
+    async def chat_postMessage(self, **kwargs: Any) -> dict[str, Any]:
+        self.post_calls.append(kwargs)
+        ts = f"1716832700.{len(self.post_calls):06d}"
+        return {"ok": True, "channel": "D0DMCHAN1", "ts": ts}
+
+    async def files_upload_v2(self, **kwargs: Any) -> dict[str, Any]:
+        if self._upload_fails:
+            raise RuntimeError("missing_scope: files:write")
+        self.upload_calls.append(kwargs)
+        return {"ok": True}
+
+
+def _slack(tmp_path: Path, client: Any) -> SlackAdapter:
+    cfg = AnnaConfig()
+    object.__setattr__(cfg, "anna_home", tmp_path / "anna_home")
+    tp = ThreadParticipation(
+        state_path=tmp_path / "anna_home" / "state" / "slack_thread_participation.jsonl"
+    )
+    adapter = SlackAdapter(config=cfg, thread_participation=tp)
+    adapter._client = client  # type: ignore[attr-defined]
+    return adapter
+
+
+def test_split_on_paragraphs_keeps_every_paragraph_whole() -> None:
+    chunks = split_on_paragraphs(_LONG_BODY, 1000)
+    assert all(len(c) <= 1000 for c in chunks)
+    assert "\n\n".join(chunks) == _LONG_BODY
+
+
+def test_split_headline_on_an_oversized_first_paragraph_loses_nothing() -> None:
+    text = "word " * 1000
+    head, rest = split_headline(text, 500)
+    assert len(head) <= 500
+    assert head + " " + rest == text
+
+
+async def test_short_slack_reply_is_one_post_no_thread(tmp_path: Path) -> None:
+    client = _StubSlackClient()
+    await _slack(tmp_path, client).send(
+        OutboundMessage(conversation_key="slack:dm:U123", text="short reply")
+    )
+    assert [c["text"] for c in client.post_calls] == ["short reply"]
+    assert client.upload_calls == []
+
+
+async def test_over_limit_reply_posts_headline_and_uploads_full_text(
+    tmp_path: Path,
+) -> None:
+    assert len(_LONG_BODY) > SLACK_MAX_CHARS
+    client = _StubSlackClient()
+    await _slack(tmp_path, client).send(
+        OutboundMessage(conversation_key="slack:dm:U123", text=_LONG_BODY)
+    )
+
+    assert len(client.post_calls) == 1
+    main = client.post_calls[0]
+    assert main["text"].startswith(_HEADLINE)
+    assert "Finding 00" not in main["text"]
+    assert len(main["text"]) <= SLACK_MAX_CHARS
+    # Full text in the headline's thread, uploaded to the RESOLVED channel id.
+    assert len(client.upload_calls) == 1
+    upload = client.upload_calls[0]
+    assert upload["content"] == _LONG_BODY
+    assert upload["thread_ts"] == "1716832700.000001"
+    assert upload["channel"] == "D0DMCHAN1"
+
+
+async def test_over_limit_reply_falls_back_to_threaded_paragraph_replies(
+    tmp_path: Path,
+) -> None:
+    client = _StubSlackClient(upload_fails=True)
+    await _slack(tmp_path, client).send(
+        OutboundMessage(conversation_key="slack:dm:U123", text=_LONG_BODY)
+    )
+
+    head, *replies = client.post_calls
+    assert len(replies) >= 2
+    assert all(len(r["text"]) <= SLACK_MAX_CHARS for r in replies)
+    assert all(r["thread_ts"] == "1716832700.000001" for r in replies)
+    # No content lost: headline + threaded replies reassemble the original.
+    assert head["text"].startswith(_HEADLINE)
+    assert _HEADLINE + "\n\n" + "\n\n".join(r["text"] for r in replies) == _LONG_BODY
+
+
+async def test_over_limit_reply_in_a_channel_thread_stays_in_that_thread(
+    tmp_path: Path,
+) -> None:
+    client = _StubSlackClient(upload_fails=True)
+    await _slack(tmp_path, client).send(
+        OutboundMessage(
+            conversation_key="slack:ch:C0CHAN:1716000000.000100", text=_LONG_BODY
+        )
+    )
+    assert {c["thread_ts"] for c in client.post_calls} == {"1716000000.000100"}

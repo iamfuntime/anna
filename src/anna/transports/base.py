@@ -86,6 +86,49 @@ def split_message_text(text: str, limit: int) -> list[str]:
     return chunks
 
 
+def split_on_paragraphs(text: str, limit: int) -> list[str]:
+    """Split ``text`` into chunks no longer than ``limit``, on paragraphs.
+
+    Whole paragraphs (``\n\n``-separated) are packed greedily into each
+    chunk; a single paragraph longer than ``limit`` falls back to
+    :func:`split_message_text`. Used for Slack thread overflow (2026-09-18),
+    where each chunk becomes one threaded reply and should read as whole
+    paragraphs rather than a line cut mid-thought.
+    """
+    if limit <= 0:
+        raise ValueError("split_on_paragraphs limit must be > 0")
+    if len(text) <= limit:
+        return [text]
+    chunks: list[str] = []
+    current = ""
+    for para in text.split("\n\n"):
+        for piece in split_message_text(para, limit):
+            candidate = f"{current}\n\n{piece}" if current else piece
+            if len(candidate) <= limit:
+                current = candidate
+            else:
+                chunks.append(current)
+                current = piece
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def split_headline(text: str, limit: int) -> tuple[str, str]:
+    """Split ``text`` into its first paragraph (``<= limit``) and the rest.
+
+    A first paragraph longer than ``limit`` is cut at the same boundary
+    :func:`split_message_text` would choose, and the remainder resumes
+    exactly where the headline stopped, so ``headline`` + ``rest`` loses
+    nothing but the one boundary whitespace between them.
+    """
+    para, _sep, rest = text.partition("\n\n")
+    if len(para) <= limit:
+        return para, rest.lstrip("\n")
+    head = split_message_text(para, limit)[0]
+    return head, text[len(head) :].lstrip()
+
+
 @dataclass(frozen=True)
 class ImageAttachment:
     """A single inbound image carried on an :class:`InboundEvent`.

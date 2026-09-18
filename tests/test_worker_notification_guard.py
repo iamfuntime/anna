@@ -1300,3 +1300,138 @@ def test_ledger_terminal_text_clears_at_each_tool_boundary() -> None:
     ledger.note_terminal_text("report")
     assert ledger.terminal_text == "report"
     assert ledger.tool_boundaries == 1
+
+
+# ---------------------------------------------------------------------------
+# Provenance-aware terminal budget (2026-09-18)
+#
+# A terminal report closing out work the operator started interactively
+# (including work backgrounded from that turn) ships in FULL; scheduled and
+# unrequested reports keep the notification_terminal_max_chars cap and its
+# " […]" marker. The MISTAKES/FRICTION/WISHES footer is stripped either way.
+# ---------------------------------------------------------------------------
+
+_LONG_REPORT = "\n\n".join(
+    f"Finding {i:02d}: the schedule store entry was stale and has been fixed."
+    for i in range(80)
+)  # ~5.8k chars: over both the 1,200 cap and SLACK_MAX_CHARS
+
+_FOOTER = (
+    "\n\n---\n"
+    "*MISTAKES* — none\n"
+    "*FRICTION* — the store has no dry-run mode\n"
+    "*WISHES* — none\n"
+)
+
+
+def _scheduled_event(future: asyncio.Future[str]) -> InboundEvent:
+    return InboundEvent(
+        transport="slack",
+        conversation_key=CONV_KEY,
+        sender_id="anna.scheduler",
+        sender_display="ANNA Scheduler",
+        text="Run the nightly audit.",
+        is_dm=False,
+        is_thread=False,
+        raw={"schedule_id": "nightly"},
+        completion_future=future,
+    )
+
+
+async def _run_origin_then_completion(
+    tmp_path: Path, origin: str, terminal: str
+) -> tuple[list[OutboundMessage], ConversationWorker]:
+    """Drive one originating turn (interactive or scheduled) that launches the
+    work, then the background-completion turn that reports on it. Returns only
+    what the COMPLETION turn sent."""
+    sent: list[OutboundMessage] = []
+    worker = _make_worker(tmp_path, sent)
+    client = _StreamClient()
+    worker._client = client
+    client.on_query = lambda prompt: _reply("Started the audit.")
+    if origin == "interactive":
+        await worker._handle(_operator_event(text="Audit the schedules."))
+    elif origin == "scheduled":
+        future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+        await worker._handle(_scheduled_event(future))
+    sent.clear()
+    client.on_query = lambda prompt: _narrated_reply(
+        "Reading the report", terminal=terminal
+    )
+    await worker._handle(_background_completion_event())
+    return sent, worker
+
+
+@pytest.mark.asyncio
+async def test_interactive_origin_long_report_delivered_untruncated(
+    tmp_path: Path,
+) -> None:
+    sent, worker = await _run_origin_then_completion(
+        tmp_path, "interactive", _LONG_REPORT
+    )
+    try:
+        assert [m.text for m in sent] == [_LONG_REPORT]
+        assert "[…]" not in sent[0].text
+        row = _suppression_rows(worker._config)[-1]
+        assert row["origin"] == "interactive"
+        assert row["delivered_chars"] == len(_LONG_REPORT)
+    finally:
+        await worker._stop_stream_consumer()
+
+
+@pytest.mark.asyncio
+async def test_scheduled_origin_long_report_capped_with_marker(
+    tmp_path: Path,
+) -> None:
+    sent, worker = await _run_origin_then_completion(
+        tmp_path, "scheduled", _LONG_REPORT
+    )
+    try:
+        assert len(sent) == 1
+        cap = worker._config.runtime.visibility.notification_terminal_max_chars
+        assert len(sent[0].text) <= cap
+        assert sent[0].text.endswith(" […]")
+        assert _LONG_REPORT.startswith(sent[0].text[: -len(" […]")])
+        assert _suppression_rows(worker._config)[-1]["origin"] == "scheduled"
+    finally:
+        await worker._stop_stream_consumer()
+
+
+@pytest.mark.asyncio
+async def test_unknown_origin_keeps_the_cap(tmp_path: Path) -> None:
+    """A fresh worker (respawned after idle-out, nothing driven yet) cannot
+    prove the work was requested, so it keeps the pre-existing cap."""
+    sent, worker = await _run_origin_then_completion(tmp_path, "none", _LONG_REPORT)
+    try:
+        assert len(sent) == 1
+        assert sent[0].text.endswith(" […]")
+    finally:
+        await worker._stop_stream_consumer()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("origin", ["interactive", "scheduled"])
+async def test_footer_stripped_for_every_origin(tmp_path: Path, origin: str) -> None:
+    short = "REPORT: three schedules fixed."
+    sent, worker = await _run_origin_then_completion(
+        tmp_path, origin, short + _FOOTER
+    )
+    try:
+        assert [m.text for m in sent] == [short]
+        for marker in ("MISTAKES", "FRICTION", "WISHES"):
+            assert marker not in sent[0].text
+    finally:
+        await worker._stop_stream_consumer()
+
+
+@pytest.mark.asyncio
+async def test_footer_stripped_from_a_long_interactive_report(tmp_path: Path) -> None:
+    """Uncapped does not mean unsanitized: the full body ships, the footer does
+    not."""
+    sent, worker = await _run_origin_then_completion(
+        tmp_path, "interactive", _LONG_REPORT + _FOOTER
+    )
+    try:
+        assert [m.text for m in sent] == [_LONG_REPORT]
+    finally:
+        await worker._stop_stream_consumer()

@@ -250,7 +250,9 @@ class RuntimeVisibilityConfig(BaseModel):
     # defect), and nothing here touches ``_guarded_send``. ``0`` means "no
     # cap" (restores the pre-2026-09-16 behavior without a code revert);
     # negatives are rejected at load. No hot-reload — edits take effect on the
-    # next ``systemctl --user restart anna``.
+    # next ``systemctl --user restart anna``. 2026-09-18: applies only to
+    # reports on work that did NOT start in an interactive turn; a report on
+    # work the operator asked for ships whole (Slack threads any overflow).
     notification_terminal_max_chars: int = 1200
 
     # Slack-specific knobs. Custom emojis may not exist on every workspace;

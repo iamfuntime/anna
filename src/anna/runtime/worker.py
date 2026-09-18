@@ -686,6 +686,10 @@ class _NotificationOnlyTurn:
     tool_boundaries: int = 0
     delivery_outcome: str = ""
     delivered_text: str = ""
+    # Provenance of the work this report closes out (2026-09-18): "interactive"
+    # when it was started from an operator turn, "scheduled" otherwise. Set by
+    # :meth:`ConversationWorker._decide_notification_terminal`; audit-only.
+    origin: str = ""
 
     @property
     def suppressing(self) -> bool:
@@ -905,6 +909,15 @@ class ConversationWorker:
         self._notification_terminal_max_chars: int = (
             config.runtime.visibility.notification_terminal_max_chars
         )
+        # Provenance latch for terminal reports (2026-09-18). True once this
+        # worker has run an operator-driven turn, False once it has run a
+        # scheduled one, keyed on the same ``completion_future is None`` signal
+        # the drip and watchdog gates use. Background-delegation completion
+        # turns never set it, so a completion inherits the provenance of the
+        # turn that launched the work. ``None`` (fresh worker, nothing driven
+        # yet) is treated as NOT interactive: the capped direction is the
+        # pre-existing behavior, so an unknown origin can never widen output.
+        self._driven_turn_interactive: bool | None = None
         # Flood cap, per worker, as a COUNT IN A WINDOW: monotonic timestamps of
         # terminal reports actually delivered, pruned on the send path. A
         # deliberate non-choice of a timer/delayed flush — real coalescing needs
@@ -2955,6 +2968,10 @@ class ConversationWorker:
         delegate report crossed the Slack transport's ``SLACK_MAX_CHARS``
         split point and arrived as two messages with an orphaned list item.
 
+        2026-09-18 amendment: the character cap applies only when the work did
+        NOT originate in an interactive turn (see ``_driven_turn_interactive``).
+        A report closing out work the operator asked for is delivered whole.
+
         The window is pruned here, on the send path, rather than by a timer:
         the list only ever holds at most ``_notification_terminal_max`` live
         entries plus whatever has aged out since the previous call, so it cannot
@@ -2972,9 +2989,17 @@ class ConversationWorker:
         # flood-window bookkeeping so a report that sanitizes away to nothing
         # does not burn one of the window's delivery slots.
         clean_text, _filters_fired = _sanitize_outbound(terminal_text)
-        clean_text = _truncate_notification_terminal(
-            clean_text, self._notification_terminal_max_chars
-        )
+        # Provenance-aware budget (2026-09-18). Work the operator started from
+        # an interactive turn (including work backgrounded from it) was asked
+        # for, so its report ships in FULL; the Slack transport threads any
+        # overflow past SLACK_MAX_CHARS rather than splitting it. Scheduled and
+        # unrequested reports keep the character cap and its marker.
+        interactive = self._driven_turn_interactive is True
+        ledger.origin = "interactive" if interactive else "scheduled"
+        if not interactive:
+            clean_text = _truncate_notification_terminal(
+                clean_text, self._notification_terminal_max_chars
+            )
         if not clean_text.strip():
             # Nothing left to say — the same silence a turn that ended on a
             # tool call gets, recorded under the same existing outcome so the
@@ -3093,6 +3118,7 @@ class ConversationWorker:
                 delivered_chars=len(ledger.delivered_text),
                 delivered_preview=ledger.delivered_text[:280],
                 delivery_outcome=ledger.delivery_outcome,
+                origin=ledger.origin,
             )
         except Exception as exc:  # noqa: BLE001 — never break turn teardown
             self._log.warning(
@@ -3318,6 +3344,10 @@ class ConversationWorker:
         # ``_end_turn`` flushes belong to a DIFFERENT turn and are judged by
         # their own ledger, never by this one.
         self._notification_turn = self._notification_turn_for(event)
+        # Provenance latch (2026-09-18): only turns a person or the scheduler
+        # drove set it; a background-delegation completion inherits it.
+        if not event.raw.get("background_delegation"):
+            self._driven_turn_interactive = event.completion_future is None
         turn_queue = self._begin_turn()
         try:
             await self._dispatch_turn(event, turn_queue)

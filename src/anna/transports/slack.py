@@ -32,9 +32,14 @@ from anna.transports.base import (
     InboundHandler,
     OutboundMessage,
     SignalHandle,
-    split_message_text,
+    split_headline,
+    split_on_paragraphs,
 )
 from anna.transports.slack_thread_state import ThreadParticipation
+
+# Appended to the headline of a reply that overflowed SLACK_MAX_CHARS, so the
+# reader knows the rest is in the thread rather than missing (2026-09-18).
+_THREAD_OVERFLOW_NOTE = "\n\n_(full text in thread)_"
 
 if TYPE_CHECKING:  # pragma: no cover - import-only for typing
     from anna.runtime.voice import VoiceProcessor
@@ -245,24 +250,24 @@ class SlackAdapter(ChannelAdapter):
                 # the slack_post MCP tool also routes through, so report cards
                 # and skill posts are normalized here too.
                 mrkdwn_text = normalize_to_slack_mrkdwn(message.text)
-                # Length splitting (Inbox/2026-06-04 plan, decision C): a
-                # single oversized reply is posted as a sequence of messages
-                # under Slack's practical cap instead of being degraded. Most
-                # messages fit and yield exactly one chunk, preserving prior
-                # behavior. ``blocks`` (structured) attach to the FINAL chunk
-                # only so they are not duplicated across the split.
-                chunks = split_message_text(mrkdwn_text, SLACK_MAX_CHARS)
-                last_ts: str | None = None
-                for idx, chunk in enumerate(chunks):
-                    kwargs: dict[str, Any] = {"channel": channel, "text": chunk}
-                    if thread_ts:
-                        kwargs["thread_ts"] = thread_ts
-                    if (
-                        idx == len(chunks) - 1
-                        and message.structured
-                        and "blocks" in message.structured
-                    ):
-                        kwargs["blocks"] = message.structured["blocks"]
+                # Length handling (2026-09-18, replacing the Inbox/2026-06-04
+                # blind split): a reply over Slack's practical cap posts its
+                # headline as the main message and the FULL text in that
+                # message's thread (see :meth:`_post_with_thread_overflow`),
+                # so nothing is lost and the channel gets one message, not an
+                # arbitrary cut with an orphaned list item. Most messages fit
+                # and take the single-post path unchanged.
+                kwargs: dict[str, Any] = {"channel": channel, "text": mrkdwn_text}
+                if thread_ts:
+                    kwargs["thread_ts"] = thread_ts
+                if message.structured and "blocks" in message.structured:
+                    kwargs["blocks"] = message.structured["blocks"]
+                overflow = len(mrkdwn_text) > SLACK_MAX_CHARS
+                if overflow:
+                    last_ts = await self._post_with_thread_overflow(
+                        message=message, kwargs=kwargs, mrkdwn_text=mrkdwn_text
+                    )
+                else:
                     response = await self._client.chat_postMessage(**kwargs)
                     last_ts = response.get("ts")
                 self._log.debug(
@@ -270,7 +275,7 @@ class SlackAdapter(ChannelAdapter):
                     channel="slack",
                     conv_key=message.conversation_key,
                     text_length=len(message.text),
-                    chunks=len(chunks),
+                    overflow=overflow,
                     ts=last_ts,
                 )
             except Exception as exc:
@@ -294,6 +299,62 @@ class SlackAdapter(ChannelAdapter):
                 channel_id=channel,
                 thread_ts=thread_ts,
             )
+
+    async def _post_with_thread_overflow(
+        self,
+        *,
+        message: OutboundMessage,
+        kwargs: dict[str, Any],
+        mrkdwn_text: str,
+    ) -> str | None:
+        """Post an over-``SLACK_MAX_CHARS`` reply as headline + thread overflow.
+
+        The first paragraph (clipped to fit with the thread note) goes out as
+        the main message; the FULL text then lands in that message's thread
+        (or the conversation's existing thread) as a text-file snippet via
+        ``files_upload_v2``, the same client call the voice path uses. When the
+        upload is unavailable or fails (missing ``files:write`` scope, API
+        error), the text after the headline is posted as sequential threaded
+        replies split on paragraph boundaries instead. Either way every
+        character of the reply reaches Slack. Returns the headline's ``ts``.
+        """
+        headline, rest = split_headline(
+            mrkdwn_text, SLACK_MAX_CHARS - len(_THREAD_OVERFLOW_NOTE)
+        )
+        response = await self._client.chat_postMessage(
+            **{**kwargs, "text": headline + _THREAD_OVERFLOW_NOTE}
+        )
+        headline_ts: str | None = response.get("ts")
+        reply_ts = kwargs.get("thread_ts") or headline_ts
+        # ``chat.postMessage`` returns the resolved conversation ID, which the
+        # upload API needs (it rejects the bare user ID a DM post accepts).
+        upload_channel = response.get("channel") or kwargs["channel"]
+        upload = getattr(self._client, "files_upload_v2", None)
+        if upload is not None:
+            try:
+                upload_kwargs: dict[str, Any] = {
+                    "channel": upload_channel,
+                    "content": message.text,
+                    "filename": "full-reply.md",
+                    "title": "Full reply",
+                }
+                if reply_ts:
+                    upload_kwargs["thread_ts"] = reply_ts
+                await upload(**upload_kwargs)
+                return headline_ts
+            except Exception as exc:
+                self._log.warning(
+                    "channel.overflow_upload_failed",
+                    channel="slack",
+                    conv_key=message.conversation_key,
+                    error=str(exc),
+                )
+        for chunk in split_on_paragraphs(rest, SLACK_MAX_CHARS):
+            reply: dict[str, Any] = {"channel": kwargs["channel"], "text": chunk}
+            if reply_ts:
+                reply["thread_ts"] = reply_ts
+            await self._client.chat_postMessage(**reply)
+        return headline_ts
 
     async def _maybe_upload_voice(
         self,
