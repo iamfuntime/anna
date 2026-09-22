@@ -489,6 +489,23 @@ _MACHINE_INBOUND_BLOCK_RE = re.compile(
 )
 
 
+def _is_subagent_message(msg: Any) -> bool:
+    """True when a stream message was authored by a SUB-AGENT, not the main loop.
+
+    The CLI streams every sub-agent's own ``AssistantMessage`` s (foreground
+    Task and background delegates alike) on the same channel as the main
+    loop's, tagged with ``parent_tool_use_id`` = the spawning tool call. Their
+    text is the sub-agent's working output / raw report — addressed to the
+    main model, never to the operator. It must never enter an outbound reply
+    buffer (2026-09-22: a background delegate's 5.2k-char final report, with
+    its MISTAKES/FRICTION/WISHES footer, streamed in just before its
+    task-notification, was accumulated into the idle buffer and shipped to
+    Slack glued in front of the assistant's own reply). Token accounting still
+    counts these messages; only reply assembly ignores them.
+    """
+    return getattr(msg, "parent_tool_use_id", None) is not None
+
+
 def _operator_text_of(msg: Any) -> str:
     """Genuine operator text carried by a stream ``UserMessage``, or ``""``.
 
@@ -1723,6 +1740,12 @@ class ConversationWorker:
                 self._unsolicited_ledger().note_user_inbound()
             return
         if AssistantMessage is not None and isinstance(msg, AssistantMessage):
+            if _is_subagent_message(msg):
+                # A (typically background) sub-agent's own output. It is not
+                # the main model speaking, so it neither opens an unsolicited
+                # turn nor contributes text to one; the main model's reply to
+                # the task notification that follows is what gets delivered.
+                return
             self._unsolicited_open = True
             for block in msg.content:
                 if TextBlock is not None and isinstance(block, TextBlock):
@@ -1898,6 +1921,7 @@ class ConversationWorker:
             if (
                 AssistantMessage is not None
                 and isinstance(msg, AssistantMessage)
+                and not _is_subagent_message(msg)
                 and any(
                     TextBlock is not None and isinstance(b, TextBlock) and b.text
                     for b in msg.content
@@ -2356,7 +2380,11 @@ class ConversationWorker:
 
             try:
                 async for msg in self._turn_messages(turn_queue):
-                    if AssistantMessage is not None and isinstance(msg, AssistantMessage):
+                    if (
+                        AssistantMessage is not None
+                        and isinstance(msg, AssistantMessage)
+                        and not _is_subagent_message(msg)
+                    ):
                         for block in msg.content:
                             if TextBlock is not None and isinstance(block, TextBlock):
                                 chunks.append(block.text)
@@ -3189,7 +3217,10 @@ class ConversationWorker:
             async for msg in self._turn_messages(turn_queue):
                 if AssistantMessage is not None and isinstance(msg, AssistantMessage):
                     regen_usage.observe_assistant(msg)
-                    for block in msg.content:
+                    # Sub-agent output is billed above but never part of the
+                    # reply (see ``_is_subagent_message``).
+                    blocks = [] if _is_subagent_message(msg) else msg.content
+                    for block in blocks:
                         if TextBlock is not None and isinstance(block, TextBlock):
                             reply_chunks.append(block.text)
                             terminal_chunks.append(block.text)
@@ -3626,7 +3657,14 @@ class ConversationWorker:
                             transport=self.transport,
                             turn_id=self._notification_turn.turn_id,
                         )
-                    if AssistantMessage is not None and isinstance(msg, AssistantMessage):
+                    # Sub-agent messages (``parent_tool_use_id`` set) were
+                    # billed above; their text and tool calls are the
+                    # sub-agent's, never this turn's reply or tool count.
+                    if (
+                        AssistantMessage is not None
+                        and isinstance(msg, AssistantMessage)
+                        and not _is_subagent_message(msg)
+                    ):
                         for block in msg.content:
                             if TextBlock is not None and isinstance(block, TextBlock):
                                 reply_chunks.append(block.text)

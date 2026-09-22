@@ -98,8 +98,8 @@ def test_zero_limit_rejected() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Slack: over-SLACK_MAX_CHARS replies go out as headline + thread overflow
-# (2026-09-18). Never an arbitrary split, never lost content.
+# Slack: over-SLACK_MAX_CHARS replies go out as sequential paragraph-split
+# messages, first in channel, rest in thread (2026-09-22). No file upload.
 # ---------------------------------------------------------------------------
 
 _HEADLINE = "Audit finished: 80 findings, all fixed."
@@ -160,52 +160,42 @@ async def test_short_slack_reply_is_one_post_no_thread(tmp_path: Path) -> None:
     assert client.upload_calls == []
 
 
-async def test_over_limit_reply_posts_headline_and_uploads_full_text(
+async def test_over_limit_reply_posts_sequential_paragraph_messages_no_file(
     tmp_path: Path,
 ) -> None:
+    """2026-09-22: no ``full-reply.md`` upload and no "see thread" note. The
+    reply goes out as normal messages split on paragraphs: first chunk is the
+    main message, the rest follow in its thread, in order, losing nothing."""
     assert len(_LONG_BODY) > SLACK_MAX_CHARS
     client = _StubSlackClient()
     await _slack(tmp_path, client).send(
         OutboundMessage(conversation_key="slack:dm:U123", text=_LONG_BODY)
     )
 
-    assert len(client.post_calls) == 1
-    main = client.post_calls[0]
-    assert main["text"].startswith(_HEADLINE)
-    assert "Finding 00" not in main["text"]
-    assert len(main["text"]) <= SLACK_MAX_CHARS
-    # Full text in the headline's thread, uploaded to the RESOLVED channel id.
-    assert len(client.upload_calls) == 1
-    upload = client.upload_calls[0]
-    assert upload["content"] == _LONG_BODY
-    assert upload["thread_ts"] == "1716832700.000001"
-    assert upload["channel"] == "D0DMCHAN1"
-
-
-async def test_over_limit_reply_falls_back_to_threaded_paragraph_replies(
-    tmp_path: Path,
-) -> None:
-    client = _StubSlackClient(upload_fails=True)
-    await _slack(tmp_path, client).send(
-        OutboundMessage(conversation_key="slack:dm:U123", text=_LONG_BODY)
-    )
-
-    head, *replies = client.post_calls
-    assert len(replies) >= 2
-    assert all(len(r["text"]) <= SLACK_MAX_CHARS for r in replies)
+    assert client.upload_calls == []
+    first, *replies = client.post_calls
+    assert replies
+    assert "thread_ts" not in first
+    assert first["text"].startswith(_HEADLINE)
+    assert "Finding 00" in first["text"]
+    assert all(len(c["text"]) <= SLACK_MAX_CHARS for c in client.post_calls)
     assert all(r["thread_ts"] == "1716832700.000001" for r in replies)
-    # No content lost: headline + threaded replies reassemble the original.
-    assert head["text"].startswith(_HEADLINE)
-    assert _HEADLINE + "\n\n" + "\n\n".join(r["text"] for r in replies) == _LONG_BODY
+    assert not any("in thread" in c["text"] for c in client.post_calls)
+    assert [c["text"] for c in client.post_calls] == split_on_paragraphs(
+        _LONG_BODY, SLACK_MAX_CHARS
+    )
+    assert "\n\n".join(c["text"] for c in client.post_calls) == _LONG_BODY
 
 
 async def test_over_limit_reply_in_a_channel_thread_stays_in_that_thread(
     tmp_path: Path,
 ) -> None:
-    client = _StubSlackClient(upload_fails=True)
+    client = _StubSlackClient()
     await _slack(tmp_path, client).send(
         OutboundMessage(
             conversation_key="slack:ch:C0CHAN:1716000000.000100", text=_LONG_BODY
         )
     )
     assert {c["thread_ts"] for c in client.post_calls} == {"1716000000.000100"}
+    assert len(client.post_calls) >= 2
+    assert client.upload_calls == []

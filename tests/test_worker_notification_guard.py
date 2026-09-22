@@ -1435,3 +1435,102 @@ async def test_footer_stripped_from_a_long_interactive_report(tmp_path: Path) ->
         assert [m.text for m in sent] == [_LONG_REPORT]
     finally:
         await worker._stop_stream_consumer()
+
+
+# ---------------------------------------------------------------------------
+# Sub-agent output never reaches the operator (2026-09-22 incident, turn
+# e50abda53258). The CLI streams a background delegate's own AssistantMessages
+# (``parent_tool_use_id`` set) on the shared stream; its final report landed
+# just before the task notification, was accumulated into the idle buffer as
+# if the main model had said it, and shipped glued in front of the real reply.
+# ---------------------------------------------------------------------------
+
+
+class _SubagentAssistantMessage(_FakeAssistantMessage):
+    """An AssistantMessage (passes the SDK isinstance check) authored by a
+    sub-agent, i.e. with ``parent_tool_use_id`` set."""
+
+    def __init__(self, content: list[Any], parent_tool_use_id: str = "toolu_sub") -> None:
+        super().__init__(content=content)
+        self.parent_tool_use_id = parent_tool_use_id
+
+
+_SUBAGENT_REPORT = (
+    "**Jaxson Dart status**\nDart hurt his left knee...\n\n"
+    "MISTAKES: none\nFRICTION: none\nWISHES: none"
+)
+_MAIN_REPLY = "*Dart:* It looks like a sprained MCL. MRI is today."
+
+
+@pytest.mark.asyncio
+async def test_background_subagent_report_is_not_delivered_idle(tmp_path: Path) -> None:
+    """Exact incident shape: sub-agent tool calls, its final report, the system
+    task notification, then the main model's own reply. Only the reply ships."""
+    sent: list[OutboundMessage] = []
+    worker = _make_worker(tmp_path, sent)
+    client = _StreamClient()
+    worker._client = client
+    worker._ensure_stream_consumer()
+    try:
+        client.push(
+            _SubagentAssistantMessage([_FakeToolUseBlock(name="web_fetch")]),
+            _SubagentAssistantMessage([_FakeTextBlock(text="Checking one more source")]),
+            _SubagentAssistantMessage([_FakeToolUseBlock(name="web_search")]),
+            _SubagentAssistantMessage([_FakeTextBlock(text=_SUBAGENT_REPORT)]),
+            _system_notification(),
+            _FakeAssistantMessage(content=[_FakeTextBlock(text=_MAIN_REPLY)]),
+            _FakeResultMessage(),
+        )
+        await _spin()
+
+        assert [m.text for m in sent] == [_MAIN_REPLY]
+        joined = "".join(m.text for m in sent)
+        assert "Jaxson Dart status" not in joined
+        assert "MISTAKES" not in joined
+        rows = _suppression_rows(worker._config)
+        assert len(rows) == 1
+        assert rows[0]["delivered_chars"] == len(_MAIN_REPLY)
+    finally:
+        await worker._stop_stream_consumer()
+
+
+@pytest.mark.asyncio
+async def test_idle_subagent_message_does_not_open_unsolicited_turn(
+    tmp_path: Path,
+) -> None:
+    """A sub-agent streaming while the worker is idle is not a main-model turn:
+    it must not flip ``_unsolicited_open`` (which would divert the next live
+    turn's messages to the idle path)."""
+    sent: list[OutboundMessage] = []
+    worker = _make_worker(tmp_path, sent)
+    client = _StreamClient()
+    worker._client = client
+    worker._ensure_stream_consumer()
+    try:
+        client.push(_SubagentAssistantMessage([_FakeTextBlock(text=_SUBAGENT_REPORT)]))
+        await _spin()
+        assert worker._unsolicited_open is False
+        assert worker._idle_chunks == []
+        assert sent == []
+    finally:
+        await worker._stop_stream_consumer()
+
+
+@pytest.mark.asyncio
+async def test_subagent_text_during_live_turn_not_in_reply(tmp_path: Path) -> None:
+    """A foreground/background sub-agent's messages that land in a LIVE turn's
+    queue are billed but never become part of the turn's reply."""
+    sent: list[OutboundMessage] = []
+    worker = _make_worker(tmp_path, sent)
+    client = _StreamClient()
+    worker._client = client
+    client.on_query = lambda prompt: [
+        _SubagentAssistantMessage([_FakeTextBlock(text=_SUBAGENT_REPORT)]),
+        _FakeAssistantMessage(content=[_FakeTextBlock(text=_MAIN_REPLY)]),
+        _FakeResultMessage(),
+    ]
+    try:
+        await worker._handle(_operator_event())
+        assert [m.text for m in sent] == [_MAIN_REPLY]
+    finally:
+        await worker._stop_stream_consumer()
