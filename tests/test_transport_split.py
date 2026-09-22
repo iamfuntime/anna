@@ -24,6 +24,7 @@ from anna.transports.base import (
     split_message_text,
     split_on_paragraphs,
 )
+from anna.transports.fit import TRIM_NOTE, truncate_at_paragraph
 from anna.transports.slack import SlackAdapter
 from anna.transports.slack_thread_state import ThreadParticipation
 
@@ -98,8 +99,9 @@ def test_zero_limit_rejected() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Slack: over-SLACK_MAX_CHARS replies go out as sequential paragraph-split
-# messages, first in channel, rest in thread (2026-09-22). No file upload.
+# Slack: never more than ONE message per reply (2026-09-22). Over
+# SLACK_MAX_CHARS the reply is tuned by one model call; if that fails or still
+# does not fit it is truncated at a paragraph boundary with a trimmed note.
 # ---------------------------------------------------------------------------
 
 _HEADLINE = "Audit finished: 80 findings, all fixed."
@@ -127,13 +129,29 @@ class _StubSlackClient:
         return {"ok": True}
 
 
-def _slack(tmp_path: Path, client: Any) -> SlackAdapter:
+class _StubTuner:
+    def __init__(self, *, result: str | None = None, fails: bool = False) -> None:
+        self.calls: list[tuple[str, int]] = []
+        self._result = result
+        self._fails = fails
+
+    async def __call__(self, text: str, limit: int) -> str:
+        self.calls.append((text, limit))
+        if self._fails:
+            raise RuntimeError("model unavailable")
+        assert self._result is not None
+        return self._result
+
+
+def _slack(tmp_path: Path, client: Any, tuner: Any = None) -> SlackAdapter:
     cfg = AnnaConfig()
     object.__setattr__(cfg, "anna_home", tmp_path / "anna_home")
     tp = ThreadParticipation(
         state_path=tmp_path / "anna_home" / "state" / "slack_thread_participation.jsonl"
     )
-    adapter = SlackAdapter(config=cfg, thread_participation=tp)
+    adapter = SlackAdapter(
+        config=cfg, thread_participation=tp, tuner=tuner or _StubTuner(fails=True)
+    )
     adapter._client = client  # type: ignore[attr-defined]
     return adapter
 
@@ -151,51 +169,80 @@ def test_split_headline_on_an_oversized_first_paragraph_loses_nothing() -> None:
     assert head + " " + rest == text
 
 
-async def test_short_slack_reply_is_one_post_no_thread(tmp_path: Path) -> None:
+async def test_under_limit_reply_passes_through_untouched(tmp_path: Path) -> None:
     client = _StubSlackClient()
-    await _slack(tmp_path, client).send(
+    tuner = _StubTuner(result="should not be used")
+    await _slack(tmp_path, client, tuner).send(
         OutboundMessage(conversation_key="slack:dm:U123", text="short reply")
     )
     assert [c["text"] for c in client.post_calls] == ["short reply"]
+    assert tuner.calls == []
     assert client.upload_calls == []
 
 
-async def test_over_limit_reply_posts_sequential_paragraph_messages_no_file(
+@pytest.mark.parametrize(
+    "conv_key", ["slack:dm:U123", "slack:ch:C0CHAN:1716000000.000100"]
+)
+async def test_over_limit_reply_is_tuned_once_and_posts_one_message(
+    tmp_path: Path, conv_key: str
+) -> None:
+    assert len(_LONG_BODY) > SLACK_MAX_CHARS
+    tuned = _HEADLINE + "\n\nAll 80 stale schedule entries fixed. Nothing for you to decide."
+    client = _StubSlackClient()
+    tuner = _StubTuner(result=tuned)
+    await _slack(tmp_path, client, tuner).send(
+        OutboundMessage(conversation_key=conv_key, text=_LONG_BODY)
+    )
+    assert len(tuner.calls) == 1
+    sent_text, asked_limit = tuner.calls[0]
+    assert sent_text == _LONG_BODY
+    assert asked_limit < SLACK_MAX_CHARS
+    assert len(client.post_calls) == 1
+    assert client.post_calls[0]["text"] == tuned
+    assert client.upload_calls == []
+    if conv_key.startswith("slack:ch:"):
+        assert client.post_calls[0]["thread_ts"] == "1716000000.000100"
+    else:
+        assert "thread_ts" not in client.post_calls[0]
+
+
+async def test_tune_failure_falls_back_to_paragraph_truncation_one_message(
     tmp_path: Path,
 ) -> None:
-    """2026-09-22: no ``full-reply.md`` upload and no "see thread" note. The
-    reply goes out as normal messages split on paragraphs: first chunk is the
-    main message, the rest follow in its thread, in order, losing nothing."""
-    assert len(_LONG_BODY) > SLACK_MAX_CHARS
     client = _StubSlackClient()
-    await _slack(tmp_path, client).send(
+    tuner = _StubTuner(fails=True)
+    await _slack(tmp_path, client, tuner).send(
         OutboundMessage(conversation_key="slack:dm:U123", text=_LONG_BODY)
     )
-
-    assert client.upload_calls == []
-    first, *replies = client.post_calls
-    assert replies
-    assert "thread_ts" not in first
-    assert first["text"].startswith(_HEADLINE)
-    assert "Finding 00" in first["text"]
-    assert all(len(c["text"]) <= SLACK_MAX_CHARS for c in client.post_calls)
-    assert all(r["thread_ts"] == "1716832700.000001" for r in replies)
-    assert not any("in thread" in c["text"] for c in client.post_calls)
-    assert [c["text"] for c in client.post_calls] == split_on_paragraphs(
-        _LONG_BODY, SLACK_MAX_CHARS
-    )
-    assert "\n\n".join(c["text"] for c in client.post_calls) == _LONG_BODY
+    assert len(tuner.calls) == 1
+    assert len(client.post_calls) == 1
+    text = client.post_calls[0]["text"]
+    assert len(text) <= SLACK_MAX_CHARS
+    assert text.startswith(_HEADLINE)
+    assert text.endswith(TRIM_NOTE)
+    body = text[: -len(TRIM_NOTE)].rstrip()
+    # Cut on a paragraph boundary: every kept paragraph is a whole original one.
+    originals = set(_LONG_BODY.split("\n\n"))
+    assert all(p in originals for p in body.split("\n\n"))
 
 
-async def test_over_limit_reply_in_a_channel_thread_stays_in_that_thread(
+async def test_tuned_text_still_over_limit_falls_back_to_truncation(
     tmp_path: Path,
 ) -> None:
     client = _StubSlackClient()
-    await _slack(tmp_path, client).send(
-        OutboundMessage(
-            conversation_key="slack:ch:C0CHAN:1716000000.000100", text=_LONG_BODY
-        )
+    tuner = _StubTuner(result=_LONG_BODY)  # model ignored the limit
+    await _slack(tmp_path, client, tuner).send(
+        OutboundMessage(conversation_key="slack:dm:U123", text=_LONG_BODY)
     )
-    assert {c["thread_ts"] for c in client.post_calls} == {"1716000000.000100"}
-    assert len(client.post_calls) >= 2
-    assert client.upload_calls == []
+    assert len(tuner.calls) == 1
+    assert len(client.post_calls) == 1
+    assert len(client.post_calls[0]["text"]) <= SLACK_MAX_CHARS
+    assert client.post_calls[0]["text"].endswith(TRIM_NOTE)
+
+
+def test_truncate_at_paragraph_oversized_first_paragraph() -> None:
+    text = "word " * 2000
+    out = truncate_at_paragraph(text, 500)
+    assert len(out) <= 500
+    assert out.endswith(TRIM_NOTE)
+    assert not out[: -len(TRIM_NOTE)].rstrip().endswith("wor")

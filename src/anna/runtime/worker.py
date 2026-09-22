@@ -3019,8 +3019,8 @@ class ConversationWorker:
         clean_text, _filters_fired = _sanitize_outbound(terminal_text)
         # Provenance-aware budget (2026-09-18). Work the operator started from
         # an interactive turn (including work backgrounded from it) was asked
-        # for, so its report ships in FULL; the Slack transport threads any
-        # overflow past SLACK_MAX_CHARS rather than splitting it. Scheduled and
+        # for, so its report ships in FULL; the Slack transport tunes any
+        # overflow past SLACK_MAX_CHARS down into one message. Scheduled and
         # unrequested reports keep the character cap and its marker.
         interactive = self._driven_turn_interactive is True
         ledger.origin = "interactive" if interactive else "scheduled"

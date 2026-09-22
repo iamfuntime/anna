@@ -23,7 +23,6 @@ import httpx
 
 from anna.config import AnnaConfig
 from anna.log import audit_event, get_logger
-from anna.transports.mrkdwn import normalize_to_slack_mrkdwn
 from anna.transports.base import (
     SLACK_MAX_CHARS,
     ChannelAdapter,
@@ -32,8 +31,9 @@ from anna.transports.base import (
     InboundHandler,
     OutboundMessage,
     SignalHandle,
-    split_on_paragraphs,
 )
+from anna.transports.fit import Tuner, build_sdk_tuner, fit_one_message
+from anna.transports.mrkdwn import normalize_to_slack_mrkdwn
 from anna.transports.slack_thread_state import ThreadParticipation
 
 if TYPE_CHECKING:  # pragma: no cover - import-only for typing
@@ -60,8 +60,12 @@ class SlackAdapter(ChannelAdapter):
         config: AnnaConfig,
         thread_participation: ThreadParticipation,
         voice: VoiceProcessor | None = None,
+        tuner: Tuner | None = None,
     ) -> None:
         self._config = config
+        # One-shot model rewrite used when a reply is over SLACK_MAX_CHARS
+        # (see anna.transports.fit). Injectable for tests.
+        self._tuner: Tuner = tuner if tuner is not None else build_sdk_tuner(config)
         self._log = get_logger("anna.transport.slack")
         self._handlers: list[InboundHandler] = []
         self._app: Any = None
@@ -245,31 +249,34 @@ class SlackAdapter(ChannelAdapter):
                 # the slack_post MCP tool also routes through, so report cards
                 # and skill posts are normalized here too.
                 mrkdwn_text = normalize_to_slack_mrkdwn(message.text)
-                # Length handling (2026-09-22, replacing the 2026-09-18
-                # headline + file-upload overflow): a reply over Slack's
-                # practical cap is posted as sequential normal messages split
-                # on paragraph boundaries, the first as the main message and
-                # the rest in its thread (see :meth:`_post_with_thread_overflow`).
-                # Most messages fit and take the single-post path unchanged.
+                # Length handling (2026-09-22, replacing the same-day
+                # paragraph-split overflow): never more than ONE message per
+                # reply. Over SLACK_MAX_CHARS, one model call rewrites it
+                # tighter; if that fails or still does not fit, truncate at a
+                # paragraph boundary with a short trimmed note. Applies to
+                # DMs, channel replies and scheduled output alike, since they
+                # all go through this send path.
+                mrkdwn_text, fit_outcome = await fit_one_message(
+                    mrkdwn_text,
+                    SLACK_MAX_CHARS,
+                    self._tuner,
+                    normalize=normalize_to_slack_mrkdwn,
+                )
+                overflow = fit_outcome != "fits"
                 kwargs: dict[str, Any] = {"channel": channel, "text": mrkdwn_text}
                 if thread_ts:
                     kwargs["thread_ts"] = thread_ts
                 if message.structured and "blocks" in message.structured:
                     kwargs["blocks"] = message.structured["blocks"]
-                overflow = len(mrkdwn_text) > SLACK_MAX_CHARS
-                if overflow:
-                    last_ts = await self._post_with_thread_overflow(
-                        message=message, kwargs=kwargs, mrkdwn_text=mrkdwn_text
-                    )
-                else:
-                    response = await self._client.chat_postMessage(**kwargs)
-                    last_ts = response.get("ts")
+                response = await self._client.chat_postMessage(**kwargs)
+                last_ts = response.get("ts")
                 self._log.debug(
                     "channel.message.sent",
                     channel="slack",
                     conv_key=message.conversation_key,
                     text_length=len(message.text),
                     overflow=overflow,
+                    fit=fit_outcome,
                     ts=last_ts,
                 )
             except Exception as exc:
@@ -293,36 +300,6 @@ class SlackAdapter(ChannelAdapter):
                 channel_id=channel,
                 thread_ts=thread_ts,
             )
-
-    async def _post_with_thread_overflow(
-        self,
-        *,
-        message: OutboundMessage,
-        kwargs: dict[str, Any],
-        mrkdwn_text: str,
-    ) -> str | None:
-        """Post an over-``SLACK_MAX_CHARS`` reply as sequential normal messages.
-
-        The text is split on paragraph boundaries (``split_on_paragraphs``).
-        The first chunk goes out as the main message (carrying any structured
-        ``blocks``); the remaining chunks follow in order in that message's
-        thread (or the conversation's existing thread). No file upload and no
-        "see thread" note (2026-09-22: the operator does not want replies
-        turned into ``full-reply.md`` attachments). Every character of the
-        reply reaches Slack. Returns the first message's ``ts``.
-        """
-        chunks = split_on_paragraphs(mrkdwn_text, SLACK_MAX_CHARS) or [mrkdwn_text]
-        response = await self._client.chat_postMessage(
-            **{**kwargs, "text": chunks[0]}
-        )
-        first_ts: str | None = response.get("ts")
-        reply_ts = kwargs.get("thread_ts") or first_ts
-        for chunk in chunks[1:]:
-            reply: dict[str, Any] = {"channel": kwargs["channel"], "text": chunk}
-            if reply_ts:
-                reply["thread_ts"] = reply_ts
-            await self._client.chat_postMessage(**reply)
-        return first_ts
 
     async def _maybe_upload_voice(
         self,
