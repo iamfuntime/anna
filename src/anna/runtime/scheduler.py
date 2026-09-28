@@ -22,9 +22,12 @@ the full design.
 from __future__ import annotations
 
 import asyncio
+import json
+import subprocess
+import time
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 from anna.config import AnnaConfig
 from anna.log import audit_event, get_logger
@@ -51,7 +54,81 @@ if TYPE_CHECKING:
 # the skill returns exactly.
 QUIET_SENTINEL = "[[ANNA_NO_OUTPUT]]"
 
-__all__ = ["QUIET_SENTINEL", "Scheduler"]
+# Wall-clock cap on a schedule's optional ``gate_command`` pre-flight. A gate
+# exists to be cheaper than the fire it guards, so it gets a hard, short
+# budget; overrunning it is a fail-open (the fire proceeds), never a skip.
+GATE_TIMEOUT_SECONDS = 15.0
+
+# The ONLY exit code that suppresses a fire. Derived from
+# ``scripts/heartbeat_gate.py``: 0 = "nothing present, safe to skip", 10 =
+# "something present or a check was inconclusive, run", 1 = "the gate itself
+# malfunctioned, run". Its docstring states the caller contract directly —
+# "The caller must treat ANY non-zero exit as 'run'. Only 0 is a skip."
+GATE_SKIP_EXIT_CODE = 0
+
+# Bound on the gate stdout we copy into the audit row and on the reason we
+# derive from it. Mirrors the 280-char previews the no-tool-call guard emits.
+GATE_REASON_MAX_CHARS = 280
+GATE_OUTPUT_MAX_CHARS = 2000
+
+__all__ = ["GATE_TIMEOUT_SECONDS", "QUIET_SENTINEL", "Scheduler"]
+
+
+class GateOutcome(NamedTuple):
+    """What a ``gate_command`` pre-flight decided, plus telemetry.
+
+    ``skip`` is the only field that changes behavior and it is true ONLY on
+    an unambiguous skip signal (a clean exit with
+    :data:`GATE_SKIP_EXIT_CODE`). Every other field is audit payload.
+    """
+
+    skip: bool
+    exit_code: int | None
+    reason: str
+    output: str
+    duration_seconds: float
+
+    @classmethod
+    def fire(
+        cls,
+        *,
+        exit_code: int | None = None,
+        reason: str = "",
+        output: str = "",
+        duration_seconds: float = 0.0,
+    ) -> "GateOutcome":
+        """A fail-open outcome: whatever happened, the schedule fires."""
+        return cls(
+            skip=False,
+            exit_code=exit_code,
+            reason=reason,
+            output=output,
+            duration_seconds=duration_seconds,
+        )
+
+
+def _gate_reason(stdout: str) -> str:
+    """Best-effort human reason for a suppression, read from gate stdout.
+
+    Purely cosmetic: this NEVER influences the decision. A gate that prints
+    nothing, prose, or malformed JSON still suppresses on its exit code
+    alone, so no parsing failure here can turn a skip into a fire or the
+    reverse. JSON objects are preferred because ``heartbeat_gate.py --json``
+    emits one; a plain-text gate falls back to its last line.
+    """
+    text = (stdout or "").strip()
+    if not text:
+        return ""
+    try:
+        payload = json.loads(text)
+    except ValueError:
+        return text.splitlines()[-1].strip()[:GATE_REASON_MAX_CHARS]
+    if isinstance(payload, dict):
+        for key in ("reason", "detail", "summary", "decision"):
+            value = payload.get(key)
+            if isinstance(value, str) and value:
+                return value[:GATE_REASON_MAX_CHARS]
+    return text[:GATE_REASON_MAX_CHARS]
 
 
 class Scheduler:
@@ -286,8 +363,138 @@ class Scheduler:
     # Guarded fire with timeout + failure handling
     # ------------------------------------------------------------------
 
+    async def _consult_gate(self, schedule: Schedule) -> GateOutcome:
+        """Run ``schedule.gate_command`` and report whether to skip this tick.
+
+        FAILS OPEN ON EVERYTHING. The contract is the one
+        ``scripts/heartbeat_gate.py`` documents and the only one this method
+        implements: a clean exit with code :data:`GATE_SKIP_EXIT_CODE` (0)
+        means "nothing present, skip"; ANY other outcome — any other exit
+        code, a timeout, a missing or non-executable binary, an OS error, an
+        unparseable stdout, an unexpected exception — means FIRE. There is
+        deliberately no branch in here that turns an ambiguous result into a
+        skip, because a gate that wakes too often only costs money while a
+        gate that stays quiet when it should not loses work.
+
+        ``subprocess.run`` is pushed onto a worker thread so a gate that
+        sits for its full :data:`GATE_TIMEOUT_SECONDS` cannot stall the
+        scheduler's event loop. ``CancelledError`` is intentionally NOT
+        caught: a fire cancelled by :meth:`cancel_schedule_tasks` while its
+        gate is running must stay cancelled, exactly as it does at every
+        other await point in the fire path.
+        """
+        command = schedule.gate_command or []
+        if not command:
+            return GateOutcome.fire()
+        started = time.monotonic()
+        try:
+            proc = await asyncio.to_thread(
+                subprocess.run,
+                command,
+                capture_output=True,
+                text=True,
+                timeout=GATE_TIMEOUT_SECONDS,
+                stdin=subprocess.DEVNULL,
+            )
+        except asyncio.CancelledError:
+            raise
+        except subprocess.TimeoutExpired:
+            elapsed = time.monotonic() - started
+            self._log.warning(
+                "scheduler.gate_timeout",
+                schedule_id=schedule.id,
+                timeout_seconds=GATE_TIMEOUT_SECONDS,
+                duration_seconds=elapsed,
+            )
+            return GateOutcome.fire(
+                reason=f"gate timed out after {GATE_TIMEOUT_SECONDS:.0f}s",
+                duration_seconds=elapsed,
+            )
+        except Exception as exc:
+            # Missing binary, not executable, permission denied, a bad argv
+            # type that only blows up at spawn — all of it fires.
+            elapsed = time.monotonic() - started
+            self._log.warning(
+                "scheduler.gate_error",
+                schedule_id=schedule.id,
+                error=str(exc),
+                duration_seconds=elapsed,
+            )
+            return GateOutcome.fire(
+                reason=f"gate error: {type(exc).__name__}: {exc}"[
+                    :GATE_REASON_MAX_CHARS
+                ],
+                duration_seconds=elapsed,
+            )
+
+        elapsed = time.monotonic() - started
+        stdout = (proc.stdout or "")[:GATE_OUTPUT_MAX_CHARS]
+        if proc.returncode != GATE_SKIP_EXIT_CODE:
+            # The expected wake path. Not a warning: a gate saying "there is
+            # work" is the normal, healthy answer most of the time.
+            self._log.info(
+                "scheduler.gate_wake",
+                schedule_id=schedule.id,
+                exit_code=proc.returncode,
+                duration_seconds=elapsed,
+            )
+            return GateOutcome.fire(
+                exit_code=proc.returncode,
+                reason=_gate_reason(proc.stdout or ""),
+                output=stdout,
+                duration_seconds=elapsed,
+            )
+        return GateOutcome(
+            skip=True,
+            exit_code=proc.returncode,
+            reason=_gate_reason(proc.stdout or ""),
+            output=stdout,
+            duration_seconds=elapsed,
+        )
+
+    async def _record_gate_skip(
+        self, schedule: Schedule, outcome: GateOutcome
+    ) -> None:
+        """Audit a suppressed tick.
+
+        This row is the ONLY record that a tick happened at all — no
+        ``audit.schedule.fire`` is emitted for a gated-off tick — so counting
+        ``audit.schedule.gate_skip`` against ``audit.schedule.fire`` gives the
+        measured suppression rate rather than an estimated one. No store
+        mutation: ``_poll_once`` already advanced ``last_fired_at`` via
+        ``mark_dispatched`` (so the next cron tick computes correctly), and a
+        tick that never ran is neither a success nor a failure, so
+        ``last_status`` and ``consecutive_failures`` are left untouched.
+        """
+        audit_event(
+            "audit.schedule.gate_skip",
+            audit_dir=self._audit_dir,
+            actor="anna",
+            fsync_on_write=self._fsync,
+            schedule_id=schedule.id,
+            gate_command=list(schedule.gate_command or ()),
+            exit_code=outcome.exit_code,
+            reason=outcome.reason,
+            gate_output=outcome.output,
+            duration_seconds=outcome.duration_seconds,
+        )
+        self._log.info(
+            "scheduler.gate_skip",
+            schedule_id=schedule.id,
+            reason=outcome.reason,
+            duration_seconds=outcome.duration_seconds,
+        )
+
     async def _guarded_fire(self, schedule: Schedule) -> None:
         async with self._semaphore:
+            # Optional pre-flight gate. Runs BEFORE audit.schedule.fire so a
+            # suppressed tick emits exactly one row (gate_skip) and the fire
+            # count stays a count of real fires. Fails open on everything.
+            gate = await self._consult_gate(schedule)
+            if gate.skip:
+                await self._record_gate_skip(schedule, gate)
+                return
+
             started_at = datetime.now(timezone.utc)
             audit_event(
                 "audit.schedule.fire",

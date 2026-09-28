@@ -65,6 +65,15 @@ class Schedule(BaseModel):
     ``schedules.yaml`` entries, where it defaults to False — preserving
     the existing non-ephemeral behavior for every schedule that does not
     opt in.
+
+    ``gate_command`` (default None) is an optional argv the scheduler runs
+    as a cheap pre-flight before each fire. Exit code 0 means "nothing to
+    do, skip this tick"; ANY other outcome — nonzero exit, timeout, crash,
+    missing binary — fires the schedule normally. None (the default, and
+    the value for every legacy ``schedules.yaml`` entry) means no gate and
+    no subprocess: the fire proceeds exactly as it does today. It is an
+    argv list rather than a shell string so no shell ever interprets it.
+    See :meth:`anna.runtime.scheduler.Scheduler._consult_gate`.
     """
 
     id: str
@@ -76,5 +85,6 @@ class Schedule(BaseModel):
     timeout_seconds: int = 300
     enabled: bool = True
     ephemeral: bool = False
+    gate_command: list[str] | None = None
     created_at: datetime
     state: ScheduleState = Field(default_factory=ScheduleState)
