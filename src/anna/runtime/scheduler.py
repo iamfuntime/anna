@@ -354,6 +354,7 @@ class Scheduler:
             completion_future=completion,
             ephemeral=schedule.ephemeral,
             turn_meta=turn_meta,
+            model=schedule.model,
         )
 
         await self._router.dispatch(event)

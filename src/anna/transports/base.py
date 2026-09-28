@@ -152,6 +152,15 @@ class InboundEvent:
     fields it is excluded from compare / hash / repr so the dataclass
     stays hashable and the raw bytes never bloat logs.
 
+    ``model`` is an optional per-event Claude model override. Set only by
+    the Phase 2 scheduler, from ``Schedule.model``, for a schedule pinned
+    to a model other than the global ``runtime.model``. Like ``ephemeral``
+    it is read by ``ConversationRouter`` on the FIRST event for a conv_key
+    and bound to that worker at spawn; scheduled fires use their own
+    ``schedule:<id>:<date>`` conv_key, so the override can never reach a
+    DM / conversation session. ``None`` (every transport-originated event)
+    means "use ``runtime.model``" — today's behavior.
+
     Both callable / future fields are excluded from compare / hash so
     the dataclass remains hashable and equality compares on the
     semantic payload only. ``ephemeral`` is similarly excluded so a
@@ -180,6 +189,9 @@ class InboundEvent:
         default_factory=list, compare=False, hash=False, repr=False
     )
     turn_meta: dict[str, Any] | None = field(
+        default=None, compare=False, hash=False, repr=False
+    )
+    model: str | None = field(
         default=None, compare=False, hash=False, repr=False
     )
 

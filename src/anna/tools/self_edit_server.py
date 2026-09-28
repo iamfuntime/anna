@@ -346,6 +346,7 @@ class SelfEditTools:
         tz_name: str = "America/New_York",
         timeout_seconds: int = 300,
         enabled: bool = True,
+        model: str | None = None,
         creator_conv: str,
     ) -> dict[str, Any]:
         store = self._require_store()
@@ -370,6 +371,7 @@ class SelfEditTools:
             destination=ScheduleDestination(transport=destination_transport, channel=destination_channel),  # type: ignore[arg-type]
             timeout_seconds=timeout_seconds,
             enabled=enabled,
+            model=model or None,
             created_at=datetime.now(timezone.utc),
         )
         await store.create(schedule, actor_conv=creator_conv)
@@ -391,7 +393,13 @@ class SelfEditTools:
         destination_channel: str | None = None,
         timeout_seconds: int | None = None,
         enabled: bool | None = None,
+        model: str | None = None,
     ) -> dict[str, Any]:
+        """Patch only the passed fields; everything else round-trips.
+
+        ``model``: None = leave as is; ``""`` = clear the pin (fall back to
+        ``runtime.model``); any other value = pin (validated by Schedule).
+        """
         store = self._require_store()
         changes: dict[str, Any] = {}
         if cron is not None and natural_language is not None:
@@ -422,13 +430,15 @@ class SelfEditTools:
             changes["timeout_seconds"] = timeout_seconds
         if enabled is not None:
             changes["enabled"] = enabled
+        if model is not None:
+            changes["model"] = model or None
 
         if not changes:
             raise ValueError("schedule_update called with no fields to change")
         updated = await store.update(id, actor_conv=creator_conv, **changes)
         return _text_response(
             f"schedule '{id}' updated; new cron: {updated.cron!r}, "
-            f"enabled: {updated.enabled}"
+            f"enabled: {updated.enabled}, model: {updated.model or '<runtime default>'}"
         )
 
     async def schedule_delete(
@@ -451,8 +461,9 @@ class SelfEditTools:
             state = s.state
             last = state.last_fired_at.isoformat() if state.last_fired_at else "never"
             enabled_marker = "ENABLED " if s.enabled else "disabled"
+            model_part = f" model={s.model}" if s.model else ""
             lines.append(
-                f"- [{enabled_marker}] {s.id}: cron={s.cron!r} "
+                f"- [{enabled_marker}] {s.id}: cron={s.cron!r}{model_part} "
                 f"-> {s.destination.transport}:{s.destination.channel} "
                 f"(last fired: {last}, consecutive failures: {state.consecutive_failures})"
             )
@@ -583,7 +594,7 @@ def build_self_edit_server(*, tools: SelfEditTools, conv_key: str) -> Any:
 
     @tool(
         "schedule_create",
-        "Create a new scheduled task. Either cron (5-field cron expression) or natural_language ('every morning at 6am', 'every weekday at 9am', 'every Monday at 10am', 'every N hours', 'every N minutes', 'daily at HH:MM', 'weekly on DAY at HH:MM') must be set, not both. destination_transport is 'slack' or 'telegram'; destination_channel is the channel id or chat id. The admin channel is reserved for alerter traffic and will be rejected.",
+        "Create a new scheduled task. Either cron (5-field cron expression) or natural_language ('every morning at 6am', 'every weekday at 9am', 'every Monday at 10am', 'every N hours', 'every N minutes', 'daily at HH:MM', 'weekly on DAY at HH:MM') must be set, not both. destination_transport is 'slack' or 'telegram'; destination_channel is the channel id or chat id. The admin channel is reserved for alerter traffic and will be rejected. Optional model pins this schedule's fires to a Claude model (tier alias like 'sonnet' or a full model id) instead of the global runtime model.",
         {
             "id": str,
             "prompt": str,
@@ -594,6 +605,7 @@ def build_self_edit_server(*, tools: SelfEditTools, conv_key: str) -> Any:
             "tz_name": str,
             "timeout_seconds": int,
             "enabled": bool,
+            "model": str,
         },
     )
     async def _schedule_create(args: dict[str, Any]) -> dict[str, Any]:
@@ -607,12 +619,13 @@ def build_self_edit_server(*, tools: SelfEditTools, conv_key: str) -> Any:
             tz_name=args.get("tz_name") or "America/New_York",
             timeout_seconds=int(args.get("timeout_seconds") or 300),
             enabled=bool(args.get("enabled", True)),
+            model=args.get("model") or None,
             creator_conv=conv_key,
         )
 
     @tool(
         "schedule_update",
-        "Update an existing schedule by id. Any field other than id may be passed; only set the fields you want to change. cron and natural_language are mutually exclusive.",
+        "Update an existing schedule by id. Any field other than id may be passed; only set the fields you want to change. cron and natural_language are mutually exclusive. model pins the schedule's fires to a Claude model (tier alias like 'sonnet' or a full model id); pass an empty string to clear the pin.",
         {
             "id": str,
             "cron": str,
@@ -623,6 +636,7 @@ def build_self_edit_server(*, tools: SelfEditTools, conv_key: str) -> Any:
             "destination_channel": str,
             "timeout_seconds": int,
             "enabled": bool,
+            "model": str,
         },
     )
     async def _schedule_update(args: dict[str, Any]) -> dict[str, Any]:
@@ -637,6 +651,7 @@ def build_self_edit_server(*, tools: SelfEditTools, conv_key: str) -> Any:
             destination_channel=args.get("destination_channel") or None,
             timeout_seconds=int(args["timeout_seconds"]) if args.get("timeout_seconds") is not None else None,
             enabled=args.get("enabled") if "enabled" in args else None,
+            model=(args.get("model") or "") if "model" in args else None,
         )
 
     @tool(

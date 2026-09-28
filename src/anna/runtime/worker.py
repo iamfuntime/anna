@@ -444,6 +444,7 @@ class ConversationWorker:
         google_clients: "GoogleClients | None" = None,
         subagent_runner: "SubAgentRunner | None" = None,
         ephemeral: bool = False,
+        model_override: str | None = None,
         visibility: VisibilityCallbacks = NULL_VISIBILITY,
         alerter: "AdminAlerter | None" = None,
     ) -> None:
@@ -515,6 +516,12 @@ class ConversationWorker:
         # all other transports leave it false and keep the existing
         # checkpoint-on-close behavior.
         self._ephemeral = ephemeral
+        # Per-schedule model pin (Schedule.model). Set by the router from
+        # the FIRST event's ``model`` for this conv_key; only the scheduler
+        # ever sets it, and scheduled fires run on their own
+        # ``schedule:<id>:<date>`` conv_key, so a DM / conversation worker
+        # always has None here and builds its options exactly as before.
+        self.model_override: str | None = model_override
         self._log = get_logger("anna.worker").bind(conv_key=conversation_key, channel=transport)
 
         self._queue: asyncio.Queue[InboundEvent] = asyncio.Queue(maxsize=128)
@@ -986,9 +993,12 @@ class ConversationWorker:
         # which model the conversation runs on. Plain structured INFO log, not
         # a formal audit event — this is observational, not a security record.
         # None resolves to "<cli-default>" (the SDK's account default).
+        main_model, fallback_model = self._resolve_models()
         self._log.info(
             "worker.model.resolved",
-            model=self._config.runtime.model or "<cli-default>",
+            model=main_model or "<cli-default>",
+            fallback_model=fallback_model or "<none>",
+            model_source="schedule" if self.model_override else "runtime",
             effort=self._config.runtime.effort or "<sdk-default>",
         )
 
@@ -1023,11 +1033,13 @@ class ConversationWorker:
             # main loop does not go through resolve_effective_grant (it reads
             # runtime.* directly), so it takes the model straight off config.
             # None inherits the CLI/account default — today's behavior exactly.
-            model=self._config.runtime.model,
+            # A per-schedule pin (``self.model_override``) replaces it for
+            # that schedule's own worker only — see ``_resolve_models``.
+            model=main_model,
             # Automatic fallback when the primary model is overloaded or
             # unavailable (incl. usage-cap exhaustion). None = no fallback
             # flag passed, a failed primary fails the turn (prior behavior).
-            fallback_model=self._config.runtime.fallback_model,
+            fallback_model=fallback_model,
             # Reasoning-effort level for the main loop
             # (low|medium|high|xhigh|max). None = no effort flag passed, the
             # SDK applies its own default ("high"). Main-loop only:
@@ -1061,6 +1073,24 @@ class ConversationWorker:
             # yet.
             add_dirs=[str(anna_home / "core")],
         )
+
+    def _resolve_models(self) -> tuple[str | None, str | None]:
+        """Return ``(model, fallback_model)`` for this worker's SDK options.
+
+        No override (every DM / conversation worker, and every schedule
+        without ``model:``): exactly ``runtime.model`` /
+        ``runtime.fallback_model``, unchanged. With a per-schedule override
+        the primary becomes the override and the global fallback is kept —
+        unless it equals the override, in which case it is dropped, because
+        the CLI refuses a ``--fallback-model`` identical to ``--model``.
+        """
+        runtime = self._config.runtime
+        if not self.model_override:
+            return runtime.model, runtime.fallback_model
+        fallback = runtime.fallback_model
+        if fallback == self.model_override:
+            fallback = None
+        return self.model_override, fallback
 
     async def _ensure_client(self) -> None:
         if self._client is not None:

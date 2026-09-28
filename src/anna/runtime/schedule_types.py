@@ -17,7 +17,9 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+from anna.config import validate_model_string
 
 
 class ScheduleDestination(BaseModel):
@@ -74,6 +76,16 @@ class Schedule(BaseModel):
     no subprocess: the fire proceeds exactly as it does today. It is an
     argv list rather than a shell string so no shell ever interprets it.
     See :meth:`anna.runtime.scheduler.Scheduler._consult_gate`.
+
+    ``model`` (default None) pins the Claude model this schedule's fires
+    run on, in place of the global ``runtime.model``. Same grammar as
+    ``runtime.model`` (a tier alias such as ``sonnet`` or a full model ID),
+    validated by the same :func:`anna.config.validate_model_string`. It is
+    carried on the dispatched ``InboundEvent`` and bound to the fire's own
+    worker (conv_key ``schedule:<id>:<date>``) at spawn, so it never touches
+    the persistent DM / conversation sessions or the global config. None
+    (the default, and the value for every legacy entry) keeps today's
+    behavior exactly: the fire runs on ``runtime.model``.
     """
 
     id: str
@@ -86,5 +98,11 @@ class Schedule(BaseModel):
     enabled: bool = True
     ephemeral: bool = False
     gate_command: list[str] | None = None
+    model: str | None = None
     created_at: datetime
     state: ScheduleState = Field(default_factory=ScheduleState)
+
+    @field_validator("model")
+    @classmethod
+    def _validate_model(cls, v: str | None) -> str | None:
+        return validate_model_string(v)
