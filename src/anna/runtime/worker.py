@@ -1413,6 +1413,20 @@ class ConversationWorker:
                 self._unsolicited_ledger().note_user_inbound()
             return
         if AssistantMessage is not None and isinstance(msg, AssistantMessage):
+            if getattr(msg, "parent_tool_use_id", None) is not None:
+                # Sub-agent (sidechain) message. A background agent's closing
+                # text is streamed on the parent session just before its task
+                # notification (2026-09-29: a 5,001-char research result, footer
+                # and all, was glued in front of ANNA's own relay and posted as
+                # one 6,702-char "terminal report"). It is the agent's raw
+                # result, never ANNA's reply: do not accumulate it, do not let
+                # its tool calls move the terminal boundary, and do not open an
+                # unsolicited turn that no parent ResultMessage may ever close.
+                self._log.info(
+                    "worker.stream.subagent_message_ignored",
+                    parent_tool_use_id=msg.parent_tool_use_id,
+                )
+                return
             self._unsolicited_open = True
             for block in msg.content:
                 if TextBlock is not None and isinstance(block, TextBlock):
