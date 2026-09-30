@@ -1334,6 +1334,42 @@ class ImagesConfig(BaseModel):
     inbound: ImagesInboundConfig = Field(default_factory=ImagesInboundConfig)
 
 
+class FilesInboundConfig(BaseModel):
+    """Inbound non-image / non-voice Slack file intake (PDFs, docs, ...).
+
+    Every Slack ``files[]`` entry is always described to the model (id,
+    name, mimetype) so an attachment can never vanish silently. When
+    ``enabled`` the adapter additionally downloads each document-type
+    file (bot token, ``url_private``) into ``destination`` and passes the
+    local path along, so the model can Read it directly.
+
+    * ``max_file_size_bytes`` — per-file cap, checked against Slack's
+      ``size`` before download, ``Content-Length`` during, and the actual
+      byte length after. Oversize files are listed but not downloaded.
+    """
+
+    enabled: bool = True
+    destination: str = "~/Obsidian/ANNA/Inbox"
+    max_file_size_bytes: int = 10_485_760  # 10 MB
+
+    @property
+    def resolved_destination(self) -> Path:
+        return Path(os.path.expanduser(self.destination))
+
+    @field_validator("max_file_size_bytes")
+    @classmethod
+    def _file_size_positive(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError("files.inbound.max_file_size_bytes must be > 0")
+        return v
+
+
+class FilesConfig(BaseModel):
+    """Top-level inbound file-intake block (Slack adapter only for now)."""
+
+    inbound: FilesInboundConfig = Field(default_factory=FilesInboundConfig)
+
+
 class ObsidianIntegrationConfig(BaseModel):
     """Optional Obsidian-vault integration (default: fully off).
 
@@ -1450,6 +1486,7 @@ class AnnaConfig(BaseModel):
     web: WebDashboardConfig = Field(default_factory=WebDashboardConfig)
     voice: VoiceConfig = Field(default_factory=VoiceConfig)
     images: ImagesConfig = Field(default_factory=ImagesConfig)
+    files: FilesConfig = Field(default_factory=FilesConfig)
     integrations: IntegrationsConfig = Field(default_factory=IntegrationsConfig)
     identities: list[IdentityAliasEntry] = Field(default_factory=list)
 
