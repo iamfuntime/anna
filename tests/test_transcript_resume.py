@@ -7,6 +7,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from anna.vault.transcript_resume import (
+    delivered_posts_since,
+    latest_ts,
+    render_delivered_posts,
     render_tail_block,
     transcript_tail_since,
 )
@@ -192,3 +195,178 @@ def test_render_tail_block_truncates_long_message() -> None:
     assert body.endswith("...")
     # 400 chars of payload + prefix + ellipsis.
     assert len(body) < len("**anna:** ") + 400 + 5
+
+
+# ---------------------------------------------------------------------------
+# Out-of-band posts (rows carrying a ``source``): scheduled posts and
+# slack_post deliveries recorded by anna.runtime.delivered_posts.
+# ---------------------------------------------------------------------------
+
+
+def _sourced(epoch: float, text: str, source: str) -> dict:
+    obj = _line(epoch, "outbound", text)
+    obj["source"] = source
+    return obj
+
+
+def test_render_labels_scheduled_post_with_its_origin() -> None:
+    tail = [
+        _line(1000.0, "outbound", "a conversational reply"),
+        _sourced(2000.0, "DocuSign: the offer was signed.", "schedule:heartbeat"),
+        _line(3000.0, "inbound", "Fuck yea it did"),
+    ]
+    block = render_tail_block(tail)
+    lines = block.splitlines()
+    # A plain reply keeps the bare label; the scheduled post names its origin.
+    assert "**anna:** a conversational reply" in lines
+    assert "**anna (scheduled: heartbeat):** DocuSign: the offer was signed." in lines
+    assert "**you:** Fuck yea it did" in lines
+    assert lines.index(
+        "**anna (scheduled: heartbeat):** DocuSign: the offer was signed."
+    ) < lines.index("**you:** Fuck yea it did")
+
+
+def test_render_labels_slack_post_and_unknown_sources() -> None:
+    tail = [
+        _sourced(1000.0, "build is red", "slack_post:schedule:ci-watch:2026-10-07"),
+        _sourced(2000.0, "something else", "future_origin"),
+        _sourced(3000.0, "blank source", "   "),
+    ]
+    block = render_tail_block(tail)
+    assert (
+        "**anna (slack_post from schedule:ci-watch:2026-10-07):** build is red"
+        in block
+    )
+    assert "**anna (future_origin):** something else" in block
+    # A blank / non-string source degrades to the plain label.
+    assert "**anna:** blank source" in block
+
+
+def test_render_truncates_long_scheduled_post() -> None:
+    tail = [_sourced(1000.0, "x" * 1000, "schedule:heartbeat")]
+    block = render_tail_block(tail)
+    body = block.splitlines()[-1]
+    assert body.startswith("**anna (scheduled: heartbeat):** ")
+    assert body.endswith("...")
+    assert len(body) < 500
+
+
+def test_scheduled_posts_bounded_by_the_same_caps(tmp_path: Path) -> None:
+    """Scheduled rows are ordinary outbound lines to the trimmer: they ride
+    inside the turn cap and are cut by the token cap, oldest first."""
+    # Turn cap: two exchanges, each preceded by a scheduled post.
+    objs = [
+        _sourced(1000.0, "sched 0", "schedule:heartbeat"),
+        _line(1001.0, "inbound", "user 0"),
+        _sourced(2000.0, "sched 1", "schedule:heartbeat"),
+        _line(2001.0, "inbound", "user 1"),
+        _sourced(3000.0, "sched 2", "schedule:heartbeat"),
+    ]
+    _write_day(tmp_path, "2026-06-03", objs)
+    result = transcript_tail_since(tmp_path, CONV_KEY, None, 1, 100_000)
+    # One inbound-anchored exchange is kept, plus the unanswered post after
+    # it; the older scheduled posts fall outside the window.
+    assert [o["text"] for o in result] == ["user 1", "sched 2"]
+
+    # Token cap: a run of unanswered scheduled posts cannot grow the tail
+    # without bound.
+    flood = [
+        _sourced(5000.0 + i, f"alert {i} " + "word " * 50, "schedule:heartbeat")
+        for i in range(40)
+    ]
+    _write_day(tmp_path, "2026-06-04", flood)
+    result = transcript_tail_since(tmp_path, CONV_KEY, 4000.0, 8, 200)
+    assert 0 < len(result) < 40
+    assert result[-1]["text"].startswith("alert 39 ")
+    assert all(o["source"] == "schedule:heartbeat" for o in result)
+
+
+# ---------------------------------------------------------------------------
+# Posts delivered into a live conversation: lookup past a high-water mark
+# and the bounded per-turn listing.
+# ---------------------------------------------------------------------------
+
+
+def test_delivered_posts_since_returns_only_sourced_outbound_past_mark(
+    tmp_path: Path,
+) -> None:
+    inbound_with_source = _line(3500.0, "inbound", "operator text")
+    inbound_with_source["source"] = "schedule:heartbeat"
+    _write_day(
+        tmp_path,
+        "2026-06-03",
+        [
+            _sourced(1000.0, "before the mark", "schedule:heartbeat"),
+            _sourced(2000.0, "exactly at the mark", "schedule:heartbeat"),
+            _line(2500.0, "outbound", "a conversational reply"),
+            _line(2600.0, "inbound", "an operator message"),
+            _sourced(3000.0, "after the mark", "schedule:heartbeat"),
+            _sourced(3100.0, "blank source", "  "),
+            inbound_with_source,
+            _sourced(4000.0, "own post", f"slack_post:{CONV_KEY}"),
+            _sourced(5000.0, "foreign post", "slack_post:schedule:ci:2026-06-03"),
+        ],
+    )
+
+    posts = delivered_posts_since(
+        tmp_path, CONV_KEY, 2000.0, exclude_sources=(f"slack_post:{CONV_KEY}",)
+    )
+
+    # Strictly newer than the mark, outbound, source-tagged, not excluded.
+    assert [p["text"] for p in posts] == ["after the mark", "foreign post"]
+    assert latest_ts(posts) == 5000.0
+
+
+def test_delivered_posts_since_missing_dir_and_two_day_window(tmp_path: Path) -> None:
+    assert delivered_posts_since(tmp_path, CONV_KEY, 0.0) == []
+    assert latest_ts([]) is None
+
+    _write_day(tmp_path, "2026-06-01", [_sourced(1000.0, "three days old", "schedule:a")])
+    _write_day(tmp_path, "2026-06-02", [_sourced(2000.0, "yesterday", "schedule:a")])
+    _write_day(tmp_path, "2026-06-03", [_sourced(3000.0, "today", "schedule:a")])
+    # Same newest-two-daily-files window as the resume tail.
+    posts = delivered_posts_since(tmp_path, CONV_KEY, 0.0)
+    assert [p["text"] for p in posts] == ["yesterday", "today"]
+
+
+def test_render_delivered_posts_line_shape() -> None:
+    epoch = datetime(2026, 10, 7, 15, 0, 28, tzinfo=timezone.utc).timestamp()
+    lines, omitted = render_delivered_posts(
+        [_sourced(epoch, "  DocuSign: signed.  ", "schedule:heartbeat")]
+    )
+    assert omitted == 0
+    assert lines == [
+        "[2026-10-07 15:00:28Z] anna (scheduled: heartbeat): DocuSign: signed."
+    ]
+    assert render_delivered_posts([]) == ([], 0)
+
+
+def test_render_delivered_posts_caps_count_newest_kept() -> None:
+    posts = [_sourced(1000.0 + i, f"alert {i}", "schedule:heartbeat") for i in range(7)]
+    lines, omitted = render_delivered_posts(posts, max_posts=3, max_chars=10_000)
+    assert omitted == 4
+    assert lines[0] == "(4 earlier posts omitted)"
+    assert [line.rsplit(": ", 1)[-1] for line in lines[1:]] == [
+        "alert 4",
+        "alert 5",
+        "alert 6",
+    ]
+
+
+def test_render_delivered_posts_caps_characters() -> None:
+    posts = [
+        _sourced(1000.0, "a" * 60, "schedule:heartbeat"),
+        _sourced(1001.0, "b" * 60, "schedule:heartbeat"),
+        _sourced(1002.0, "c" * 60, "schedule:heartbeat"),
+    ]
+    # Budget fits two whole posts; the oldest is omitted, never split.
+    lines, omitted = render_delivered_posts(posts, max_posts=10, max_chars=130)
+    assert omitted == 1
+    assert lines[0] == "(1 earlier post omitted)"
+    assert lines[1].endswith("b" * 60) and lines[2].endswith("c" * 60)
+
+    # The newest post is always kept, cut to the budget with an ellipsis.
+    lines, omitted = render_delivered_posts(posts, max_posts=10, max_chars=20)
+    assert omitted == 2
+    assert lines[0] == "(2 earlier posts omitted)"
+    assert lines[1].endswith(": " + "c" * 20 + "...")

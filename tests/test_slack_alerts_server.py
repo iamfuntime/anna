@@ -226,6 +226,73 @@ async def test_slack_post_admin_channel_refused_and_sends_nothing(
 
 
 # ---------------------------------------------------------------------------
+# Delivered post -> destination conversation transcript
+# ---------------------------------------------------------------------------
+
+
+def _transcript_rows(cfg: AnnaConfig, safe_key: str) -> list[dict]:
+    conv_dir = cfg.transcripts_dir / safe_key
+    rows: list[dict] = []
+    if not conv_dir.is_dir():
+        return rows
+    for path in sorted(conv_dir.glob("*.jsonl")):
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                rows.append(json.loads(line))
+    return rows
+
+
+@pytest.mark.asyncio
+async def test_slack_post_to_dm_recorded_in_dm_transcript(tmp_path: Path) -> None:
+    """A slack_post into a DM from another conversation (here a scheduled
+    run) lands in that DM's transcript, tagged with the calling conv_key."""
+    cfg = _make_config(tmp_path)
+    slack = _StubAdapter("slack")
+    tools = SlackAlertTools(cfg, {"slack": slack})
+    caller = "schedule:heartbeat:2026-10-07"
+
+    await tools.slack_post(text="build is red", channel_id="USETH", conv_key=caller)
+
+    assert len(slack.sent) == 1
+    rows = _transcript_rows(cfg, "slack-dm-USETH")
+    assert len(rows) == 1
+    assert rows[0]["direction"] == "outbound"
+    assert rows[0]["conv_key"] == "slack:dm:USETH"
+    assert rows[0]["text"] == "build is red"
+    assert rows[0]["source"] == f"slack_post:{caller}"
+
+    audits = _read_audit_records(cfg.audit_dir)
+    dispatched = [a for a in audits if a.get("event") == "audit.slack_post.dispatched"]
+    assert dispatched[0]["recorded_conv_key"] == "slack:dm:USETH"
+
+
+@pytest.mark.asyncio
+async def test_slack_post_to_channel_not_recorded(tmp_path: Path) -> None:
+    cfg = _make_config(tmp_path)
+    slack = _StubAdapter("slack")
+    tools = SlackAlertTools(cfg, {"slack": slack})
+
+    await tools.slack_post(text="digest card", channel_id="C_REPORTS", conv_key=CONV_KEY)
+
+    assert len(slack.sent) == 1
+    assert not cfg.transcripts_dir.exists()
+    audits = _read_audit_records(cfg.audit_dir)
+    dispatched = [a for a in audits if a.get("event") == "audit.slack_post.dispatched"]
+    assert dispatched[0]["recorded_conv_key"] is None
+
+
+@pytest.mark.asyncio
+async def test_slack_post_failed_send_to_dm_not_recorded(tmp_path: Path) -> None:
+    cfg = _make_config(tmp_path)
+    slack = _StubAdapter("slack", raise_on_send=True)
+    tools = SlackAlertTools(cfg, {"slack": slack})
+
+    await tools.slack_post(text="will fail", channel_id="USETH", conv_key=CONV_KEY)
+
+    assert _transcript_rows(cfg, "slack-dm-USETH") == []
+
+
+# ---------------------------------------------------------------------------
 # Server build path (smoke)
 # ---------------------------------------------------------------------------
 

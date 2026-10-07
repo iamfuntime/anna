@@ -6,7 +6,9 @@ Polls :class:`ScheduleStore` for due schedules at every
 carries a ``completion_future`` so the worker resolves it with the
 final assistant message instead of calling its normal outbound send
 path. The scheduler then routes the message to the schedule's declared
-destination via the appropriate :class:`ChannelAdapter` directly.
+destination via the appropriate :class:`ChannelAdapter` directly, and
+records the delivered post in the destination conversation's transcript
+(:mod:`anna.runtime.delivered_posts`) so a reply there has a referent.
 
 Failure handling is three-strikes-then-disable per
 ``config.scheduler.failure_threshold``. Each fire is timeboxed by
@@ -31,6 +33,7 @@ from typing import TYPE_CHECKING, NamedTuple
 
 from anna.config import AnnaConfig
 from anna.log import audit_event, get_logger
+from anna.runtime.delivered_posts import record_delivered_post
 from anna.runtime.schedule_store import ScheduleStore
 from anna.runtime.schedule_types import Schedule
 from anna.runtime.worker import (
@@ -634,7 +637,19 @@ class Scheduler:
                 )
                 return
 
-            await self._record_success(schedule, reply, started_at=started_at)
+            # The post is in the destination now. Tell the conversation that
+            # lives there (2026-10-07 incident: the operator replied to a
+            # heartbeat alert 17s after it landed in their DM, and the DM's
+            # worker spawned with no record of it). Reached ONLY on the real
+            # send path — every suppression branch above returned already.
+            recorded_conv_key = self._record_delivered_post(schedule, reply)
+
+            await self._record_success(
+                schedule,
+                reply,
+                started_at=started_at,
+                recorded_conv_key=recorded_conv_key,
+            )
 
     @staticmethod
     def _is_quiet_sentinel(reply: str) -> bool:
@@ -719,6 +734,7 @@ class Scheduler:
         *,
         started_at: datetime,
         suppressed: bool = False,
+        recorded_conv_key: str | None = None,
     ) -> None:
         """Record a successful fire: mark_fired (resets failures, sets
         last_fired_at + last_status="complete"), audit, and log.
@@ -726,6 +742,10 @@ class Scheduler:
         Shared by the normal-send path and the quiet-sentinel path so both
         use identical bookkeeping. ``suppressed`` only affects telemetry; the
         persisted success state is the same in both cases.
+        ``recorded_conv_key`` is telemetry too: the conversation whose
+        transcript the delivered post was appended to (see
+        :meth:`_record_delivered_post`), or ``None`` when nothing was
+        recorded — always ``None`` for a suppressed run.
         """
         completed_at = datetime.now(timezone.utc)
         duration = (completed_at - started_at).total_seconds()
@@ -741,6 +761,7 @@ class Scheduler:
             duration_seconds=duration,
             output_length=len(reply),
             suppressed=suppressed,
+            recorded_conv_key=recorded_conv_key,
         )
         self._log.info(
             "scheduler.complete",
@@ -748,6 +769,7 @@ class Scheduler:
             duration_seconds=duration,
             output_length=len(reply),
             suppressed=suppressed,
+            recorded_conv_key=recorded_conv_key,
         )
 
     async def _send_to_destination(self, schedule: Schedule, text: str) -> None:
@@ -762,6 +784,37 @@ class Scheduler:
             channel=schedule.destination.channel,
         )
         await adapter.send(OutboundMessage(conversation_key=dest_conv_key, text=text))
+
+    def _record_delivered_post(self, schedule: Schedule, text: str) -> str | None:
+        """Append the delivered post to the destination conversation's transcript.
+
+        The scheduled run itself lives under ``schedule:<id>:<date>``, so
+        without this the conversation at the destination (the operator's DM)
+        has no trace of a message that was posted into it. The row is tagged
+        ``source="schedule:<id>"`` so the resume tail can label it as a
+        scheduled post rather than a conversational reply.
+
+        Returns the conversation key the row landed under, or ``None`` when
+        the destination has no single conversation (a shared channel) —
+        see :func:`anna.runtime.delivered_posts.conv_key_for_destination`.
+        Exception-isolated: the post is already delivered, so a recording
+        problem must never turn a successful fire into a failure.
+        """
+        try:
+            return record_delivered_post(
+                self._config,
+                transport=schedule.destination.transport,
+                channel=schedule.destination.channel,
+                text=text,
+                source=f"schedule:{schedule.id}",
+            )
+        except Exception as exc:  # noqa: BLE001 — never fail a delivered fire
+            self._log.warning(
+                "scheduler.post_record_failed",
+                schedule_id=schedule.id,
+                error=str(exc),
+            )
+            return None
 
     @staticmethod
     def _dest_conv_key(*, transport: str, channel: str) -> str:
