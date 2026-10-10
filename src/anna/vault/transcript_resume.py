@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from anna.core.identity import count_tokens
@@ -193,8 +193,8 @@ def extend_coverage_through_outbound(
     while True:
         nxt = by_seq.get(end + 1)
         if nxt is None or nxt.get("direction") != "outbound" or not isinstance(nxt.get("event_id"), str):
+            return end, end_id
         end, end_id = end + 1, str(nxt["event_id"])
-        end, end_id = end + 1, nxt["event_id"]
 
 
 def _safe_key(conv_key: str) -> str:
@@ -219,7 +219,7 @@ def _parse_ts(value: object) -> float | None:
     except ValueError:
         return None
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.replace(tzinfo=UTC)
     return dt.timestamp()
 
 
