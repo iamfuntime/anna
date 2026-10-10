@@ -739,3 +739,23 @@ integrations:
 #     slack_user_id: USP2QLB41
 #     telegram_chat_id: "993947726"
 #     cli_username: funtime
+
+# ============================================================
+# Background memory extraction (opt-in; see docs/anna-implementation-status.md)
+# ============================================================
+memory:
+  extraction:
+    # OPT-IN. Each qualifying interactive user message may cost one small,
+    # tool-free model call. Off by default. Only the user's own words are sent
+    # (never assistant or tool output); only verbatim-grounded, user-stated,
+    # non-conflicting facts are stored. Explicit "remember" is unaffected.
+    enabled: false
+    # With auth.mode: api_key (metered) this must ALSO be true; otherwise the
+    # runner refuses to start. No fallback model is ever used for extraction.
+    allow_api_key_billing: false
+    model: haiku
+    max_budget_usd_per_job: 0.02
+    max_jobs_per_day: 200
+    concurrency: 1
+    max_attempts: 3
+    min_confidence: 0.8

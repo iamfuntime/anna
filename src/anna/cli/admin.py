@@ -311,5 +311,47 @@ def merge_checkpoints(
     )
 
 
+@main.command(name="memory-import")
+@click.argument("path", type=click.Path(exists=True, path_type=Path))
+@click.option("--owner", required=True, help="Owner id (user canonical name, or the conversation key for a group scope).")
+@click.option("--scope", required=True, help="'private' or 'group:<conversation_key>'.")
+@click.option("--kind", default="fact", show_default=True)
+@click.option("--recursive", is_flag=True, help="Recurse into subdirectories when PATH is a directory.")
+@click.option("--apply", "apply_", is_flag=True, help="Write facts. Default is a dry run.")
+def memory_import(path: Path, owner: str, scope: str, kind: str, recursive: bool, apply_: bool) -> None:
+    """Import bullet items from a legacy MEMORY.md (or a directory of notes).
+
+    Idempotent, never edits or deletes the source, and never revives facts the
+    user forgot. Owner and scope are mandatory so shared history is not
+    attributed to a user. A backup of the memory DB is taken before writing.
+    """
+    from datetime import datetime, timezone
+
+    from anna.runtime.memory import MemoryStore
+    from anna.runtime.memory_import import import_legacy
+
+    _configure_cli_logging()
+    db = _anna_home() / "state" / "memory.sqlite3"
+    store = MemoryStore(db)
+    try:
+        if apply_ and db.exists():
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+            store.backup(db.with_name(f"{db.name}.bak-import-{stamp}"))
+        try:
+            result = import_legacy(store, path, owner_id=owner, scope=scope, kind=kind,
+                                   recursive=recursive, apply=apply_)
+        except (ValueError, OSError) as exc:
+            click.secho(f"memory-import: {exc}", fg="red")
+            sys.exit(2)
+    finally:
+        store.close()
+    mode = "applied" if apply_ else "dry-run"
+    click.secho(f"memory-import ({mode}): " + (", ".join(f"{k}={v}" for k, v in sorted(result.items())) or "no items"),
+                fg="green")
+    if apply_:
+        audit_event("audit.admin.memory_import", audit_dir=_anna_home() / "audit", actor="operator",
+                    fsync_on_write=True, owner=owner, scope=scope, **dict(result))
+
+
 if __name__ == "__main__":
     main()

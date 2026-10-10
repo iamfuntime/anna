@@ -466,6 +466,7 @@ class ConversationWorker:
         )
         self._memory_store = MemoryStore(config.anna_home / "state" / "memory.sqlite3")
         self._active_memory_source_id: str | None = None
+        self.memory_enqueue_failures = 0
         self._on_idle_close = on_idle_close
         # Live transport adapters (same dict the router/alerter hold). Used by
         # the anna_slack_alerts MCP server to post through ANNA's own Slack
@@ -2982,6 +2983,8 @@ class ConversationWorker:
                     tool_used=bool(ledger.tool_boundaries),
                 )
             await self._end_turn(turn_queue)
+            # After the reply path: durable enqueue never blocks or fails a turn.
+            self._enqueue_memory_extraction(event)
             if completed_normally:
                 sequence = event.raw.get("anna_transcript_sequence")
                 event_id = event.raw.get("anna_transcript_event_id")
@@ -3001,6 +3004,47 @@ class ConversationWorker:
                     if self._coverage_advance_allowed:
                         self._last_processed_transcript_sequence = sequence
                         self._last_processed_transcript_event_id = event_id
+
+    def _memory_owner_scope(self) -> tuple[str, str]:
+        owner_id = self.conversation_key.removeprefix("user:")
+        scope = "private" if self.conversation_key.startswith("user:") else f"group:{self.conversation_key}"
+        return owner_id, scope
+
+    def _enqueue_memory_extraction(self, event: InboundEvent) -> None:
+        """Queue the user's own message for opt-in background extraction.
+
+        Only interactive, non-ephemeral turns qualify (scheduled/heartbeat turns
+        carry no user-authored statements).  Any failure is logged, audited and
+        counted but never raised: the reply has already been handled.
+        """
+        cfg = self._config.memory.extraction
+        if not cfg.enabled or event.completion_future is not None or event.ephemeral:
+            return
+        text = (event.text or "").strip()
+        if len(text) < cfg.min_source_chars:
+            return
+        source_id = (
+            event.raw.get("anna_transcript_event_id") or event.raw.get("event_id")
+            or event.raw.get("ts") or event.raw.get("message_id")
+        )
+        owner_id, scope = self._memory_owner_scope()
+        try:
+            if source_id is None:
+                raise ValueError("turn has no source event id")
+            self._memory_store.enqueue_extraction(
+                owner_id=owner_id, visibility_scope=scope, conversation_key=self.conversation_key,
+                source_event_id=str(source_id), source_text=text[: cfg.max_source_chars],
+                max_pending=cfg.max_pending,
+            )
+        except Exception as exc:
+            self.memory_enqueue_failures += 1
+            self._log.warning("worker.memory.enqueue_failed", error=str(exc),
+                              failures=self.memory_enqueue_failures)
+            try:
+                audit_event("audit.memory.enqueue_failed", audit_dir=self._config.audit_dir,
+                            conv_key=self.conversation_key, error=f"{type(exc).__name__}: {exc}"[:200])
+            except Exception:
+                pass
 
     async def _dispatch_turn(
         self, event: InboundEvent, turn_queue: asyncio.Queue[Any]
@@ -3035,8 +3079,7 @@ class ConversationWorker:
         # Refresh retrieval for every turn, including an already-live worker.
         # Owner-scoped DMs use their canonical owner key; non-DM conversations
         # remain isolated in a private group scope.
-        owner_id = self.conversation_key.removeprefix("user:")
-        scope = "private" if self.conversation_key.startswith("user:") else f"group:{self.conversation_key}"
+        owner_id, scope = self._memory_owner_scope()
         try:
             facts = self._memory_store.search(
                 owner_id=owner_id,
@@ -3068,7 +3111,7 @@ class ConversationWorker:
             if reminder:
                 query_text = (
                     f"<system-reminder>\n{reminder}\n</system-reminder>\n\n"
-                    f"{event.text}"
+                    f"{query_text}"
                 )
 
         # Consume a forcing watchdog reminder stashed by a PRIOR turn's breach

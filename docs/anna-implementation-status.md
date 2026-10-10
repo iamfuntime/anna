@@ -114,7 +114,7 @@ FTS5 retrieval, owner/scope filtering, provenance event IDs, correction
 supersession, and soft forgetting. Workers refresh matching scoped facts per
 turn. The first cross-transport policy correction also uses the event transport
 for voice-only/drip eligibility. Explicit memory MCP tools, extraction jobs,
-legacy import, and UI remain unfinished.
+legacy import (both now done below), and UI remain.
 
 Commit `b07ea37` mounts `anna_memory` in every worker with explicit
 `memory_remember`, `memory_search`, `memory_correct`, and `memory_forget`
@@ -255,6 +255,61 @@ Migration/rollback: `state/memory.sqlite3` is created automatically with a
 version-1 ledger and WAL mode. It is additive; rollback is to stop using the
 store while retaining the database and transcripts. Use a temporary `ANNA_HOME`
 in tests; no real provider or credential action is required.
+
+## Durable background memory extraction and legacy import
+
+Opt-in (`memory.extraction.enabled`, default **false**). After an interactive,
+non-ephemeral turn the worker durably enqueues only the *user's own message*
+into `state/memory.sqlite3` (`extraction_jobs`, idempotent per
+owner+scope+source event, queue cap). The enqueue runs after the reply path and
+any failure is logged, audited (`audit.memory.enqueue_failed`) and counted in
+`worker.memory_enqueue_failures`; it never fails the reply. A daemon-level
+`MemoryExtractionRunner` claims jobs with a lease (expired claims are reclaimed
+after a crash/restart; stale claimants cannot commit), applies bounded
+concurrency, a per-day job cap, per-job retry with exponential backoff
+(`max_attempts`, then `dead`) and global backoff after repeated failures.
+
+- **Extractor isolation:** `SdkMemoryExtractor` uses the existing Agent SDK in a
+  single turn with `tools=[]`, no MCP/skills/plugins/hooks/settings,
+  `max_turns=1`, `max_budget_usd`, and no `fallback_model`; a non-text block is
+  a violation. Tests use a fake extractor; no model call is made in the suite.
+- **Billing/trust:** off unless enabled; with `auth.mode: api_key` it also needs
+  `memory.extraction.allow_api_key_billing: true`, otherwise the runner logs
+  `anna.memory_extraction.blocked` and does not start.
+- **Schema:** strict `{"candidates":[{kind,subject,content,evidence,source,confidence}]}`;
+  schema violations are malformed → retry (bounded). Semantics are recorded, not
+  retried: only `source=user_stated`, verbatim `evidence` present in the source,
+  `confidence >= min_confidence`, non-instruction-like candidates are stored
+  (`origin=auto_extracted`, evidence + source event id + owner/scope kept).
+  `user_inferred`/`assistant`/`tool`/`instruction` are rejected; assistant and
+  tool output is never sent to the extractor.
+- **Protections:** a candidate differing from an active fact on the same subject
+  is a `conflict` candidate (never overrides; use `memory_correct`); wording
+  that was forgotten or superseded, or a subject that was forgotten, is `held`
+  and cannot resurrect. Forgetting purges retained evidence. Source text is
+  purged when a job finishes. Explicit `memory_remember` is unchanged and
+  synchronously committed; an extraction for the same event defers to it.
+- **Legacy import:** `anna-admin memory-import PATH --owner O --scope S
+  [--kind K] [--recursive] [--apply]`: dry-run by default; bullets from a
+  MEMORY.md-style file or a directory of `.md` notes (non-recursive by default,
+  no transcripts); owner and scope are mandatory, group scope requires
+  owner == conversation key (no fabricated user owner); idempotent ledger
+  (`legacy_imports`), provenance `legacy:<file>#<hash>`, never edits/deletes the
+  source, never revives forgotten facts; DB backup before `--apply`.
+- **Migration:** memory schema v2 is additive (fact provenance columns,
+  `extraction_jobs`, `memory_candidates`, `legacy_imports`); an existing v1 DB
+  is copied to `memory.sqlite3.bak-v1-<ts>` first. Rollback: stop enabling
+  extraction and keep/restore the backup; v1 code ignores the added columns.
+- **Fixes found on the way:** per-turn retrieval passed raw user text to FTS5
+  MATCH (punctuation like `?` raised and silently disabled retrieval) — now
+  tokenized to a safe OR-query; and the cadence reminder overwrote the
+  `<durable-memory>` block on Slack/Telegram — now preserved.
+
+Validation: `uv run --extra dev pytest -q` → 1,455 passed, 1 skipped (45 new in
+`tests/test_memory_extraction.py`); `ruff` clean on new files, no new findings
+in touched files; `mypy` clean on the new/changed memory modules. Still
+deferred: operator UI/CLI to review/accept `conflict`/`held` candidates, any
+live-model quality evaluation of the extraction prompt, and shared-task state.
 
 ## Deferred milestones
 

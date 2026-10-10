@@ -39,6 +39,11 @@ from anna.log import configure_logging, get_logger
 from anna.runtime.alerter import AdminAlerter
 from anna.runtime.router import ConversationRouter
 from anna.runtime.schedule_store import ScheduleStore
+from anna.runtime.memory_extraction import (
+    MemoryExtractionRunner,
+    SdkMemoryExtractor,
+    extraction_blocked_reason,
+)
 from anna.runtime.scheduler import Scheduler
 from anna.runtime.startup import (
     build_startup_message,
@@ -365,6 +370,24 @@ async def _run(config: AnnaConfig) -> None:
         schedule_store.set_cancel_callback(scheduler.cancel_schedule_tasks)
         scheduler_task = asyncio.create_task(scheduler.run(), name="scheduler")
 
+    # Opt-in durable memory extraction (off by default; never silently metered).
+    memory_store: Any = None
+    memory_task: asyncio.Task[Any] | None = None
+    blocked = extraction_blocked_reason(config)
+    if blocked is None:
+        from anna.runtime.memory import MemoryStore
+
+        memory_store = MemoryStore(config.state_dir / "memory.sqlite3")
+        memory_task = asyncio.create_task(
+            MemoryExtractionRunner(
+                store=memory_store, extractor=SdkMemoryExtractor(config),
+                cfg=config.memory.extraction,
+            ).run(),
+            name="memory_extraction",
+        )
+    elif config.memory.extraction.enabled:
+        log.warning("anna.memory_extraction.blocked", reason=blocked)
+
     # Schedule the operator startup ping. It waits a few seconds for
     # adapters to attach, then fires once. We use a background task so
     # the main coroutine can proceed straight to the signal wait.
@@ -406,6 +429,8 @@ async def _run(config: AnnaConfig) -> None:
         aux_tasks.append(startup_alert_task)
     if scheduler_task is not None:
         aux_tasks.append(scheduler_task)
+    if memory_task is not None:
+        aux_tasks.append(memory_task)
     for task in aux_tasks:
         task.cancel()
 
@@ -421,6 +446,9 @@ async def _run(config: AnnaConfig) -> None:
         await router.shutdown()
     except Exception as exc:
         log.warning("anna.shutdown.router_failed", error=str(exc))
+
+    if memory_store is not None:
+        memory_store.close()
 
     if google_clients is not None:
         # Do not leave account-owned executor threads alive after shutdown.

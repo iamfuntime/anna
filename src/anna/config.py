@@ -584,6 +584,63 @@ class CheckpointConfig(BaseModel):
         return v
 
 
+class MemoryExtractionConfig(BaseModel):
+    """Opt-in background memory extraction after interactive turns.
+
+    OFF by default: each extracted turn is a model call. In ``auth.mode:
+    api_key`` extraction additionally requires ``allow_api_key_billing`` so a
+    metered key is never spent silently. No ``fallback_model`` is ever passed
+    to the extractor. Restart-gated like the rest of anna.yaml.
+    """
+
+    enabled: bool = False
+    allow_api_key_billing: bool = False
+    model: str | None = "haiku"
+    max_budget_usd_per_job: float = 0.02
+    max_jobs_per_day: int = 200
+    concurrency: int = 1
+    poll_interval_seconds: float = 15.0
+    job_timeout_seconds: float = 60.0
+    max_attempts: int = 3
+    backoff_base_seconds: float = 30.0
+    backoff_max_seconds: float = 900.0
+    lease_seconds: float = 300.0
+    max_pending: int = 500
+    max_source_chars: int = 4000
+    min_source_chars: int = 12
+    max_candidates_per_job: int = 5
+    min_confidence: float = 0.8
+
+    @field_validator("model")
+    @classmethod
+    def _validate_model(cls, v: str | None) -> str | None:
+        return validate_model_string(v)
+
+    @field_validator(
+        "max_budget_usd_per_job", "max_jobs_per_day", "concurrency",
+        "poll_interval_seconds", "job_timeout_seconds", "max_attempts",
+        "backoff_base_seconds", "backoff_max_seconds", "lease_seconds",
+        "max_pending", "max_source_chars", "min_source_chars",
+        "max_candidates_per_job",
+    )
+    @classmethod
+    def _positive(cls, v: float, info: Any) -> float:
+        if v <= 0:
+            raise ValueError(f"memory.extraction.{info.field_name} must be positive")
+        return v
+
+    @field_validator("min_confidence")
+    @classmethod
+    def _unit_interval(cls, v: float) -> float:
+        if not 0.0 <= v <= 1.0:
+            raise ValueError("memory.extraction.min_confidence must be within [0, 1]")
+        return v
+
+
+class MemoryConfig(BaseModel):
+    extraction: MemoryExtractionConfig = Field(default_factory=MemoryExtractionConfig)
+
+
 class AdminConfig(BaseModel):
     """Operator-side destinations for out-of-band alerts.
 
@@ -1442,6 +1499,7 @@ class AnnaConfig(BaseModel):
     sessions: SessionsConfig = Field(default_factory=SessionsConfig)
     checkpoint: CheckpointConfig = Field(default_factory=CheckpointConfig)
     admin: AdminConfig = Field(default_factory=AdminConfig)
+    memory: MemoryConfig = Field(default_factory=MemoryConfig)
     reports: ReportsConfig = Field(default_factory=ReportsConfig)
     scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
     google: GoogleConfig = Field(default_factory=GoogleConfig)
