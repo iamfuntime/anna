@@ -195,6 +195,11 @@ class ScheduleStore:
                 "the Google heartbeat is opt-in: set heartbeat.enabled: true in anna.yaml and restart first")
         if not self._config.google.enabled or not self._config.google.accounts:
             raise ScheduleValidationError("the Google heartbeat needs google.enabled and at least one account")
+        dest = f"{schedule.destination.transport}:{schedule.destination.channel}"
+        if dest not in self._config.heartbeat.allowed_destinations:
+            raise ScheduleValidationError(
+                f"heartbeat output may only go to destinations the operator allowlisted in "
+                f"heartbeat.allowed_destinations; {dest!r} is not listed")
 
     def _check_cron(self, expr: str) -> None:
         if not croniter.is_valid(expr):
@@ -252,6 +257,7 @@ class ScheduleStore:
             new_schedule = Schedule.model_validate(merged)
             self._check_destination(new_schedule.destination)
             self._check_cron(new_schedule.cron)
+            self._check_job_kind(new_schedule)
             self._cache[schedule_id] = new_schedule
             await self.save()
         audit_event(

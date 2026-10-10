@@ -285,6 +285,12 @@ class Scheduler:
             await self._store.load()  # pick up dashboard edits and other writers
         except Exception as exc:
             self._log.warning("scheduler.reload_failed", error=str(exc))
+        for done in self._ledger.apply_repairs():
+            audit_event("audit.schedule.repair_applied", audit_dir=self._audit_dir, actor="operator",
+                        fsync_on_write=self._fsync,
+                        level="INFO" if done["outcome"] == "applied" else "WARNING", repair_id=done["id"],
+                        kind=done["kind"], target_id=done["target_id"], action=done["action"],
+                        outcome=done["outcome"], detail=done["detail"], requested_by=done["requested_by"])
         for rec in self._ledger.recover_expired(now=now, max_run_attempts=cfg.max_run_attempts):
             await self._on_recovery(rec)
         self._ledger.recover_outbox(now=now)
@@ -509,6 +515,10 @@ class Scheduler:
 
         if not cfg.heartbeat.enabled:
             await fail("failed", "heartbeat is disabled (set heartbeat.enabled: true)")
+            return
+        dest = f"{schedule.destination.transport}:{schedule.destination.channel}"
+        if dest not in cfg.heartbeat.allowed_destinations:
+            await fail("failed", f"heartbeat destination {dest!r} is not in heartbeat.allowed_destinations")
             return
         occ = self._ledger.get(occurrence_id)
         job = HeartbeatJob(config=cfg, clients=self._google_clients, ledger=self._ledger,

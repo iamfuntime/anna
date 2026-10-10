@@ -1117,6 +1117,17 @@ class SlackAdapter(ChannelAdapter):
     # Health
     # ------------------------------------------------------------------
 
+    async def health_detail(self) -> dict[str, Any]:
+        receiver = self._handler_task is not None and not self._handler_task.done()
+        api_ok: bool | None = None
+        error = None
+        if self._client is not None:
+            try:
+                api_ok = bool((await self._client.auth_test()).get("ok", False))
+            except Exception as exc:  # noqa: BLE001
+                api_ok, error = False, type(exc).__name__
+        return {"receiver_alive": receiver, "api_ok": api_ok, "error": error}
+
     async def health_check(self) -> bool:
         if self._client is None:
             return False

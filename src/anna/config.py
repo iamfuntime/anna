@@ -666,6 +666,11 @@ class HeartbeatConfig(BaseModel):
 
     enabled: bool = False
     accounts: list[str] = Field(default_factory=list)  # empty = every configured account
+    # Operator-set allowlist of "transport:channel" destinations that may receive
+    # heartbeat output (mail subjects/senders, calendar titles). Default: none.
+    # Enforced when a heartbeat schedule is created/updated AND on every run, so
+    # an agent tool (or a prompt-injected agent) cannot redirect mail summaries.
+    allowed_destinations: list[str] = Field(default_factory=list)
     services: list[Literal["gmail", "calendar"]] = Field(default_factory=lambda: ["gmail", "calendar"])
     check_timeout_seconds: float = 90.0
     gmail_page_size: int = 50

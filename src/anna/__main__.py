@@ -45,6 +45,8 @@ from anna.runtime.memory_extraction import (
     extraction_blocked_reason,
 )
 from anna.runtime.scheduler import Scheduler
+from anna.runtime.status import StatusRecorder
+from anna.runtime.status import set_recorder as set_status_recorder
 from anna.runtime.startup import (
     build_startup_message,
     read_and_clear_sentinel,
@@ -347,6 +349,10 @@ async def _run(config: AnnaConfig) -> None:
     last_clean = read_and_clear_sentinel(config.state_dir)
     boot_time = datetime.now(timezone.utc)
 
+    status_recorder = StatusRecorder(config.state_dir / "runtime-status.json")
+    set_status_recorder(status_recorder)
+    status_recorder.flush(force=True)
+
     # Start every adapter listener concurrently. Each lives in its own task
     # so a Slack outage cannot block Telegram.
     listener_tasks = [asyncio.create_task(a.start(), name=f"listener.{a.name}") for a in adapters.values()]
@@ -370,6 +376,7 @@ async def _run(config: AnnaConfig) -> None:
         # tool, which only holds the store.
         schedule_store.set_cancel_callback(scheduler.cancel_schedule_tasks)
         scheduler_task = asyncio.create_task(scheduler.run(), name="scheduler")
+        status_recorder.scheduler(running=True)
 
     # Opt-in durable memory extraction (off by default; never silently metered).
     memory_store: Any = None
@@ -388,6 +395,7 @@ async def _run(config: AnnaConfig) -> None:
         )
     elif config.memory.extraction.enabled:
         log.warning("anna.memory_extraction.blocked", reason=blocked)
+    status_recorder.memory_extraction(running=memory_task is not None, blocked_reason=blocked)
 
     # Schedule the operator startup ping. It waits a few seconds for
     # adapters to attach, then fires once. We use a background task so
@@ -425,6 +433,7 @@ async def _run(config: AnnaConfig) -> None:
     await stop_event.wait()
 
     log.info("anna.shutdown.start")
+    status_recorder.stopped()
     aux_tasks: list[asyncio.Task[Any]] = [*listener_tasks, watchdog_task, housekeeping_task]
     if startup_alert_task is not None:
         aux_tasks.append(startup_alert_task)

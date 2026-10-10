@@ -24,6 +24,7 @@ from ``schedules.yaml`` so a dashboard rewrite of the YAML cannot clobber it.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import sqlite3
 from dataclasses import dataclass, field
@@ -37,7 +38,7 @@ from anna.runtime.fsutil import private_file
 
 ACTIVE_EXEC = ("claimed", "running")
 TERMINAL_EXEC = ("succeeded", "failed", "timeout", "cancelled", "unknown", "blocked",
-                 "skipped_overlap", "skipped_misfire", "partial", "auth_required")
+                 "skipped_overlap", "skipped_misfire", "partial", "auth_required", "resolved_unknown")
 MAX_RECORDED_MISFIRES = 20
 
 
@@ -159,6 +160,10 @@ class RuntimeLedger:
             if 1 in applied:
                 self.backup(self._path.with_name(f"{self._path.name}.bak-v1-{iso(now_utc()).replace(':', '')}"))
             self._migrate_v2()
+        if 3 not in applied:
+            if 2 in applied:
+                self.backup(self._path.with_name(f"{self._path.name}.bak-v2-{iso(now_utc()).replace(':', '')}"))
+            self._migrate_v3()
 
     def backup(self, dest: Path) -> Path:
         if dest.exists():
@@ -238,6 +243,94 @@ class RuntimeLedger:
                 receipt_hash TEXT NOT NULL, detail_json TEXT NOT NULL,
                 UNIQUE(run_id, account, service))""")
             self._conn.execute("INSERT INTO ledger_migrations(version, applied_at) VALUES(2, ?)", (iso(now_utc()),))
+
+    def _migrate_v3(self) -> None:
+        """Additive: operator repair intents (inserted by the dashboard, applied only by the daemon)."""
+        with self._conn:
+            self._conn.execute("""CREATE TABLE IF NOT EXISTS repair_requests (
+                id INTEGER PRIMARY KEY, kind TEXT NOT NULL, target_id INTEGER NOT NULL, action TEXT NOT NULL,
+                expected_status TEXT NOT NULL, note TEXT, requested_by TEXT NOT NULL, requested_at TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending', result TEXT, applied_at TEXT)""")
+            self._conn.execute("CREATE INDEX IF NOT EXISTS repair_pending ON repair_requests(status, id)")
+            self._conn.execute("INSERT INTO ledger_migrations(version, applied_at) VALUES(3, ?)", (iso(now_utc()),))
+
+    # --- operator repairs (daemon is the only applier)
+
+    RUN_ACTIONS = {"unknown": ("verified_completed", "verified_not_run", "accept_unknown"),
+                   "blocked": ("verified_completed", "verified_not_run", "accept_unknown")}
+    OUTBOX_ACTIONS = {"uncertain": ("mark_delivered", "resend", "abandon"), "failed": ("retry", "abandon")}
+
+    def apply_repairs(self, *, limit: int = 20) -> list[dict[str, Any]]:
+        """Apply queued operator intents. Never re-runs a run; never resends without an explicit resend/retry.
+
+        Each request pins the status the operator saw (``expected_status``); if the row moved on
+        meanwhile the request is rejected instead of acting on a stale view.
+        """
+        applied: list[dict[str, Any]] = []
+        rows = self._conn.execute("SELECT * FROM repair_requests WHERE status='pending' ORDER BY id LIMIT ?",
+                                  (limit,)).fetchall()
+        for req in rows:
+            outcome, detail = self._apply_one(req)
+            with self._conn:
+                self._conn.execute("UPDATE repair_requests SET status=?, result=?, applied_at=? WHERE id=?",
+                                   (outcome, detail, iso(now_utc()), req["id"]))
+            applied.append({"id": req["id"], "kind": req["kind"], "target_id": req["target_id"],
+                            "action": req["action"], "outcome": outcome, "detail": detail,
+                            "requested_by": req["requested_by"]})
+        return applied
+
+    def _apply_one(self, req: sqlite3.Row) -> tuple[str, str]:
+        now = iso(now_utc())
+        kind, tid, action = req["kind"], req["target_id"], req["action"]
+        with self._immediate():
+            if kind == "run":
+                row = self._conn.execute("SELECT exec_status FROM schedule_occurrences WHERE id=?", (tid,)).fetchone()
+                if row is None:
+                    return "rejected", "no such run"
+                if row[0] != req["expected_status"]:
+                    return "rejected", f"state changed (now {row[0]})"
+                if action not in self.RUN_ACTIONS.get(row[0], ()):
+                    return "rejected", f"action {action!r} not allowed for a {row[0]} run"
+                target = {"verified_completed": "succeeded", "verified_not_run": "cancelled",
+                          "accept_unknown": "resolved_unknown"}[action]
+                self._conn.execute(
+                    "UPDATE schedule_occurrences SET exec_status=?, detail=?, finished_at=COALESCE(finished_at,?), "
+                    "updated_at=? WHERE id=?", (target, f"operator-resolved: {action} (run was NOT re-executed)", now, now, tid))
+                return "applied", f"run {tid} -> {target}; not re-executed"
+            if kind == "outbox":
+                row = self._conn.execute("SELECT status, occurrence_id FROM schedule_outbox WHERE id=?", (tid,)).fetchone()
+                if row is None:
+                    return "rejected", "no such delivery"
+                if row[0] != req["expected_status"]:
+                    return "rejected", f"state changed (now {row[0]})"
+                if action not in self.OUTBOX_ACTIONS.get(row[0], ()):
+                    return "rejected", f"action {action!r} not allowed for a {row[0]} delivery"
+                if action == "mark_delivered":
+                    status, outcome = "sent", "operator verified delivered"
+                elif action == "abandon":
+                    status, outcome = "cancelled", "operator abandoned (not resent)"
+                else:  # resend / retry after the operator confirmed it did not arrive
+                    status, outcome = "pending", f"operator requested {action}"
+                self._conn.execute(
+                    "UPDATE schedule_outbox SET status=?, provider_outcome=?, next_attempt_at=?, attempts=CASE WHEN ? "
+                    "THEN 0 ELSE attempts END, updated_at=? WHERE id=?",
+                    (status, outcome, now, status == "pending", now, tid))
+                self._refresh_delivery(row[1])
+                return "applied", f"delivery {tid} -> {status}"
+        return "rejected", f"unknown target kind {kind!r}"
+
+    @contextlib.contextmanager
+    def _immediate(self):  # type: ignore[no-untyped-def]
+        if self._conn.in_transaction:
+            self._conn.commit()
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+        except BaseException:
+            self._conn.rollback()
+            raise
+        else:
+            self._conn.commit()
 
     # --- heartbeat reads
 

@@ -273,6 +273,10 @@ class ChannelAdapter(ABC):
     @abstractmethod
     async def health_check(self) -> bool: ...
 
+    async def health_detail(self) -> dict[str, Any]:
+        """Receiver liveness separate from API reachability (None = not applicable/unknown)."""
+        return {"receiver_alive": None, "api_ok": None, "error": None}
+
     async def restart(self) -> None:
         """Default restart: stop then start. Subclasses may override."""
         await self.stop()

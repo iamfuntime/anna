@@ -784,3 +784,4 @@ heartbeat:
   reminder_interval_hours: 24
   max_reminders: 3
   max_pending_notifications: 20
+  allowed_destinations: []   # REQUIRED: e.g. ["slack:C0123ABC"]; heartbeat output goes nowhere else

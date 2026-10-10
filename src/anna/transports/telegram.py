@@ -620,6 +620,18 @@ class TelegramAdapter(ChannelAdapter):
     # Health
     # ------------------------------------------------------------------
 
+    async def health_detail(self) -> dict[str, Any]:
+        receiver = self._updater_task is not None and not self._updater_task.done()
+        api_ok: bool | None = None
+        error = None
+        if self._application is not None:
+            try:
+                await self._application.bot.get_me()
+                api_ok = True
+            except Exception as exc:  # noqa: BLE001
+                api_ok, error = False, type(exc).__name__
+        return {"receiver_alive": receiver, "api_ok": api_ok, "error": error}
+
     async def health_check(self) -> bool:
         if self._application is None:
             return False

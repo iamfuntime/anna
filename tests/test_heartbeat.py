@@ -145,6 +145,7 @@ def make_cfg(tmp_path: Path, accounts=("personal", "work")) -> AnnaConfig:
     cfg.google.accounts = [GoogleAccountConfig(slug=a, email=f"{a}@x.test", auth_type="oauth",
                                                credentials_file="c.json") for a in accounts]
     cfg.heartbeat.enabled = True
+    cfg.heartbeat.allowed_destinations = ["slack:CDEST"]
     cfg.heartbeat.quiet_hours.enabled = False
     return cfg
 
@@ -617,3 +618,32 @@ def test_ledger_v1_database_upgrades_with_backup(tmp_path):
 def test_heartbeat_is_off_by_default_and_documented_in_example():
     assert AnnaConfig().heartbeat.enabled is False
     assert "google_heartbeat" in Path("anna.yaml.example").read_text()
+
+
+async def test_heartbeat_destination_must_be_operator_allowlisted_on_create_update_and_run(tmp_path):
+    cfg = make_cfg(tmp_path, ("personal",))
+    store = ScheduleStore(config=cfg, supervisor=Supervisor(config=cfg))
+    evil = hb_schedule("evil")
+    evil.destination = ScheduleDestination(transport="slack", channel="CATTACKER")
+    with pytest.raises(ScheduleValidationError, match="allowlist"):
+        await store.create(evil)
+    await store.create(hb_schedule("ok"))
+    with pytest.raises(ScheduleValidationError, match="allowlist"):
+        await store.update("ok", destination={"transport": "slack", "channel": "CATTACKER"})
+    # run-time gate: a schedule that bypassed the store (hand-edited file) still cannot exfiltrate
+    e = await Env(tmp_path / "e").start()
+    e.store.get("hb").destination = ScheduleDestination(transport="slack", channel="CATTACKER")
+    e.prov.add_mail("personal", "m1", subject="secret subject")
+    occ = await e.tick()
+    assert occ.exec_status == "failed" and e.adapter.sent == [] and not e.prov.calls
+
+
+async def test_slack_markup_in_untrusted_mail_is_inert(tmp_path):
+    e = await Env(tmp_path).start()
+    e.prov.add_mail("personal", "m1", subject="<!channel> click <https://evil.test|here> <@U123>",
+                    sender="x <!here> & co")
+    await e.tick()
+    [text] = e.texts()
+    assert "<!channel>" not in text and "<@U123>" not in text and "<https" not in text and "&lt;!channel&gt;" in text
+    from anna.runtime.heartbeat import escape_for_transport
+    assert escape_for_transport("telegram", "a <b> & c") == "a <b> & c"

@@ -27,6 +27,7 @@ from anna.core.eviction import evict_if_over_cap
 from anna.core.identity import CORE_FILES, CoreFile, read_core_file
 from anna.log import audit_event, get_logger
 from anna.runtime.memory import MemoryStore, render_memory_block
+from anna.runtime.status import get_recorder
 from anna.runtime.turn_watchdog import (
     TurnWatchdog,
     WatchdogAction,
@@ -470,6 +471,7 @@ class ConversationWorker:
         self._active_memory_source_id: str | None = None
         self.memory_enqueue_failures = 0
         self._sdk_turn_failed = False
+        self._sdk_result_seen = False
         self._coverage_frozen = False
         self._resume_tail_sequences: set[int] = set()
         self._on_idle_close = on_idle_close
@@ -2957,6 +2959,7 @@ class ConversationWorker:
         self._notification_turn = self._notification_turn_for(event)
         self._active_memory_source_id = self._event_source_id(event)
         self._sdk_turn_failed = False
+        self._sdk_result_seen = False
         turn_queue = self._begin_turn()
         completed_normally = False
         cancel_task: asyncio.Task[None] | None = None
@@ -3018,6 +3021,12 @@ class ConversationWorker:
             await self._end_turn(turn_queue)
             # After the reply path: durable enqueue never blocks or fails a turn.
             self._enqueue_memory_extraction(event)
+            recorder = get_recorder()
+            if recorder is not None:
+                if self._sdk_turn_failed:
+                    recorder.sdk_error("sdk turn failed")
+                elif self._sdk_result_seen:
+                    recorder.sdk_success()
             if self._sdk_turn_failed:
                 # The model never saw (or never answered) this turn: coverage must
                 # not advance over it, now or for later turns of this worker.
@@ -3521,6 +3530,7 @@ class ConversationWorker:
                                             buffer.pending.clear()
                                             buffer.last_flush = loop.time()
                     if ResultMessage is not None and isinstance(msg, ResultMessage):
+                        self._sdk_result_seen = True
                         break
             except Exception as exc:
                 self._log.error("worker.sdk_receive_failed", error=str(exc))

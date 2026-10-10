@@ -94,6 +94,19 @@ def _status_of(exc: BaseException) -> int | None:
         return None
 
 
+def escape_for_transport(transport: str, text: str) -> str:
+    """Neutralise markup in untrusted provider text for the destination.
+
+    Slack treats ``<!channel>``, ``<@U123>`` and ``<url|label>`` as live syntax;
+    escaping ``& < >`` (Slack's documented rule) makes sender/subject/title text
+    inert.  Telegram messages are sent as plain text (no parse_mode), where no
+    escaping is needed or wanted.
+    """
+    if transport == "slack":
+        return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return text
+
+
 def clean(text: str, limit: int = 160) -> str:
     """Untrusted provider text: strip control/bidi characters, collapse whitespace, bound length."""
     text = _CTRL.sub("", text or "")
@@ -564,7 +577,7 @@ class HeartbeatJob:
         specs = []
         for n in outcome.notices:
             not_before = iso(quiet_end) if quiet_end and not n.urgent else None
-            specs.append((dest.transport, dest.channel, n.text, not_before))
+            specs.append((dest.transport, dest.channel, escape_for_transport(dest.transport, n.text), not_before))
         return specs
 
 
