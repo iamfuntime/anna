@@ -24,6 +24,8 @@ worktree.
   pytest -q` on Python 3.13.15: 1,388 passed, 2 failed, 1 skipped.
 - The original watchdog regression is fixed and the pending focused rerun is
   green (43 passed).
+- Coordinator verified the full suite at `3390c54`: **1,392 passed, 1 skipped,
+  1 warning** in 31.29 seconds.
 - The user-supplied copied plan is intentionally untracked until this
   documentation milestone commit, where it will be included.
 
@@ -99,6 +101,38 @@ basic checkpoint write/replay safety are complete slices; receiver liveness,
 safe Google isolation, exact checkpoint event coverage, and later phases
 remain.
 
+## Continuation after review
+
+Independent read-only review of `e7a7015..3390c54` reported an idle-send
+regression and unsafe shared callback mutation. Commit `750c17d` fixes both by
+using task-local reply addresses; it also makes Slack/Telegram startup fail if
+their receiver task dies immediately and makes health fail for stopped receiver
+tasks. The reviewer terminal was confirmed idle and closed.
+
+Commit `48f9118` adds a SQLite WAL-backed fact store with a migration ledger,
+FTS5 retrieval, owner/scope filtering, provenance event IDs, correction
+supersession, and soft forgetting. Workers refresh matching scoped facts per
+turn. The first cross-transport policy correction also uses the event transport
+for voice-only/drip eligibility. Explicit memory MCP tools, extraction jobs,
+legacy import, and UI remain unfinished.
+
+Focused continuation validation:
+
+```text
+tests/test_router_identity_alias.py tests/test_transport_token_missing.py
+tests/test_worker_periodic_flush.py tests/test_turn_watchdog.py
+69 passed
+
+tests/test_memory.py tests/test_worker_tool_wiring.py
+tests/test_worker_periodic_flush.py tests/test_router_identity_alias.py
+60 passed
+```
+
+Migration/rollback: `state/memory.sqlite3` is created automatically with a
+version-1 ledger and WAL mode. It is additive; rollback is to stop using the
+store while retaining the database and transcripts. Use a temporary `ANNA_HOME`
+in tests; no real provider or credential action is required.
+
 ## Deferred milestones
 
 1. **Phase 0:** finish exact event coverage/replay, receiver liveness, and
@@ -170,6 +204,7 @@ additive and preserve pending records across downgrade/restart.
 - Exact checkpoint coverage is deliberately conservative for now: legacy and
   bounded checkpoints do not suppress transcript replay.
 - Receiver readiness/liveness and Google `.execute()` thread isolation are
-  not implemented.
-- Memory, durable tasks/runs/outbox, heartbeat, and account repair UX have
-  not started.
+  only partially implemented: receiver liveness is covered, safe Google call
+  isolation remains.
+- Memory persistence/retrieval is started, but explicit tools, extraction,
+  source import, durable tasks/runs/outbox, heartbeat, and repair UX remain.

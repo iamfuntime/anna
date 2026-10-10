@@ -2122,7 +2122,7 @@ class ConversationWorker:
             "parent_tool_use_id": None,
         }
 
-    def _voice_only_for_transport(self) -> bool:
+    def _voice_only_for_transport(self, event: InboundEvent) -> bool:
         """True when this transport would send replies as voice-only.
 
         Decision F: when voice-only outbound is configured for this
@@ -2137,7 +2137,7 @@ class ConversationWorker:
         return (
             voice_out.enabled
             and voice_out.voice_only
-            and self.transport in voice_out.transports
+            and (event.reply_transport or event.transport) in voice_out.transports
         )
 
     def _periodic_flush_active(self, event: InboundEvent) -> bool:
@@ -2155,9 +2155,9 @@ class ConversationWorker:
             return False
         if event.completion_future is not None:
             return False
-        if self.transport not in ("slack", "telegram"):
+        if (event.reply_transport or event.transport) not in ("slack", "telegram"):
             return False
-        if self._voice_only_for_transport():
+        if self._voice_only_for_transport(event):
             return False
         return True
 
