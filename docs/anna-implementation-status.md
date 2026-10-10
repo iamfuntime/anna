@@ -579,6 +579,48 @@ Migration/rollback: ledger schema v4 (additive `schedule_outbox.announced`), aut
 new config keys (`heartbeat.max_deferred_notifications`, `gmail_max_empty_pages`, `gmail_time_budget_seconds`,
 `scheduler.retention_days`, `text_retention_days`, `prune_interval_hours`) have defaults and are ignored by older builds.
 
+## Google connect / reconnect / remove / verify (dashboard `/google`, CLI parity)
+
+Isolated trial steps, tested-vs-deferred matrix and rollback: `docs/google-connect-trial-guide.md`.
+
+- **Flow:** Google's supported installed-app loopback flow (`InstalledAppFlow.run_local_server` on `127.0.0.1`; `state` + PKCE
+  generated and the state validated by the library; no hosted callback, no out-of-band flow). The dashboard only wraps it:
+  one active session, 5-minute TTL, single use, cancel (a poke at the loopback port ends the blocking wait), consent URL captured
+  rather than printed, flow object (PKCE verifier, secret copy) dropped when the thread ends, sessions keep only a status and an
+  exception class name.
+- **Token write rule (`persist_connected_token`):** written atomically at 0600 only after every requested scope was granted, a
+  refresh token exists, and the REAL mailbox (Gmail profile, or primary calendar id for calendar-only accounts) equals the
+  configured address. A mismatch is a hard rejection that saves nothing, under any slug. The CLI `verify` now fails (exit 3) on a
+  mismatch instead of warning.
+- **One reusable client:** `google.oauth_client_file` (default `state/google/oauth_client.json`) is imported once (dashboard form or
+  `python -m anna.setup.google_auth import-client PATH`): Desktop ("installed") clients only, path must be inside the user's home or
+  ANNA_HOME and owned by them, symlinks resolved, <=64 KB, Google-hosted auth/token URIs, never echoed. Accounts may leave
+  `credentials_file` empty; a per-account file still wins for backward compatibility.
+- **Service-aware permissions:** `GoogleAccountConfig.services` (default gmail+calendar, read-only scopes). Scopes requested = exactly
+  the chosen services; `GoogleClients.run` refuses an API the account is not authorized for; the heartbeat only checks authorized
+  services. Changing services edits `anna.yaml` and says reconnect + restart; permissions are never widened silently.
+- **Daemon-owned connector control (ledger v5 `control_requests`):** the dashboard queues `google_invalidate` (after connect/remove)
+  and `google_verify`; the daemon's poll applies them on the account's serialized lane (cache drop; live read-only verification that
+  reports only error classes and `match|MISMATCH`). The dashboard never refreshes tokens or touches the daemon's cached services.
+  With no daemon the requests wait and the page says so. Adding accounts/services is a config edit that needs a daemon restart
+  (never performed automatically).
+- **Remove vs revoke:** "remove locally" deletes only the token file (optionally the config entry; the grant at Google stays valid
+  and the page says so); "revoke at Google" is a separate typed-confirmation action that calls Google's revoke endpoint and deletes the
+  local token only if Google confirms.
+- **Browser protections:** all new POSTs pass the existing same-origin middleware plus the Host guard; Connect additionally requires a
+  loopback client address. Remote browser: honest `ssh -L` instructions that require a fixed `google.oauth_callback_port`; with a
+  random port the page states it is unsupported. Banners come from fixed server tables. Residual: the library's one-shot callback
+  listener accepts the first request it receives, so a local process could end a pending flow early (denial of service, no token).
+- **Not claimed:** no Cloud project registration is done for you and the app is not Google-verified (unverified-app warning; Testing-mode
+  refresh tokens expire after 7 days). No live Google, Slack or Telegram call, consent or credential was used.
+
+Earlier security-review notices whose text was truncated in this session ("+1 more"/"+2 more" on the heartbeat, dashboard and ledger
+commits) are not retrievable from session output and remain **unresolved/unknown**; all findings that were visible were fixed. Please
+re-run those reviews against HEAD so nothing is left to guesswork.
+
+Validation: full suite 1,646 passed, 1 skipped (`tests/test_google_connect.py`: 22 tests); ruff clean on new files; mypy clean on new
+modules except missing third-party stubs.
+
 ## Deferred milestones
 
 1. **Phase 0:** finish exact event coverage/replay.

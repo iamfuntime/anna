@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}Connect Google — ANNA Dashboard{% endblock %}
+{% block content %}
+  {% if sess.status in ('starting', 'waiting', 'verifying') %}<meta http-equiv="refresh" content="3">{% endif %}
+  <h1>Connect {{ sess.slug }}</h1>
+  {% if sess.status == 'waiting' %}
+    <p>1. Open Google's consent page in <strong>this computer's</strong> browser: <a href="{{ auth_url }}" rel="noopener noreferrer" target="_blank">Continue to Google</a>.<br>
+       2. Sign in as the account configured for <code>{{ sess.slug }}</code> and approve the listed read-only permissions.<br>
+       3. You will be sent back to a temporary local address; this page updates by itself.</p>
+    <p><small>Unverified-app warnings are expected for your own Cloud project. The link expires in about five minutes and works once.
+      {% if not callback_port %}The callback port is random, so a remote browser cannot reach it — see the tunnel note on the accounts page.{% endif %}</small></p>
+    <form method="post" action="/google/connect/{{ sess.id }}/cancel"><button type="submit">Cancel</button></form>
+  {% elif sess.status in ('starting', 'verifying') %}
+    <p>{{ 'Checking which account you signed in with…' if sess.status == 'verifying' else 'Starting…' }}</p>
+  {% elif sess.status == 'done' %}
+    <p role="status"><strong>Connected.</strong> The token was saved only after the permissions and the mailbox matched. The daemon was asked to drop its cached session; use Verify on the accounts page to confirm.</p>
+  {% elif sess.status == 'failed' and sess.error == 'identity_mismatch' %}
+    <p role="alert"><strong>Wrong account.</strong> You signed in with a different Google account than the one configured for <code>{{ sess.slug }}</code>. Nothing was saved. Try again with the right account, or fix the email in the config.</p>
+  {% elif sess.status == 'expired' %}<p role="alert">The link expired before consent finished. Nothing was saved.</p>
+  {% elif sess.status == 'cancelled' %}<p>Cancelled. Nothing was saved.</p>
+  {% else %}<p role="alert">The connection failed ({{ sess.error or 'unknown' }}). Nothing was saved.</p>{% endif %}
+  <p><a href="/google">Back to Google accounts</a></p>
+{% endblock %}

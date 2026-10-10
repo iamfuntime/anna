@@ -271,10 +271,10 @@ class HeartbeatJob:
     # ----------------------------------------------------------------- driver
 
     def targets(self) -> list[tuple[str, str]]:
-        accounts = [a.slug for a in self._config.google.accounts]
-        if self._cfg.accounts:
-            accounts = [a for a in accounts if a in self._cfg.accounts]
-        return [(a, s) for a in accounts for s in self._cfg.services]
+        accts = {a.slug: a for a in self._config.google.accounts}
+        names = [a for a in accts if not self._cfg.accounts or a in self._cfg.accounts]
+        # An account is only checked for the services it was actually authorized for.
+        return [(a, s) for a in names for s in self._cfg.services if s in accts[a].services]
 
     async def run(self, schedule: Schedule, *, scheduled_for: str) -> HeartbeatOutcome:
         now = self._clock()

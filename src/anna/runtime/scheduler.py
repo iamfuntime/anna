@@ -348,6 +348,7 @@ class Scheduler:
                         level="INFO" if done["outcome"] == "applied" else "WARNING", repair_id=done["id"],
                         kind=done["kind"], target_id=done["target_id"], action=done["action"],
                         outcome=done["outcome"], detail=done["detail"], requested_by=done["requested_by"])
+        await self._apply_controls()
         for rec in self._ledger.recover_expired(now=now, max_run_attempts=cfg.max_run_attempts,
                                                 owner_alive=owner_alive):
             await self._on_recovery(rec)
@@ -369,6 +370,31 @@ class Scheduler:
                 continue
             self._spawn(found, occ.id)
         await self._deliver_due()
+
+    async def _apply_controls(self) -> None:
+        """Daemon-owned Google connector controls queued by the dashboard (see runtime/controls.py)."""
+        import json
+
+        from anna.tools.google_verify import verify_account
+        for req in self._ledger.pending_controls():
+            kind, slug = req["kind"], req["subject"]
+            clients = self._google_clients
+            try:
+                if clients is None:
+                    self._ledger.finish_control(req["id"], status="rejected",
+                                                result="this daemon has no Google client (google.enabled is false?)")
+                elif kind == "google_invalidate":
+                    clients.invalidate(slug)
+                    self._ledger.finish_control(req["id"], status="applied", result="cached Google services dropped")
+                elif kind == "google_verify":
+                    res = await verify_account(clients, self._config, slug)
+                    self._ledger.finish_control(req["id"], status="applied", result=json.dumps(res))
+                else:
+                    self._ledger.finish_control(req["id"], status="rejected", result="unknown control kind")
+            except Exception as exc:  # noqa: BLE001
+                self._ledger.finish_control(req["id"], status="rejected", result=type(exc).__name__)
+            audit_event("audit.google.control", audit_dir=self._audit_dir, actor="operator",
+                        fsync_on_write=self._fsync, kind=kind, slug=slug, requested_by=req["requested_by"])
 
     async def _reconcile_deleted(self) -> None:
         """Cancel work of schedules another process deleted - only once the deletion is CONFIRMED.

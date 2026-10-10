@@ -199,6 +199,10 @@ class RuntimeLedger:
             if 3 in applied:
                 self.backup(self._path.with_name(f"{self._path.name}.bak-v3-{iso(now_utc()).replace(':', '')}"))
             self._migrate_v4()
+        if 5 not in applied:
+            if 4 in applied:
+                self.backup(self._path.with_name(f"{self._path.name}.bak-v4-{iso(now_utc()).replace(':', '')}"))
+            self._migrate_v5()
 
     def backup(self, dest: Path) -> Path:
         if dest.exists():
@@ -303,6 +307,24 @@ class RuntimeLedger:
             if "announced" not in cols:
                 self._conn.execute("ALTER TABLE schedule_outbox ADD COLUMN announced INTEGER NOT NULL DEFAULT 0")
             self._conn.execute("INSERT INTO ledger_migrations(version, applied_at) VALUES(4, ?)", (iso(now_utc()),))
+
+    def _migrate_v5(self) -> None:
+        """Additive: control intents for the daemon-owned Google connector (invalidate / verify)."""
+        with self._immediate():
+            self._conn.execute("""CREATE TABLE IF NOT EXISTS control_requests (
+                id INTEGER PRIMARY KEY, kind TEXT NOT NULL, subject TEXT NOT NULL, requested_by TEXT NOT NULL,
+                requested_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', result TEXT, applied_at TEXT)""")
+            self._conn.execute("CREATE INDEX IF NOT EXISTS control_pending ON control_requests(status, id)")
+            self._conn.execute("INSERT INTO ledger_migrations(version, applied_at) VALUES(5, ?)", (iso(now_utc()),))
+
+    def pending_controls(self, limit: int = 20) -> list[sqlite3.Row]:
+        return self._conn.execute("SELECT * FROM control_requests WHERE status='pending' ORDER BY id LIMIT ?",
+                                  (limit,)).fetchall()
+
+    def finish_control(self, control_id: int, *, status: str, result: str) -> None:
+        with self._conn:
+            self._conn.execute("UPDATE control_requests SET status=?, result=?, applied_at=? WHERE id=?",
+                               (status, result[:300], iso(now_utc()), control_id))
 
     # --- operator repairs (daemon is the only applier)
 

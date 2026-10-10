@@ -24,7 +24,6 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import Any
 
 from anna.config import AnnaConfig, GoogleAccountConfig, load_config
 from anna.tools.google_auth import (
@@ -100,9 +99,9 @@ def cmd_add(args: argparse.Namespace, config: AnnaConfig) -> int:
     client_path = config.resolve_google_credentials_path(account)
     if not client_path.is_file():
         _print_err(
-            f"OAuth client JSON not found at {client_path}\n"
-            f"Download it from GCP Console -> APIs & Services -> Credentials, "
-            f"then drop the file at that path with 600 perms."
+            f"no OAuth client found (looked for {client_path}).\n"
+            f"Import your Desktop OAuth client once: "
+            f"python -m anna.setup.google_auth import-client /path/to/client_secret.json"
         )
         return 2
 
@@ -129,6 +128,18 @@ def cmd_add(args: argparse.Namespace, config: AnnaConfig) -> int:
 
     _print_ok(f"token persisted to {token_path}")
     return cmd_verify(args, config)
+
+
+def cmd_import_client(args: argparse.Namespace, config: AnnaConfig) -> int:
+    from anna.tools.google_auth import import_client_file
+
+    try:
+        target = import_client_file(config, Path(args.path), replace=args.replace)
+    except GoogleAuthError as exc:
+        _print_err(str(exc))
+        return 2
+    _print_ok(f"shared OAuth client imported to {target} (0600); every account uses it")
+    return 0
 
 
 def cmd_verify(args: argparse.Namespace, config: AnnaConfig) -> int:
@@ -165,11 +176,11 @@ def cmd_verify(args: argparse.Namespace, config: AnnaConfig) -> int:
         return 3
     actual_email = profile.get("emailAddress", "?")
     if actual_email.lower() != account.email.lower():
-        _print_warn(
-            f"gmail authenticated as {actual_email}, but anna.yaml says "
-            f"{account.email}. Service-account impersonation subject may "
-            f"not match."
+        _print_err(
+            f"gmail authenticated as {actual_email}, but anna.yaml says {account.email}: "
+            f"this token belongs to the wrong mailbox for slug {slug!r}."
         )
+        return 3
     _print_ok(
         f"gmail OK: {actual_email}, messagesTotal={profile.get('messagesTotal')}"
     )
@@ -209,6 +220,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Do not auto-open a browser; print the URL instead.",
     )
     p_add.set_defaults(func=cmd_add)
+
+    p_import = subparsers.add_parser("import-client", help="Import the shared Desktop OAuth client JSON once.")
+    p_import.add_argument("path")
+    p_import.add_argument("--replace", action="store_true", help="overwrite an already imported client")
+    p_import.set_defaults(func=cmd_import_client)
 
     p_verify = subparsers.add_parser(
         "verify",

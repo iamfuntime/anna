@@ -65,6 +65,17 @@ ALLOWED_MUTATING_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("POST", "/repairs/{kind}/{target_id}"),
         ("POST", "/memory/{fact_id}/correct"),
         ("POST", "/memory/{fact_id}/forget"),
+        # Google account management (reviewed, intentional; Host + same-origin enforced, loopback client only for
+        # connect): import the shared OAuth client, add/change accounts in anna.yaml, connect/cancel, queue a
+        # daemon-side verify, remove locally, revoke at Google. Each destructive one needs a typed phrase.
+        ("POST", "/google/client"),
+        ("POST", "/google/accounts"),
+        ("POST", "/google/accounts/{slug}/services"),
+        ("POST", "/google/accounts/{slug}/connect"),
+        ("POST", "/google/connect/{sid}/cancel"),
+        ("POST", "/google/accounts/{slug}/verify"),
+        ("POST", "/google/accounts/{slug}/remove"),
+        ("POST", "/google/accounts/{slug}/revoke"),
     }
 )
 

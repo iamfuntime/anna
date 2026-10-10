@@ -781,7 +781,19 @@ class GoogleAccountConfig(BaseModel):
     slug: str
     email: str
     auth_type: Literal["oauth", "service_account"]
-    credentials_file: str
+    # Per-account client/key file. For OAuth accounts it may be left empty (or point at a
+    # missing file) to use the ONE shared desktop OAuth client at ``google.oauth_client_file``.
+    credentials_file: str = ""
+    # Which Google services this account is authorized for; decides the OAuth scopes requested
+    # and which tools/collectors may use the account.  Default keeps the historic gmail+calendar.
+    services: list[Literal["gmail", "calendar"]] = Field(default_factory=lambda: ["gmail", "calendar"])
+
+    @field_validator("services")
+    @classmethod
+    def _services_nonempty(cls, v: list[str]) -> list[str]:
+        if not v or len(set(v)) != len(v):
+            raise ValueError("google account services must be a non-empty list without duplicates")
+        return v
 
     @field_validator("slug")
     @classmethod
@@ -812,6 +824,19 @@ class GoogleConfig(BaseModel):
     enabled: bool = False
     accounts: list[GoogleAccountConfig] = Field(default_factory=list)
     write_enabled: bool = False
+    # ONE reusable Desktop-app OAuth client registered once in YOUR Google Cloud project and shared by
+    # every mailbox (not one app per mailbox).  Imported once through the dashboard or CLI.
+    oauth_client_file: str = "state/google/oauth_client.json"
+    # Loopback port for the consent callback. 0 = a random free port (browser must be on this host).
+    # Set a fixed port to make the flow usable through an SSH port forward.
+    oauth_callback_port: int = 0
+
+    @field_validator("oauth_callback_port")
+    @classmethod
+    def _callback_port(cls, v: int) -> int:
+        if v != 0 and not 1024 <= v <= 65535:
+            raise ValueError("google.oauth_callback_port must be 0 or between 1024 and 65535")
+        return v
 
     @model_validator(mode="after")
     def _check_unique_slugs(self) -> "GoogleConfig":
@@ -1702,10 +1727,19 @@ class AnnaConfig(BaseModel):
 
     def resolve_google_credentials_path(self, account: "GoogleAccountConfig") -> Path:
         """Resolve a per-account credentials_file against anna_home if relative."""
-        raw = Path(os.path.expanduser(account.credentials_file))
-        if raw.is_absolute():
-            return raw
-        return self.anna_home / raw
+        raw = Path(os.path.expanduser(account.credentials_file)) if account.credentials_file else None
+        own = None if raw is None else (raw if raw.is_absolute() else self.anna_home / raw)
+        if account.auth_type != "oauth":
+            return own if own is not None else self.anna_home / "state" / "google" / f"sa_{account.slug}.json"
+        # OAuth: a per-account client file keeps working; otherwise the shared desktop client is used.
+        if own is not None and own.is_file():
+            return own
+        shared = self.google_oauth_client_path()
+        return shared if shared.is_file() or own is None else own
+
+    def google_oauth_client_path(self) -> Path:
+        raw = Path(os.path.expanduser(self.google.oauth_client_file))
+        return raw if raw.is_absolute() else self.anna_home / raw
 
     def google_token_path(self, account: "GoogleAccountConfig") -> Path:
         """Per-OAuth-account refresh-token cache path."""

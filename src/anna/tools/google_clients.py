@@ -157,6 +157,9 @@ class GoogleClients:
     ) -> T:
         if self._closed:
             raise RuntimeError("GoogleClients is closed")
+        if api not in self.account(slug).services:
+            raise GoogleAuthError(f"google account {slug!r} is not authorized for {api}; "
+                                  "reconnect it with that service selected")
         lane = self._lane(slug)
         if lane.pending >= _MAX_ACCEPTED_PER_ACCOUNT:
             raise GoogleBackpressureError(f"google account {slug!r} is busy; retry later")
