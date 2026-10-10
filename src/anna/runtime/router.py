@@ -184,7 +184,7 @@ class ConversationRouter:
             event = dataclasses.replace(event, conversation_key=new_key)
 
         # Transcript: inbound line.
-        transcript_event(
+        persisted = transcript_event(
             channel=event.transport,
             conv_key=event.conversation_key,
             transcripts_dir=self._config.transcripts_dir,
@@ -195,6 +195,11 @@ class ConversationRouter:
             is_dm=event.is_dm,
             is_thread=event.is_thread,
         )
+        if persisted is not None:
+            raw = dict(event.raw)
+            raw["anna_transcript_sequence"] = persisted["sequence"]
+            raw["anna_transcript_event_id"] = persisted["event_id"]
+            event = dataclasses.replace(event, raw=raw)
 
         worker = await self._get_or_spawn_worker(event)
         self._log.debug(

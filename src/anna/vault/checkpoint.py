@@ -24,6 +24,8 @@ def write_checkpoint(
     summary: str,
     operator_short_name: str | None = None,
     kind: str = "closeout",
+    coverage_end_sequence: int | None = None,
+    coverage_end_event_id: str | None = None,
 ) -> Path:
     """Write a markdown checkpoint and return its path.
 
@@ -51,6 +53,13 @@ def write_checkpoint(
     # and closeout can land in one tick, so give every completed write an ID.
     path = base_dir / f"{stamp}-{uuid.uuid4().hex}.md"
 
+    coverage = ""
+    if coverage_end_sequence is not None and coverage_end_sequence > 0 and coverage_end_event_id:
+        coverage = (
+            "coverage_version: 1\n"
+            f"coverage_end_sequence: {coverage_end_sequence}\n"
+            f"coverage_end_event_id: {coverage_end_event_id}\n"
+        )
     frontmatter = (
         f"---\n"
         f"created: {now.strftime('%Y-%m-%d')}\n"
@@ -60,6 +69,7 @@ def write_checkpoint(
         f"transport: {transport}\n"
         f"conversation_key: {conversation_key}\n"
         f"checkpoint_kind: {kind}\n"
+        f"{coverage}"
         f"---\n\n"
     )
     body = f"# Checkpoint\n\n{summary}\n"

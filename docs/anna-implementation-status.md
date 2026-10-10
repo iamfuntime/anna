@@ -145,6 +145,50 @@ uv run --extra dev pytest -q
 
 The warning is the existing Starlette `TestClient`/httpx deprecation warning.
 
+## Exact transcript/checkpoint coverage follow-up
+
+The former mtime-based resume heuristic has been replaced with durable
+per-conversation transcript records. Each newly appended inbound or outbound
+JSONL event has an opaque `event_id` and a monotonically allocated `sequence`;
+the small `.cursor.json` allocation hint is atomically replaced, while JSONL
+is authoritative and repairs the hint after a mid-write crash. Sequence order
+survives daily rotation and copied checkpoint mtimes.
+
+Only a successful closeout summary can carry `coverage_version: 1`,
+`coverage_end_sequence`, and `coverage_end_event_id` frontmatter. Periodic
+mechanical excerpts, failed/missing summaries, malformed coverage metadata,
+and legacy checkpoints have no coverage and therefore suppress no raw replay.
+The worker advances a candidate only after a normally completed inbound turn;
+if a newly spawned worker finds older uncovered events, it declines to advance
+coverage rather than hiding them. Inbound events journaled while closeout is
+stopping but not processed have higher sequences and remain replayable.
+
+Focused isolated validation:
+
+```text
+uv run --extra dev pytest -q tests/test_transcript_coverage.py \
+  tests/test_checkpoint.py tests/test_transcript_resume.py \
+  tests/test_worker_resume_context.py tests/test_worker_periodic_checkpoint.py \
+  tests/test_worker_closeout.py tests/test_router_identity_alias.py
+73 passed in 0.58s
+
+uv run --extra dev pytest -q
+1,410 passed, 1 skipped, 1 warning in 22.57s
+```
+
+Import-order lint is clean for the touched code. The project-wide strict lint
+still reports existing UTC-annotation, legacy typing, and unrelated router
+findings in long-lived modules; no broad formatting-only rewrite was made.
+
+Migration/rollback: this is an additive transcript/checkpoint format change,
+not a SQLite migration. Existing JSONL and markdown remain readable. Rollback
+is safe because older builds ignore the new JSONL fields and checkpoint
+frontmatter; newer builds treat legacy files as unvalidated and replay their
+bounded raw tail. Isolated manual acceptance: set `ANNA_HOME=$(mktemp -d)`,
+send two mocked events, stop/restart the worker, verify the JSONL event IDs and
+sequences are stable, then copy/touch the checkpoint and verify only explicit
+coverage—not its mtime—changes the recovered tail.
+
 Full validation after the memory MCP additions:
 
 ```text

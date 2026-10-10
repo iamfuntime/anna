@@ -21,7 +21,9 @@ import json
 import logging
 import os
 import sys
+import tempfile
 import threading
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -29,7 +31,6 @@ from typing import Any
 import structlog
 
 from anna.vault.paths import safe_conv_key
-
 
 # ---------------------------------------------------------------------------
 # Operational stream
@@ -206,28 +207,35 @@ def transcript_event(
     direction: str,
     text: str,
     **fields: Any,
-) -> None:
+) -> dict[str, Any] | None:
     """Append a transcript line for the given conversation.
 
     Each line carries the timestamp, direction (inbound or outbound), the raw
     text, and any caller-supplied fields. Writes are serialized per conv_key
     to preserve inbound-before-outbound ordering within a single conversation.
     """
-    record = {
-        "ts": _now_iso(),
-        "direction": direction,
-        "conv_key": conv_key,
-        "text": text,
-        **fields,
-    }
     log = get_logger("anna.transcript")
     try:
         path = _transcript_path_for_today(transcripts_dir, channel, conv_key)
         path.parent.mkdir(parents=True, exist_ok=True)
-        line = json.dumps(record, ensure_ascii=False)
         with _lock_for(conv_key):
+            sequence = _next_transcript_sequence(path.parent)
+            record = {
+                "event_id": uuid.uuid4().hex,
+                "sequence": sequence,
+                "ts": _now_iso(),
+                "direction": direction,
+                "conv_key": conv_key,
+                "text": text,
+                **fields,
+            }
+            line = json.dumps(record, ensure_ascii=False)
             with path.open("a", encoding="utf-8") as fp:
                 fp.write(line + "\n")
+                fp.flush()
+                os.fsync(fp.fileno())
+            _write_transcript_cursor(path.parent, sequence)
+        return record
     except Exception as exc:
         log.error(
             "transcript_write_failed",
@@ -235,6 +243,46 @@ def transcript_event(
             conv_key=conv_key,
             error=str(exc),
         )
+        return None
+
+
+def _next_transcript_sequence(conv_dir: Path) -> int:
+    """Allocate after the highest durable sequence, repairing a stale hint."""
+    highest = 0
+    cursor_path = conv_dir / ".cursor.json"
+    try:
+        cursor = json.loads(cursor_path.read_text(encoding="utf-8"))
+        if isinstance(cursor, dict) and isinstance(cursor.get("sequence"), int):
+            highest = cursor["sequence"]
+    except (OSError, ValueError, TypeError):
+        pass
+    for daily in conv_dir.glob("*.jsonl"):
+        try:
+            for raw in daily.read_text(encoding="utf-8").splitlines():
+                obj = json.loads(raw)
+                if isinstance(obj, dict) and isinstance(obj.get("sequence"), int):
+                    highest = max(highest, obj["sequence"])
+        except (OSError, ValueError, TypeError):
+            continue
+    return highest + 1
+
+
+def _write_transcript_cursor(conv_dir: Path, sequence: int) -> None:
+    """Atomically update an allocation hint; JSONL remains authoritative."""
+    target = conv_dir / ".cursor.json"
+    fd, temporary = tempfile.mkstemp(prefix=".cursor.", suffix=".tmp", dir=conv_dir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fp:
+            json.dump({"sequence": sequence}, fp)
+            fp.flush()
+            os.fsync(fp.fileno())
+        os.replace(temporary, target)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 # ---------------------------------------------------------------------------

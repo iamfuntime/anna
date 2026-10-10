@@ -16,6 +16,7 @@ the latest checkpoint's mtime survive.
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -33,6 +34,105 @@ def latest_checkpoint_mtime(vault_root: Path, conv_key: str) -> float | None:
     if not recent:
         return None
     return recent[0].stat().st_mtime
+
+
+_COVERAGE_SEQUENCE_RE = re.compile(r"^coverage_end_sequence:\s*(\d+)\s*$", re.MULTILINE)
+_COVERAGE_EVENT_RE = re.compile(r"^coverage_end_event_id:\s*([0-9a-f]{32})\s*$", re.MULTILINE)
+
+
+def latest_checkpoint_coverage(vault_root: Path, conv_key: str) -> int | None:
+    """Return validated explicit checkpoint coverage, never a file timestamp.
+
+    Checkpoints predating coverage metadata remain useful prompt context but
+    are deliberately treated as covering nothing.  This also makes copied or
+    restored file mtimes irrelevant to transcript recovery.
+    """
+    for path in list_recent_checkpoints(vault_root=vault_root, conversation_key=conv_key, limit=1000):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        sequence = _COVERAGE_SEQUENCE_RE.search(text)
+        event_id = _COVERAGE_EVENT_RE.search(text)
+        if sequence is not None and event_id is not None:
+            value = int(sequence.group(1))
+            if value > 0:
+                return value
+    return None
+
+
+def validated_checkpoint_coverage(
+    vault_root: Path,
+    transcripts_dir: Path,
+    conv_key: str,
+) -> int | None:
+    """Return coverage only when its checkpoint event still exists in JSONL."""
+    base_dir = transcripts_dir / _safe_key(conv_key)
+    for path in list_recent_checkpoints(vault_root=vault_root, conversation_key=conv_key, limit=1000):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        sequence = _COVERAGE_SEQUENCE_RE.search(text)
+        event_id = _COVERAGE_EVENT_RE.search(text)
+        if sequence is None or event_id is None:
+            continue
+        value = int(sequence.group(1))
+        if value <= 0:
+            continue
+        for transcript in sorted(base_dir.glob("*.jsonl")):
+            try:
+                raw_lines = transcript.read_text(encoding="utf-8").splitlines()
+            except OSError:
+                continue
+            for raw in raw_lines:
+                try:
+                    obj = json.loads(raw)
+                except (ValueError, TypeError):
+                    continue
+                if (
+                    isinstance(obj, dict)
+                    and obj.get("sequence") == value
+                    and obj.get("event_id") == event_id.group(1)
+                ):
+                    return value
+    return None
+
+
+def has_uncovered_event_before(
+    transcripts_dir: Path,
+    conv_key: str,
+    sequence: int,
+    covered_through_sequence: int | None,
+) -> bool:
+    """Whether a new worker would skip durable history before ``sequence``.
+
+    This is intentionally conservative: a legacy/no-sequence line or an
+    ordered event outside validated coverage prevents a new closeout summary
+    from advancing the cursor. The raw tail remains available instead.
+    """
+    base_dir = transcripts_dir / _safe_key(conv_key)
+    floor = covered_through_sequence or 0
+    if not base_dir.is_dir():
+        return False
+    for path in sorted(base_dir.glob("*.jsonl")):
+        try:
+            raw_lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for raw in raw_lines:
+            try:
+                obj = json.loads(raw)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(obj, dict):
+                continue
+            event_sequence = obj.get("sequence")
+            if not isinstance(event_sequence, int):
+                return True
+            if floor < event_sequence < sequence:
+                return True
+    return False
 
 
 def _safe_key(conv_key: str) -> str:
@@ -67,13 +167,17 @@ def transcript_tail_since(
     since_mtime: float | None,
     max_turns: int,
     max_tokens: int,
+    *,
+    covered_through_sequence: int | None = None,
 ) -> list[dict]:
-    """Return transcript lines newer than ``since_mtime``, bounded.
+    """Return explicitly uncovered transcript lines, bounded.
 
     Reads the newest one or two daily JSONL files for ``conv_key``, parses
     each line as JSON (skipping malformed lines defensively), and keeps
-    only lines whose ``ts`` is strictly newer than ``since_mtime``. If
-    ``since_mtime`` is None the whole tail is kept.
+    only events whose stable ``sequence`` is above
+    ``covered_through_sequence``. Legacy JSONL events without a sequence are
+    never filtered. ``since_mtime`` is retained only for callers of the old
+    standalone helper; runtime recovery must pass explicit coverage instead.
 
     The surviving lines are then trimmed from the END to at most
     ``max_turns`` inbound-anchored exchanges (an inbound line starts a new
@@ -85,11 +189,10 @@ def transcript_tail_since(
     if not base_dir.is_dir():
         return []
 
-    # Newest one or two daily files. Names are YYYY-MM-DD.jsonl, so a
-    # reverse lexical sort is also chronological.
-    daily = sorted(base_dir.glob("*.jsonl"), reverse=True)[:2]
-    # Read oldest-of-the-two first so the combined stream is chronological.
-    daily.reverse()
+    # Read every retained JSONL day. An old event without validated coverage
+    # must remain retrievable; trimming happens below, not by silently
+    # excluding whole days.
+    daily = sorted(base_dir.glob("*.jsonl"))
 
     lines: list[dict] = []
     for path in daily:
@@ -107,7 +210,13 @@ def transcript_tail_since(
                 continue
             if not isinstance(obj, dict):
                 continue
-            if since_mtime is not None:
+            sequence = obj.get("sequence")
+            if covered_through_sequence is not None and isinstance(sequence, int):
+                if sequence <= covered_through_sequence:
+                    continue
+            elif covered_through_sequence is None and since_mtime is not None:
+                # Compatibility path for direct legacy callers. The worker no
+                # longer uses mtimes as a correctness cursor.
                 ts = _parse_ts(obj.get("ts"))
                 if ts is None or ts <= since_mtime:
                     continue

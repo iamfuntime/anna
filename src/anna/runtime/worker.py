@@ -26,6 +26,14 @@ from anna.config import AnnaConfig
 from anna.core.eviction import evict_if_over_cap
 from anna.core.identity import CORE_FILES, CoreFile, read_core_file
 from anna.log import audit_event, get_logger
+from anna.runtime.memory import MemoryStore
+from anna.runtime.turn_watchdog import (
+    TurnWatchdog,
+    WatchdogAction,
+    hard_reminder,
+    soft_reminder,
+)
+from anna.runtime.visibility import NULL_VISIBILITY, VisibilityCallbacks
 from anna.skills.registry import SkillRegistry
 from anna.tools.delegate_server import DELEGATE_TOOL_NAMES, build_delegate_server
 from anna.tools.google_server import GOOGLE_TOOL_NAMES, GoogleTools, build_google_server
@@ -39,14 +47,6 @@ from anna.tools.slack_alerts_server import (
 from anna.tools.vault_tools import VaultTools
 from anna.tools.web_server import WEB_TOOL_NAMES, build_web_server
 from anna.tools.web_tools import WebTools
-from anna.runtime.turn_watchdog import (
-    TurnWatchdog,
-    WatchdogAction,
-    hard_reminder,
-    soft_reminder,
-)
-from anna.runtime.memory import MemoryStore
-from anna.runtime.visibility import NULL_VISIBILITY, VisibilityCallbacks
 from anna.transports.base import (
     ChannelAdapter,
     ImageAttachment,
@@ -55,7 +55,12 @@ from anna.transports.base import (
     SignalHandle,
 )
 from anna.vault.checkpoint import list_recent_checkpoints, write_checkpoint
-from anna.vault.transcript_resume import render_tail_block, transcript_tail_since
+from anna.vault.transcript_resume import (
+    has_uncovered_event_before,
+    render_tail_block,
+    transcript_tail_since,
+    validated_checkpoint_coverage,
+)
 
 if TYPE_CHECKING:
     from anna.runtime.alerter import AdminAlerter
@@ -613,6 +618,12 @@ class ConversationWorker:
         self._turns_since_checkpoint: int = 0
         self._last_checkpoint_at: datetime | None = None
         self._dirty: bool = False
+        # Only an inbound event that completed its normal turn handling may
+        # advance closeout coverage. A durable queued event is not proof that
+        # its content was presented to the summarizer.
+        self._last_processed_transcript_sequence: int | None = None
+        self._last_processed_transcript_event_id: str | None = None
+        self._coverage_advance_allowed: bool | None = None
         self.is_dm: bool = conversation_key.split(":")[1].startswith("dm") if ":" in conversation_key else False
 
     # ------------------------------------------------------------------
@@ -1780,11 +1791,12 @@ class ConversationWorker:
             tail = transcript_tail_since(
                 transcripts_dir=self._config.transcripts_dir,
                 conv_key=self.conversation_key,
-                # A bounded checkpoint is an excerpt, not proof that all
-                # older transcript events are covered.
                 since_mtime=None,
                 max_turns=ckpt_cfg.tail_max_turns,
                 max_tokens=ckpt_cfg.tail_max_tokens,
+                covered_through_sequence=validated_checkpoint_coverage(
+                    vault_root, self._config.transcripts_dir, self.conversation_key
+                ),
             )
             return render_tail_block(tail)
         except Exception as exc:  # noqa: BLE001 — never break prompt assembly
@@ -1842,7 +1854,12 @@ class ConversationWorker:
                 level="WARNING",
             )
         else:
-            await self._write_checkpoint_now(summary, kind="closeout")
+            await self._write_checkpoint_now(
+                summary,
+                kind="closeout",
+                coverage_end_sequence=self._last_processed_transcript_sequence,
+                coverage_end_event_id=self._last_processed_transcript_event_id,
+            )
 
         # ----- 2. Per-core-file eviction ---------------------------------
         # eviction.py drains ``receive_response()`` on the shared client
@@ -1882,7 +1899,13 @@ class ConversationWorker:
 
         self._log.info("worker.closeout.complete")
 
-    async def _write_checkpoint_now(self, summary: str, kind: str) -> Path | None:
+    async def _write_checkpoint_now(
+        self,
+        summary: str,
+        kind: str,
+        coverage_end_sequence: int | None = None,
+        coverage_end_event_id: str | None = None,
+    ) -> Path | None:
         """Write a checkpoint under the supervisor lock and audit it.
 
         Extracted from :meth:`_closeout` so both the graceful-close path
@@ -1910,6 +1933,8 @@ class ConversationWorker:
                     summary=summary,
                     operator_short_name=self._operator_short_name,
                     kind=kind,
+                    coverage_end_sequence=coverage_end_sequence,
+                    coverage_end_event_id=coverage_end_event_id,
                 )
             except OSError as exc:
                 self._log.error("worker.checkpoint_write_failed", error=str(exc))
@@ -2911,8 +2936,10 @@ class ConversationWorker:
         raw_event_id = event.raw.get("event_id") or event.raw.get("ts") or event.raw.get("message_id")
         self._active_memory_source_id = str(raw_event_id) if raw_event_id is not None else None
         turn_queue = self._begin_turn()
+        completed_normally = False
         try:
             await self._dispatch_turn(event, turn_queue)
+            completed_normally = True
         finally:
             self._active_memory_source_id = None
             ledger = self._notification_turn
@@ -2955,6 +2982,25 @@ class ConversationWorker:
                     tool_used=bool(ledger.tool_boundaries),
                 )
             await self._end_turn(turn_queue)
+            if completed_normally:
+                sequence = event.raw.get("anna_transcript_sequence")
+                event_id = event.raw.get("anna_transcript_event_id")
+                if isinstance(sequence, int) and sequence > 0 and isinstance(event_id, str):
+                    if self._coverage_advance_allowed is None:
+                        prior = validated_checkpoint_coverage(
+                            self._config.vault.resolved_path,
+                            self._config.transcripts_dir,
+                            self.conversation_key,
+                        )
+                        self._coverage_advance_allowed = not has_uncovered_event_before(
+                            self._config.transcripts_dir,
+                            self.conversation_key,
+                            sequence,
+                            prior,
+                        )
+                    if self._coverage_advance_allowed:
+                        self._last_processed_transcript_sequence = sequence
+                        self._last_processed_transcript_event_id = event_id
 
     async def _dispatch_turn(
         self, event: InboundEvent, turn_queue: asyncio.Queue[Any]

@@ -155,8 +155,9 @@ def test_multi_day_reads_two_files(tmp_path: Path) -> None:
     )
     result = transcript_tail_since(tmp_path, CONV_KEY, None, 8, 1500)
     texts = [o["text"] for o in result]
-    # Only the two newest daily files are read; day1 is excluded.
-    assert texts == ["day2 q", "day2 a", "day3 q"]
+    # Uncovered history remains retrievable across rotation; bounded trimming,
+    # not filename age, decides what is injected.
+    assert texts == ["very old day1", "day2 q", "day2 a", "day3 q"]
 
 
 def test_multi_day_chronological_order(tmp_path: Path) -> None:
