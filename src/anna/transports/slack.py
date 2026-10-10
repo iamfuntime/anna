@@ -136,6 +136,14 @@ class SlackAdapter(ChannelAdapter):
             self._handler.start_async(),
             name="slack.socket_mode",
         )
+        await asyncio.sleep(0)
+        if self._handler_task.done():
+            exc = self._handler_task.exception()
+            if exc is not None:
+                self._handler_task = None
+                raise RuntimeError("slack socket receiver failed during startup") from exc
+            self._handler_task = None
+            raise RuntimeError("slack socket receiver stopped during startup")
         # COUPLING: scripts/migrate-to-uv-tool.sh greps journalctl for this
         # exact "channel.connected" event (with channel="slack") as its
         # post-migration transport gate, and the setup wizard's readiness
@@ -1110,6 +1118,14 @@ class SlackAdapter(ChannelAdapter):
 
     async def health_check(self) -> bool:
         if self._client is None:
+            return False
+        if self._handler_task is None or self._handler_task.done():
+            if self._handler_task is not None and not self._handler_task.cancelled():
+                self._log.warning(
+                    "channel.receiver_stopped",
+                    channel="slack",
+                    error=str(self._handler_task.exception()),
+                )
             return False
         try:
             response = await self._client.auth_test()

@@ -15,6 +15,7 @@ import re
 import time
 import uuid
 from collections.abc import AsyncIterator
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -448,7 +449,10 @@ class ConversationWorker:
         self.transport = transport
         self._config = config
         self._supervisor = supervisor
-        self._send = send
+        self._send_callback = send
+        self._reply_address: ContextVar[tuple[str, str] | None] = ContextVar(
+            f"anna_reply_address_{conversation_key}", default=None
+        )
         self._on_idle_close = on_idle_close
         # Live transport adapters (same dict the router/alerter hold). Used by
         # the anna_slack_alerts MCP server to post through ANNA's own Slack
@@ -678,6 +682,23 @@ class ConversationWorker:
         self.last_event_received_at = datetime.now(timezone.utc)
         await self._queue.put(event)
 
+    async def _send(self, message: OutboundMessage) -> None:
+        """Send using this task's event destination, without shared mutation.
+
+        Stream-consumer/unsolicited tasks have no active inbound context. They
+        intentionally fall back to this worker's creation transport, which is
+        also compatible with the existing canonical-key adapter reverse map.
+        """
+        address = self._reply_address.get()
+        transport, conversation_key = address or (self.transport, message.conversation_key)
+        await self._send_callback(
+            dataclasses.replace(
+                message,
+                transport=message.transport or transport,
+                conversation_key=conversation_key if address else message.conversation_key,
+            )
+        )
+
     # ------------------------------------------------------------------
     # Inner loop
     # ------------------------------------------------------------------
@@ -735,31 +756,17 @@ class ConversationWorker:
             while not self._stopping:
                 event = await self._queue.get()
                 try:
-                    # A canonical worker may receive events from several
-                    # transports.  Scope its normal send callback to the
-                    # event being handled so every final/drip/watchdog reply
-                    # returns to that event's original destination.
-                    inherited_send = self._send
-
-                    async def _send_to_event(
-                        message: OutboundMessage,
-                        send_callback: SendCallback = inherited_send,
-                        reply_key: str = event.reply_conversation_key or event.conversation_key,
-                        reply_transport: str = event.reply_transport or event.transport,
-                    ) -> None:
-                        await send_callback(
-                            dataclasses.replace(
-                                message,
-                                conversation_key=reply_key,
-                                transport=reply_transport,
-                            )
-                        )
-
-                    self._send = _send_to_event
+                    # Context-local state follows watchdog/drip tasks spawned
+                    # by this turn, without leaking its address to the stream
+                    # consumer or another concurrent task.
+                    reply_token = self._reply_address.set((
+                        event.reply_transport or event.transport,
+                        event.reply_conversation_key or event.conversation_key,
+                    ))
                     try:
                         await self._handle(event)
                     finally:
-                        self._send = inherited_send
+                        self._reply_address.reset(reply_token)
                 finally:
                     self.last_event_processed_at = datetime.now(timezone.utc)
                     self.last_active = self.last_event_processed_at

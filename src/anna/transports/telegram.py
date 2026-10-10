@@ -154,6 +154,18 @@ class TelegramAdapter(ChannelAdapter):
             self._application.updater.start_polling(),
             name="telegram.polling",
         )
+        # ``start_polling`` is asynchronous; logging connected immediately
+        # after task creation used to report a healthy receiver even when it
+        # failed before its first await. Yield once and surface such a failure
+        # to startup rather than creating a permanently-dead receiver.
+        await asyncio.sleep(0)
+        if self._updater_task.done():
+            exc = self._updater_task.exception()
+            if exc is not None:
+                self._updater_task = None
+                raise RuntimeError("telegram polling failed during startup") from exc
+            self._updater_task = None
+            raise RuntimeError("telegram polling stopped during startup")
         self._connect_attempt += 1
         bot_username = ""
         try:
@@ -609,6 +621,14 @@ class TelegramAdapter(ChannelAdapter):
 
     async def health_check(self) -> bool:
         if self._application is None:
+            return False
+        if self._updater_task is None or self._updater_task.done():
+            if self._updater_task is not None and not self._updater_task.cancelled():
+                self._log.warning(
+                    "channel.receiver_stopped",
+                    channel="telegram",
+                    error=str(self._updater_task.exception()),
+                )
             return False
         try:
             await self._application.bot.get_me()

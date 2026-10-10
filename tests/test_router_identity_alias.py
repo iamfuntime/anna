@@ -25,6 +25,7 @@ from anna.runtime.router import (
     _identifier_from_event,
 )
 from anna.runtime.supervisor import Supervisor
+from anna.runtime.worker import ConversationWorker
 from anna.transports.base import InboundEvent, OutboundMessage
 
 
@@ -158,6 +159,29 @@ async def test_shared_owner_reply_callback_uses_each_event_address(tmp_path) -> 
 
     assert [message.conversation_key for message in slack.sent] == ["slack:dm:USLACK"]
     assert [message.conversation_key for message in telegram.sent] == ["telegram:dm:12345"]
+
+
+async def test_unsolicited_shared_owner_send_falls_back_to_worker_transport(tmp_path) -> None:
+    """Idle stream sends have no event context but must still be deliverable."""
+    slack = _RecordingAdapter()
+    router = _make_router(
+        tmp_path,
+        identities=[IdentityAliasEntry(canonical="seth", slack_user_id="USLACK")],
+    )
+    router._adapters = {"slack": slack}  # type: ignore[assignment]
+    worker = ConversationWorker(
+        conversation_key="user:seth",
+        transport="slack",
+        config=router._config,
+        supervisor=router._supervisor,
+        send=router._send_factory(),
+    )
+
+    await worker._send(OutboundMessage(conversation_key="user:seth", text="late result"))
+
+    assert len(slack.sent) == 1
+    assert slack.sent[0].transport == "slack"
+    assert slack.sent[0].conversation_key == "user:seth"
 
 
 def _cli_oneshot_event(uuid_str: str, username: str) -> InboundEvent:
