@@ -9,6 +9,7 @@ GoogleClients.
 from __future__ import annotations
 
 import json
+import stat
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -23,7 +24,6 @@ from anna.tools.google_auth import (
     load_oauth_credentials,
     load_service_account_credentials,
 )
-
 
 # ---------------------------------------------------------------------------
 # Config validation
@@ -251,16 +251,21 @@ def test_load_oauth_refreshes_expired_creds_and_persists(tmp_path: Path) -> None
     fake_creds.refresh_token = "abc"
     fake_creds.to_json.return_value = '{"refreshed": true}'
 
+    request = MagicMock(return_value=object())
     with patch(
         "google.oauth2.credentials.Credentials.from_authorized_user_file",
         return_value=fake_creds,
-    ):
+    ), patch("google.auth.transport.requests.Request", return_value=request):
         result = load_oauth_credentials(cfg, acct)
 
     assert result is fake_creds
     fake_creds.refresh.assert_called_once()
+    refresh_request = fake_creds.refresh.call_args.args[0]
+    refresh_request("https://oauth.example.test/token", method="POST")
+    request.assert_called_once_with("https://oauth.example.test/token", method="POST", timeout=30.0)
     # The refreshed token should have been re-persisted.
     assert token_path.read_text(encoding="utf-8") == '{"refreshed": true}'
+    assert stat.S_IMODE(token_path.stat().st_mode) == 0o600
 
 
 def test_load_oauth_errors_when_refresh_token_missing(tmp_path: Path) -> None:

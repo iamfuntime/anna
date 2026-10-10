@@ -152,23 +152,58 @@ uv run --extra dev pytest -q
 1,397 passed, 1 skipped, 1 warning in 22.67s
 ```
 
-Google call isolation is complete for the read-only tool surface. Each
-`(account, API)` has one bounded single-worker executor: discovery, credential
-refresh, request construction, and synchronous `execute()` stay on that owner
-thread. Calls have a 30-second deadline; timeout/cancellation does not claim
-an uncertain remote result and cannot create more than that account/API's one
-owner thread. Shutdown closes queued executor work after workers stop.
+Google isolation was strengthened after review of the initial executor design.
+One single-worker owner lane is now allocated only after a configured account
+slug is validated, and that lane is shared by Gmail and Calendar for the same
+account. Discovery, OAuth refresh, request construction, cached resources,
+and synchronous `execute()` therefore remain on that account owner thread;
+different accounts can still progress in parallel. Each lane accepts at most
+two calls (one running and one asyncio-queued), so the executor's unbounded
+submission queue is not exposed. A caller deadline returns a timeout without
+claiming an uncertain remote result, but intentionally retains lane ownership
+until the already-running synchronous call exits; Python cannot safely kill a
+blocked provider thread.
 
-Focused tests cover event-loop heartbeat progress, same-account serialization,
-different-account progress, timeout/queued-work cleanup, and result
-compatibility. `ruff check` is clean for touched Google code; targeted `mypy`
-is blocked only because installed `googleapiclient.discovery` lacks typing
-metadata. No dependency was changed.
+`httplib2.Http(timeout=30)` is newly owned per account/API resource and wrapped
+in `google_auth_httplib2.AuthorizedHttp`, so discovery, API I/O, and automatic
+credential refresh receive the bounded transport. Explicit OAuth refresh also
+wraps its request callable with the same deadline. Refreshed and newly
+authorized OAuth token JSON is atomically replaced with mode `0600`. Public
+synchronous `gmail()`/`calendar()` access now rejects rather than leaking a
+thread-owned transport. Invalidation records an owner-thread eviction; close
+rejects new calls and queues one owner-thread cached-resource cleanup after any
+in-flight I/O. `wait=False` remains non-blocking and cannot forcibly terminate
+an existing socket operation.
+
+Focused validation for this follow-up was:
+
+```text
+uv run --extra dev pytest -q tests/test_google_clients_async.py \
+  tests/test_google_auth.py tests/test_google_server.py tests/test_worker_tool_wiring.py
+69 passed in 0.82s
+
+uv run --extra dev ruff check src/anna/tools/google_clients.py \
+  src/anna/tools/google_auth.py tests/test_google_clients_async.py \
+  tests/test_google_auth.py
+All checks passed
+```
+
+The focused regressions cover heartbeat progress, same-account Gmail/Calendar
+serialization, cross-account progress, bounded queue rejection, cancelled
+queued calls, timeout ownership retention, configured HTTP timeout, unknown
+slug rejection before allocation, and invalidate/close during in-flight work.
+Targeted `mypy` still reports pre-existing missing third-party Google typing
+metadata and existing Any-return warnings in `google_auth.py`; no dependency
+or ignore was added just to silence them.
+
+Full isolated validation after this follow-up:
 
 ```text
 uv run --extra dev pytest -q
-1,400 passed, 1 skipped, 1 warning in 22.48s
+1,405 passed, 1 skipped, 1 warning in 22.61s
 ```
+
+The warning is the existing Starlette `TestClient`/httpx deprecation warning.
 
 Migration/rollback: `state/memory.sqlite3` is created automatically with a
 version-1 ledger and WAL mode. It is additive; rollback is to stop using the
@@ -244,7 +279,9 @@ additive and preserve pending records across downgrade/restart.
 - Exact checkpoint coverage is deliberately conservative for now: legacy and
   bounded checkpoints do not suppress transcript replay.
 - Receiver readiness/liveness and Google `.execute()` thread isolation are
-  implemented for the current read-only Google tools.
+  implemented for the current read-only Google tools. Google shutdown cannot
+  make a hung third-party socket exactly-once or forcibly stop its thread; it
+  bounds accepted work, preserves serialization, and cleans up when it exits.
 - Memory persistence/retrieval and explicit fact tools are implemented, but
   extraction jobs, source import, durable tasks/runs/outbox, heartbeat, and
   repair UX remain.

@@ -21,6 +21,8 @@ checkout without google deps installed.
 
 from __future__ import annotations
 
+import os
+import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -81,7 +83,9 @@ def find_account(config: AnnaConfig, slug: str) -> GoogleAccountConfig:
 def load_oauth_credentials(
     config: AnnaConfig,
     account: GoogleAccountConfig,
-) -> "OAuthCredentials":
+    *,
+    timeout_seconds: float = 30.0,
+) -> OAuthCredentials:
     """Load and refresh OAuth credentials for a personal account.
 
     Reads the persisted token JSON at ``state/google/token_<slug>.json``,
@@ -125,7 +129,17 @@ def load_oauth_credentials(
                 f"refresh_token; re-run: python -m anna.setup.google_auth add {account.slug}"
             )
         try:
-            creds.refresh(Request())
+            # ``Request`` accepts a timeout when it is *called*, not when it
+            # is constructed. Credentials.refresh only receives a callable,
+            # so wrap it to enforce this runtime deadline for the token HTTP
+            # request as well as the discovery/API transport.
+            request = Request()
+
+            def bounded_request(*args: Any, **kwargs: Any) -> Any:
+                kwargs["timeout"] = timeout_seconds
+                return request(*args, **kwargs)
+
+            creds.refresh(bounded_request)
         except Exception as exc:
             raise GoogleAuthError(
                 f"failed to refresh OAuth token for {account.slug!r}: {exc}; "
@@ -133,11 +147,7 @@ def load_oauth_credentials(
             ) from exc
         # Persist the refreshed expiry so we don't refresh on every call.
         try:
-            token_path.write_text(creds.to_json(), encoding="utf-8")
-            try:
-                token_path.chmod(0o600)
-            except OSError:
-                pass
+            _atomic_private_write(token_path, creds.to_json())
             log.debug("google.oauth.refresh_persisted")
         except OSError as exc:
             log.warning("google.oauth.refresh_persist_failed", error=str(exc))
@@ -148,7 +158,7 @@ def load_oauth_credentials(
 def load_service_account_credentials(
     config: AnnaConfig,
     account: GoogleAccountConfig,
-) -> "SACredentials":
+) -> SACredentials:
     """Load a service-account key and apply domain-wide-delegation impersonation.
 
     Per-Workspace DWD must have been authorized in the Workspace admin
@@ -184,15 +194,38 @@ def load_service_account_credentials(
 def load_credentials(
     config: AnnaConfig,
     account: GoogleAccountConfig,
-) -> "AnyGoogleCredentials":
+    *,
+    timeout_seconds: float = 30.0,
+) -> AnyGoogleCredentials:
     """Auth-type-dispatching loader. The high-level entry point."""
     if account.auth_type == "oauth":
-        return load_oauth_credentials(config, account)
+        if timeout_seconds == 30.0:
+            return load_oauth_credentials(config, account)
+        return load_oauth_credentials(config, account, timeout_seconds=timeout_seconds)
     if account.auth_type == "service_account":
         return load_service_account_credentials(config, account)
     raise GoogleAuthError(
         f"unknown auth_type {account.auth_type!r} for account {account.slug!r}"
     )
+
+
+def _atomic_private_write(path: Path, content: str) -> None:
+    """Replace credential JSON atomically and keep restrictive permissions."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def run_oauth_install_flow(
@@ -241,11 +274,7 @@ def run_oauth_install_flow(
     )
 
     token_path = config.google_token_path(account)
-    token_path.write_text(creds.to_json(), encoding="utf-8")
-    try:
-        token_path.chmod(0o600)
-    except OSError:
-        pass
+    _atomic_private_write(token_path, creds.to_json())
     return token_path
 
 
