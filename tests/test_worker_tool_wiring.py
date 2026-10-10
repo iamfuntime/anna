@@ -28,6 +28,7 @@ from anna.runtime.worker import (
 from anna.skills.registry import SkillRegistry
 from anna.tools.delegate_server import DELEGATE_TOOL_NAMES
 from anna.tools.google_server import GOOGLE_TOOL_NAMES
+from anna.tools.memory_server import MEMORY_TOOL_NAMES
 from anna.tools.self_edit_server import SELF_EDIT_TOOL_NAMES
 from anna.tools.slack_alerts_server import SLACK_ALERTS_TOOL_NAMES
 from anna.tools.web_server import WEB_TOOL_NAMES
@@ -111,7 +112,8 @@ def test_build_options_includes_default_fs_self_edit_and_web_tools(tmp_path: Pat
     expected = (
         list(_DEFAULT_FS_TOOLS)
         + [f"{_SELF_EDIT_PREFIX}{name}" for name in SELF_EDIT_TOOL_NAMES]
-        + [f"{_SLACK_ALERTS_PREFIX}{name}" for name in SLACK_ALERTS_TOOL_NAMES]
+            + [f"{_SLACK_ALERTS_PREFIX}{name}" for name in SLACK_ALERTS_TOOL_NAMES]
+            + [f"mcp__anna_memory__{name}" for name in MEMORY_TOOL_NAMES]
         + [f"{_WEB_PREFIX}{name}" for name in WEB_TOOL_NAMES]
     )
     assert sorted(options.allowed_tools) == sorted(expected)
@@ -155,7 +157,8 @@ def test_build_options_mounts_google_server_when_enabled(tmp_path: Path) -> None
     expected = (
         list(_DEFAULT_FS_TOOLS)
         + [f"{_SELF_EDIT_PREFIX}{name}" for name in SELF_EDIT_TOOL_NAMES]
-        + [f"{_SLACK_ALERTS_PREFIX}{name}" for name in SLACK_ALERTS_TOOL_NAMES]
+            + [f"{_SLACK_ALERTS_PREFIX}{name}" for name in SLACK_ALERTS_TOOL_NAMES]
+            + [f"mcp__anna_memory__{name}" for name in MEMORY_TOOL_NAMES]
         + [f"{_GOOGLE_PREFIX}{name}" for name in GOOGLE_TOOL_NAMES]
         + [f"{_WEB_PREFIX}{name}" for name in WEB_TOOL_NAMES]
     )

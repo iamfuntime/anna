@@ -29,6 +29,7 @@ from anna.log import audit_event, get_logger
 from anna.skills.registry import SkillRegistry
 from anna.tools.delegate_server import DELEGATE_TOOL_NAMES, build_delegate_server
 from anna.tools.google_server import GOOGLE_TOOL_NAMES, GoogleTools, build_google_server
+from anna.tools.memory_server import MEMORY_TOOL_NAMES, MemoryTools, build_memory_server
 from anna.tools.self_edit_server import SELF_EDIT_TOOL_NAMES, SelfEditTools, build_self_edit_server
 from anna.tools.slack_alerts_server import (
     SLACK_ALERTS_TOOL_NAMES,
@@ -73,6 +74,7 @@ _SLACK_ALERTS_PREFIX = "mcp__anna_slack_alerts__"
 _GOOGLE_PREFIX = "mcp__anna_google__"
 _WEB_PREFIX = "mcp__anna_web__"
 _DELEGATE_PREFIX = "mcp__anna_delegate__"
+_MEMORY_PREFIX = "mcp__anna_memory__"
 
 
 def _tool_belongs_to_servers(tool_name: str, server_names: set[str]) -> bool:
@@ -95,6 +97,7 @@ def _allowed_tool_names(
     include_google: bool,
     include_web: bool,
     include_delegate: bool = False,
+    include_memory: bool = True,
 ) -> list[str]:
     names = (
         list(_DEFAULT_FS_TOOLS)
@@ -107,6 +110,8 @@ def _allowed_tool_names(
         names.extend(f"{_WEB_PREFIX}{name}" for name in WEB_TOOL_NAMES)
     if include_delegate:
         names.extend(f"{_DELEGATE_PREFIX}{name}" for name in DELEGATE_TOOL_NAMES)
+    if include_memory:
+        names.extend(f"{_MEMORY_PREFIX}{name}" for name in MEMORY_TOOL_NAMES)
     return names
 
 
@@ -899,10 +904,24 @@ class ConversationWorker:
             tools=slack_alert_tools,
             conv_key=self.conversation_key,
         )
+        owner_id = self.conversation_key.removeprefix("user:")
+        memory_scope = (
+            "private" if self.conversation_key.startswith("user:")
+            else f"group:{self.conversation_key}"
+        )
+        memory_server = build_memory_server(
+            tools=MemoryTools(
+                self._memory_store,
+                owner_id=owner_id,
+                scope=memory_scope,
+                source_event_id=None,
+            )
+        )
 
         mcp_servers: dict[str, Any] = {
             "anna_self_edit": self_edit_server,
             "anna_slack_alerts": slack_alerts_server,
+            "anna_memory": memory_server,
         }
         include_google = False
         if self._google_clients is not None and self._config.google.enabled:
