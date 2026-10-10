@@ -252,7 +252,7 @@ class SlackAdapter(ChannelAdapter):
                 # pass through untouched. This is the single shared send path
                 # the slack_post MCP tool also routes through, so report cards
                 # and skill posts are normalized here too.
-                mrkdwn_text = normalize_to_slack_mrkdwn(message.text)
+                mrkdwn_text = message.text if message.plain else normalize_to_slack_mrkdwn(message.text)
                 # Length splitting (Inbox/2026-06-04 plan, decision C): a
                 # single oversized reply is posted as a sequence of messages
                 # under Slack's practical cap instead of being degraded. Most

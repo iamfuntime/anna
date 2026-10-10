@@ -484,6 +484,61 @@ new files; mypy clean except the existing missing `croniter` stubs. Not exercise
 Google account (by design). Deferred: SDK-backed classifier, dashboard view of receipts, Gmail
 push/watch, calendar sync tokens.
 
+## Phase 3: `anna doctor`, health/repairs/memory dashboard pages
+
+**Doctor** (`anna doctor [--json]`, also `/health` and `/health.json`): offline and read-only. It
+reads only local files: the daemon's status snapshot (`state/runtime-status.json`, new,
+0600, atomic), a *copy* of `runtime.sqlite3` / `memory.sqlite3` (copying avoids the WAL side
+files even a read-only SQLite connection would create next to the originals) and config. It never
+reads secret values (only "is variable X set"), never calls Google/Slack/Telegram, never runs a
+model, and never creates or modifies anything unless the operator uses an explicit repair.
+Exit code: 0 ok, 1 warn or unverified, 2 failure. Statuses: `ok` (observed working), `warn`,
+`FAIL`, `??` (not verified; **never assumed healthy**), `--` (disabled).
+
+| area | source of truth | honest rules |
+| --- | --- | --- |
+| daemon | snapshot age + pid | missing = `??`; dead pid without clean stop = FAIL; stale snapshot = FAIL (hung) |
+| transports | watchdog records `receiver_alive` and `api_ok` separately (`health_detail()`) | config-enabled + creds present but never verified = `??`; **dead receiver with a valid token = FAIL ("receiver is NOT running")**; stale check = warn |
+| Claude SDK | worker records the last REAL completed turn / failed turn | untested = `??`; failure newer than success = FAIL; success older than 24h = warn (stale). The watchdog's "construct a client" check is reported as not verifying credentials |
+| Google per account/service | latest `heartbeat_receipts` row | no receipt = `??` (listing in config proves nothing); `auth_required` = FAIL with the setup command; stale = warn |
+| heartbeat | latest finished `google_heartbeat` occurrence | complete / PARTIAL / FAILED / auth required, with age |
+| runs | ledger occurrences | unknown/blocked runs = warn with "never re-run automatically"; runs past lease; queue ages |
+| deliveries | ledger outbox | pending age, uncertain/failed counts and oldest age; message bodies never shown |
+| memory | memory DB + runner state | active/forgotten/superseded counts, extraction queue (pending/running/dead + redacted recent errors), conflict/held candidates; "enabled in config but runner NOT running" is a warn with the reason |
+
+**Dashboard** (`/health`, `/repairs`, `/memory`; localhost-only unchanged, `SameOriginMiddleware`
+unchanged and covering every new POST; the surface-contract test pins the three new mutating routes):
+- `/repairs` lists unknown/blocked runs and uncertain/failed deliveries (ids, ages, sizes, destinations; no bodies).
+  Actions: runs - verified completed / verified nothing happened / cannot tell (closed as
+  `resolved_unknown`); uncertain deliveries - verified delivered / verified NOT delivered, resend /
+  abandon; failed deliveries - retry / abandon. There is no rerun and no blind resend. Each needs the
+  exact typed phrase (e.g. `RESEND OUTBOX 12`) and pins the status the operator saw.
+- **Daemon-owned mutation:** the dashboard only INSERTs an intent into `repair_requests`
+  (ledger schema v3, additive); the scheduler poll in the daemon validates it against the row's
+  CURRENT status and applies it (`RuntimeLedger.apply_repairs`, audited as
+  `audit.schedule.repair_applied`). Stale or illegal intents are rejected with a reason; a stopped
+  daemon leaves requests visibly waiting ("restart the daemon").
+- `/memory` requires an explicit owner + scope selection (never lists across scopes) and calls
+  `MemoryStore.correct/forget` with that owner/scope: same `BEGIN IMMEDIATE` invariants (active facts
+  only, atomic supersede, no revive/fork). This is safe SQLite coordination, not a competing
+  scheduler writer. Audit rows carry fact ids and scope only, never fact text.
+
+Isolated setup: `ANNA_HOME=$(mktemp -d) uv run --extra dev pytest -q tests/test_doctor.py tests/test_web_ops.py`;
+real use: restart the daemon once (it writes the status file and migrates the ledger to v3 after
+backing it up as `runtime.sqlite3.bak-v2-<ts>`), then `anna doctor` / open `/health`.
+Rollback: stop using the pages; the new tables/file are additive and ignored by older builds
+(restore the ledger backup if reverting the code; `runtime-status.json` can simply be deleted).
+
+Review fixes folded in here (heartbeat commit `cf72508`): heartbeat output goes only to destinations in
+`heartbeat.allowed_destinations` (checked on create, update and every run - an agent tool cannot redirect
+mail summaries), Slack control syntax in untrusted mail text is escaped, and heartbeat messages are
+sent `plain=True` so the Slack adapter's Markdown converter cannot turn `[x](url)` in a subject into a
+live link. The review notice listed a third finding that was truncated; it could not be addressed.
+
+Validation: full suite 1,589 passed, 1 skipped; ruff clean on new files; mypy clean on new modules.
+Not done (by scope): Google connect/reconnect UI, live provider verification, dashboard polling of
+the status file for push updates.
+
 ## Deferred milestones
 
 1. **Phase 0:** finish exact event coverage/replay.

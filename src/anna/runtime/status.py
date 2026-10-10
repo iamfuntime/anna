@@ -16,7 +16,7 @@ import re
 import tempfile
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -31,7 +31,7 @@ def redact(text: str, limit: int = 120) -> str:
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return datetime.now(UTC).isoformat(timespec="seconds")
 
 
 class StatusRecorder:
@@ -87,7 +87,8 @@ class StatusRecorder:
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
-            return json.loads(json.dumps(self._data))
+            snap: dict[str, Any] = json.loads(json.dumps(self._data))
+            return snap
 
     def flush(self, *, force: bool = False) -> None:
         now = time.monotonic()

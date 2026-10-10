@@ -647,3 +647,21 @@ async def test_slack_markup_in_untrusted_mail_is_inert(tmp_path):
     assert "<!channel>" not in text and "<@U123>" not in text and "<https" not in text and "&lt;!channel&gt;" in text
     from anna.runtime.heartbeat import escape_for_transport
     assert escape_for_transport("telegram", "a <b> & c") == "a <b> & c"
+
+
+async def test_markdown_in_untrusted_subject_never_becomes_a_slack_link(tmp_path):
+    """Review finding: the Slack adapter's Markdown->mrkdwn converter would turn [x](url) into <url|x>."""
+    from anna.transports.mrkdwn import normalize_to_slack_mrkdwn
+    e = await Env(tmp_path).start()
+    e.prov.add_mail("personal", "m1", subject="[Reset your password](https://evil.test/login) **urgent**")
+    await e.tick()
+    [msg] = e.adapter.sent
+    assert msg.plain is True                                   # adapters must skip Markdown conversion
+    assert normalize_to_slack_mrkdwn(msg.text) != msg.text     # i.e. the converter WOULD have rewritten it
+
+
+def test_slack_adapter_skips_markdown_normalisation_for_plain_messages():
+    import inspect
+    from anna.transports.slack import SlackAdapter
+    src = inspect.getsource(SlackAdapter.send)
+    assert "message.plain" in src

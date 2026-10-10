@@ -41,6 +41,7 @@ from anna_web.routes import (
     delegation_routes,
     env_routes,
     healthz_routes,
+    ops_routes,
     restart_routes,
     schedule_routes,
     settings_routes,
@@ -145,6 +146,7 @@ def create_app(cfg: AnnaConfig) -> FastAPI:
     app.include_router(env_routes.router)
     app.include_router(schedule_routes.router)
     app.include_router(healthz_routes.router)
+    app.include_router(ops_routes.router)
     app.include_router(restart_routes.router)
     app.include_router(settings_routes.router)
 

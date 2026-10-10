@@ -218,6 +218,10 @@ class OutboundMessage:
     # address in ``conversation_key`` (an aliased owner replies to a channel but
     # their transcript belongs to ``user:<canonical>``).
     transcript_conversation_key: str | None = None
+    # Text already contains inert, untrusted provider data (mail subjects etc.):
+    # transports must NOT run Markdown->mrkdwn conversion, which would turn
+    # ``[x](url)`` in a subject into a live link.
+    plain: bool = False
 
 
 @dataclass

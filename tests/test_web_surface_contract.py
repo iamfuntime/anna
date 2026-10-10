@@ -58,6 +58,13 @@ ALLOWED_MUTATING_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("PUT", "/schedules/{schedule_id}"),
         ("DELETE", "/schedules/{schedule_id}"),
         ("POST", "/restart"),
+        # Phase 3 operations pages (reviewed, intentional): /health is GET-only; these
+        # three are operator decisions. Repairs only QUEUE an intent for the daemon
+        # (confirmation phrase + stale-state check); memory edits go through MemoryStore's
+        # transactional correct/forget with an explicit owner/scope. Same-origin enforced.
+        ("POST", "/repairs/{kind}/{target_id}"),
+        ("POST", "/memory/{fact_id}/correct"),
+        ("POST", "/memory/{fact_id}/forget"),
     }
 )
 

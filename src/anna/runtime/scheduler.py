@@ -710,7 +710,8 @@ class Scheduler:
             await asyncio.wait_for(
                 adapter.send(OutboundMessage(
                     conversation_key=self._dest_conv_key(transport=item.transport, channel=item.channel),
-                    text=item.text)),
+                    text=item.text,
+                    plain=self._ledger.get(item.occurrence_id).job_kind != "agent_prompt")),
                 timeout=cfg.send_timeout_seconds)
         except asyncio.CancelledError:
             # Interrupted mid-send: delivery unknown. Never resend automatically.

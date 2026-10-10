@@ -75,6 +75,7 @@ _CLI_SUBCOMMANDS: dict[str, str] = {
     "chat": "anna.cli.chat",
     "ask": "anna.cli.ask",
     "admin": "anna.cli.admin",
+    "doctor": "anna.cli.doctor",
 }
 
 
