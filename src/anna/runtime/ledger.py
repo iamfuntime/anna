@@ -1,0 +1,540 @@
+"""Durable runtime ledger for scheduled work (SQLite, WAL).
+
+Three record kinds, deliberately separate so *execution* and *delivery* never
+share a status:
+
+* ``schedule_occurrences`` - one row per ``(schedule_id, scheduled_for)``; the
+  UNIQUE key is the idempotency guard against double dispatch and replayed cron
+  ticks.  ``exec_status`` is the execution outcome, ``delivery_status`` is
+  derived from the outbox.
+* ``schedule_runs`` - one row per execution attempt, carrying the typed result.
+* ``schedule_outbox`` - one row per destination chunk with attempts, next retry
+  and the provider outcome.  Delivery retries touch only these rows; they never
+  re-run execution.
+
+Leases make claims recoverable.  Recovery rules (see ``recover_expired``):
+a claim that never started running is safe to re-pend; an interrupted
+``read_only`` run may be retried a bounded number of times; an interrupted
+``side_effecting`` run is marked ``unknown`` and is NEVER re-run; a send that
+was in flight is ``uncertain`` and is NEVER re-sent automatically.
+
+Only the daemon mutates this file.  Everything is additive and stored apart
+from ``schedules.yaml`` so a dashboard rewrite of the YAML cannot clobber it.
+"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any
+
+from croniter import croniter
+
+ACTIVE_EXEC = ("claimed", "running")
+TERMINAL_EXEC = ("succeeded", "failed", "timeout", "cancelled", "unknown", "blocked",
+                 "skipped_overlap", "skipped_misfire")
+MAX_RECORDED_MISFIRES = 20
+
+
+def iso(dt: datetime) -> str:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC).isoformat(timespec="microseconds")
+
+
+def parse(value: str) -> datetime:
+    return datetime.fromisoformat(value)
+
+
+def now_utc() -> datetime:
+    return datetime.now(UTC)
+
+
+@dataclass(frozen=True)
+class Occurrence:
+    id: int
+    schedule_id: str
+    scheduled_for: str
+    trigger: str
+    job_kind: str
+    run_safety: str
+    exec_status: str
+    delivery_status: str
+    attempts: int
+    lease_owner: str | None
+    lease_expires_at: str | None
+    detail: str | None
+
+
+@dataclass(frozen=True)
+class OutboxItem:
+    id: int
+    occurrence_id: int
+    schedule_id: str
+    transport: str
+    channel: str
+    chunk_index: int
+    chunk_count: int
+    text: str
+    attempts: int
+
+
+@dataclass(frozen=True)
+class Recovery:
+    occurrence_id: int
+    schedule_id: str
+    action: str  # repended | unknown | skipped | failed
+    detail: str
+
+
+def split_chunks(text: str, limit: int) -> list[str]:
+    """Split on line boundaries into pieces of at most ``limit`` characters."""
+    if len(text) <= limit:
+        return [text]
+    chunks: list[str] = []
+    current = ""
+    for line in text.splitlines(keepends=True):
+        while len(line) > limit:
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.append(line[:limit])
+            line = line[limit:]
+        if len(current) + len(line) > limit:
+            chunks.append(current)
+            current = ""
+        current += line
+    if current:
+        chunks.append(current)
+    return [c for c in chunks if c.strip()] or [text[:limit]]
+
+
+class RuntimeLedger:
+    def __init__(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._path = path
+        self._conn = sqlite3.connect(path, timeout=10)
+        self._conn.row_factory = sqlite3.Row
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA foreign_keys=ON")
+        self._migrate()
+
+    def close(self) -> None:
+        self._conn.close()
+
+    @property
+    def path(self) -> Path:
+        return self._path
+
+    # ------------------------------------------------------------------ schema
+
+    def _migrate(self) -> None:
+        with self._conn:
+            self._conn.execute("CREATE TABLE IF NOT EXISTS ledger_migrations "
+                               "(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)")
+        applied = {r[0] for r in self._conn.execute("SELECT version FROM ledger_migrations")}
+        if 1 not in applied:
+            self._migrate_v1()
+
+    def backup(self, dest: Path) -> Path:
+        if dest.exists():
+            raise FileExistsError(dest)
+        target = sqlite3.connect(dest)
+        try:
+            self._conn.backup(target)
+        finally:
+            target.close()
+        return dest
+
+    def _migrate_v1(self) -> None:
+        with self._conn:
+            self._conn.execute("""CREATE TABLE schedule_cursors (
+                schedule_id TEXT PRIMARY KEY, last_scheduled_for TEXT NOT NULL, updated_at TEXT NOT NULL)""")
+            self._conn.execute("""CREATE TABLE schedule_occurrences (
+                id INTEGER PRIMARY KEY, schedule_id TEXT NOT NULL, scheduled_for TEXT NOT NULL,
+                trigger TEXT NOT NULL DEFAULT 'cron', job_kind TEXT NOT NULL, run_safety TEXT NOT NULL,
+                exec_status TEXT NOT NULL, delivery_status TEXT NOT NULL DEFAULT 'none',
+                attempts INTEGER NOT NULL DEFAULT 0, lease_owner TEXT, lease_expires_at TEXT, detail TEXT,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL, started_at TEXT, finished_at TEXT,
+                UNIQUE(schedule_id, scheduled_for))""")
+            self._conn.execute("CREATE INDEX occ_status ON schedule_occurrences(exec_status, lease_expires_at)")
+            self._conn.execute("""CREATE TABLE schedule_runs (
+                id INTEGER PRIMARY KEY, occurrence_id INTEGER NOT NULL REFERENCES schedule_occurrences(id),
+                attempt INTEGER NOT NULL, status TEXT NOT NULL, side_effects TEXT NOT NULL DEFAULT 'unknown',
+                owner TEXT, started_at TEXT NOT NULL, finished_at TEXT, result_json TEXT, error TEXT)""")
+            self._conn.execute("""CREATE TABLE schedule_outbox (
+                id INTEGER PRIMARY KEY, occurrence_id INTEGER NOT NULL REFERENCES schedule_occurrences(id),
+                run_id INTEGER REFERENCES schedule_runs(id), schedule_id TEXT NOT NULL,
+                transport TEXT NOT NULL, channel TEXT NOT NULL, chunk_index INTEGER NOT NULL,
+                chunk_count INTEGER NOT NULL, text TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT NOT NULL, lease_expires_at TEXT,
+                provider_outcome TEXT, last_error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                UNIQUE(occurrence_id, chunk_index))""")
+            self._conn.execute("CREATE INDEX outbox_due ON schedule_outbox(status, next_attempt_at)")
+            self._conn.execute("INSERT INTO ledger_migrations(version, applied_at) VALUES(1, ?)", (iso(now_utc()),))
+
+    # ------------------------------------------------------------- occurrences
+
+    @staticmethod
+    def _occ(row: sqlite3.Row) -> Occurrence:
+        return Occurrence(**{k: row[k] for k in Occurrence.__dataclass_fields__})
+
+    def get(self, occurrence_id: int) -> Occurrence:
+        row = self._conn.execute("SELECT * FROM schedule_occurrences WHERE id=?", (occurrence_id,)).fetchone()
+        if row is None:
+            raise KeyError(occurrence_id)
+        return self._occ(row)
+
+    def _insert_occurrence(self, *, schedule_id: str, scheduled_for: datetime, trigger: str, job_kind: str,
+                           run_safety: str, status: str, detail: str | None) -> int | None:
+        now = iso(now_utc())
+        cur = self._conn.execute(
+            "INSERT OR IGNORE INTO schedule_occurrences(schedule_id,scheduled_for,trigger,job_kind,run_safety,"
+            "exec_status,detail,created_at,updated_at,finished_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (schedule_id, iso(scheduled_for), trigger, job_kind, run_safety, status, detail, now, now,
+             now if status in TERMINAL_EXEC else None))
+        return int(cur.lastrowid or 0) if cur.rowcount else None
+
+    def cursor(self, schedule_id: str) -> datetime | None:
+        row = self._conn.execute("SELECT last_scheduled_for FROM schedule_cursors WHERE schedule_id=?",
+                                 (schedule_id,)).fetchone()
+        return parse(row[0]) if row else None
+
+    def materialize(self, *, schedule_id: str, cron: str, tz: Any, baseline: datetime, now: datetime,
+                    job_kind: str, run_safety: str, overlap: str, misfire: str, grace_seconds: int) -> list[int]:
+        """Create the occurrence(s) now due for a schedule; one transaction.
+
+        ``baseline`` seeds the cursor the first time a schedule is seen (legacy
+        ``last_fired_at`` or ``created_at``).  Only the newest due tick may run;
+        older missed ticks are recorded ``skipped_misfire`` (bounded) so old cron
+        ticks are never replayed.  The cursor advances in the same transaction.
+        Returns the ids of occurrences created in ``pending``.
+        """
+        created: list[int] = []
+        with self._conn:
+            cur = self.cursor(schedule_id) or baseline.astimezone(UTC)
+            newest_local = croniter(cron, now.astimezone(tz)).get_prev(datetime)
+            newest = newest_local.astimezone(UTC)
+            if newest <= cur:
+                if self.cursor(schedule_id) is None:
+                    self._set_cursor(schedule_id, cur)
+                return created
+            # Older missed ticks (bounded) between the cursor and the newest tick.
+            it = croniter(cron, cur.astimezone(tz))
+            older = 0
+            while older < MAX_RECORDED_MISFIRES:
+                tick = it.get_next(datetime).astimezone(UTC)
+                if tick >= newest:
+                    break
+                self._insert_occurrence(schedule_id=schedule_id, scheduled_for=tick, trigger="cron",
+                                        job_kind=job_kind, run_safety=run_safety, status="skipped_misfire",
+                                        detail="older missed tick; only the newest due tick runs")
+                older += 1
+            status, detail = "pending", None
+            if misfire == "skip_late" and (now - newest).total_seconds() > grace_seconds:
+                status, detail = "skipped_misfire", f"late by more than {grace_seconds}s"
+            elif self._schedule_busy(schedule_id, overlap):
+                status, detail = "skipped_overlap", f"previous occurrence still active (policy={overlap})"
+            occ = self._insert_occurrence(schedule_id=schedule_id, scheduled_for=newest, trigger="cron",
+                                          job_kind=job_kind, run_safety=run_safety, status=status, detail=detail)
+            self._set_cursor(schedule_id, newest)
+            if occ is not None and status == "pending":
+                created.append(occ)
+        return created
+
+    def _schedule_busy(self, schedule_id: str, overlap: str) -> bool:
+        active = self._conn.execute(
+            "SELECT exec_status, COUNT(*) FROM schedule_occurrences WHERE schedule_id=? "
+            "AND exec_status IN ('pending','claimed','running') GROUP BY exec_status", (schedule_id,)).fetchall()
+        counts = {r[0]: r[1] for r in active}
+        if overlap == "skip":
+            return bool(counts)
+        # queue: at most one waiting occurrence behind the active one
+        return int(counts.get("pending", 0)) >= 1
+
+    def _set_cursor(self, schedule_id: str, when: datetime) -> None:
+        self._conn.execute(
+            "INSERT INTO schedule_cursors(schedule_id,last_scheduled_for,updated_at) VALUES(?,?,?) "
+            "ON CONFLICT(schedule_id) DO UPDATE SET last_scheduled_for=excluded.last_scheduled_for, updated_at=excluded.updated_at",
+            (schedule_id, iso(when), iso(now_utc())))
+
+    def create_manual(self, *, schedule_id: str, job_kind: str, run_safety: str) -> int:
+        """An operator/test-initiated occurrence with a unique scheduled_for."""
+        when = now_utc()
+        with self._conn:
+            occ = self._insert_occurrence(schedule_id=schedule_id, scheduled_for=when, trigger="manual",
+                                          job_kind=job_kind, run_safety=run_safety, status="pending", detail=None)
+        if occ is None:  # microsecond collision: practically impossible, but never silently drop
+            return self.create_manual(schedule_id=schedule_id, job_kind=job_kind, run_safety=run_safety)
+        return occ
+
+    def pending(self, limit: int = 50) -> list[Occurrence]:
+        rows = self._conn.execute(
+            "SELECT * FROM schedule_occurrences o WHERE exec_status='pending' AND NOT EXISTS ("
+            "SELECT 1 FROM schedule_occurrences a WHERE a.schedule_id=o.schedule_id AND a.id!=o.id "
+            "AND a.exec_status IN ('claimed','running')) ORDER BY scheduled_for, id LIMIT ?",
+            (limit,)).fetchall()
+        return [self._occ(r) for r in rows]
+
+    def claim(self, occurrence_id: int, *, owner: str, lease_seconds: float) -> bool:
+        now = now_utc()
+        with self._conn:
+            row = self._conn.execute("SELECT schedule_id FROM schedule_occurrences WHERE id=? AND exec_status='pending'",
+                                     (occurrence_id,)).fetchone()
+            if row is None:
+                return False
+            busy = self._conn.execute(
+                "SELECT 1 FROM schedule_occurrences WHERE schedule_id=? AND id!=? "
+                "AND exec_status IN ('claimed','running')", (row[0], occurrence_id)).fetchone()
+            if busy:
+                return False
+            self._conn.execute(
+                "UPDATE schedule_occurrences SET exec_status='claimed', lease_owner=?, lease_expires_at=?, "
+                "updated_at=? WHERE id=?",
+                (owner, iso(now + timedelta(seconds=lease_seconds)), iso(now), occurrence_id))
+        return True
+
+    def start_run(self, occurrence_id: int, *, owner: str) -> int:
+        """claimed -> running; opens a run row. Raises if the claim was lost."""
+        now = iso(now_utc())
+        with self._conn:
+            changed = self._conn.execute(
+                "UPDATE schedule_occurrences SET exec_status='running', attempts=attempts+1, started_at=?, "
+                "updated_at=? WHERE id=? AND exec_status='claimed' AND lease_owner=?",
+                (now, now, occurrence_id, owner)).rowcount
+            if not changed:
+                raise PermissionError("occurrence claim lost")
+            attempt = self.get(occurrence_id).attempts
+            cur = self._conn.execute(
+                "INSERT INTO schedule_runs(occurrence_id,attempt,status,side_effects,owner,started_at) "
+                "VALUES(?,?,'running','unknown',?,?)", (occurrence_id, attempt, owner, now))
+        return int(cur.lastrowid or 0)
+
+    def finish_run(self, occurrence_id: int, run_id: int, *, status: str, side_effects: str,
+                   result: dict[str, Any] | None = None, error: str | None = None,
+                   outbox: list[tuple[str, str, str]] | None = None, chunk_chars: int = 3500,
+                   delivery_status: str | None = None, detail: str | None = None) -> bool:
+        """Atomically close the run, set exec status and enqueue outbox rows.
+
+        ``outbox`` is a list of ``(transport, channel, text)``.  Returns False if
+        the occurrence is no longer ``running`` (e.g. recovered or cancelled
+        meanwhile) - in which case nothing is written, so a late finisher can
+        never enqueue a duplicate delivery.
+        """
+        now = iso(now_utc())
+        with self._conn:
+            row = self._conn.execute("SELECT schedule_id, exec_status FROM schedule_occurrences WHERE id=?",
+                                     (occurrence_id,)).fetchone()
+            if row is None or row["exec_status"] != "running":
+                return False
+            self._conn.execute(
+                "UPDATE schedule_runs SET status=?, side_effects=?, finished_at=?, result_json=?, error=? WHERE id=?",
+                (status, side_effects, now, json.dumps(result) if result is not None else None, error, run_id))
+            delivery = delivery_status or "none"
+            if outbox:
+                delivery = "pending"
+                for transport, channel, text in outbox:
+                    parts = split_chunks(text, chunk_chars)
+                    for i, part in enumerate(parts):
+                        self._conn.execute(
+                            "INSERT INTO schedule_outbox(occurrence_id,run_id,schedule_id,transport,channel,"
+                            "chunk_index,chunk_count,text,next_attempt_at,created_at,updated_at) "
+                            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                            (occurrence_id, run_id, row["schedule_id"], transport, channel, i, len(parts),
+                             part, now, now, now))
+            self._conn.execute(
+                "UPDATE schedule_occurrences SET exec_status=?, delivery_status=?, detail=?, lease_owner=NULL, "
+                "lease_expires_at=NULL, finished_at=?, updated_at=? WHERE id=?",
+                (status, delivery, detail, now, now, occurrence_id))
+        return True
+
+    def end_unrun(self, occurrence_id: int, *, status: str, detail: str) -> bool:
+        """Terminal transition for a pending/claimed occurrence that never ran."""
+        now = iso(now_utc())
+        with self._conn:
+            changed: int = self._conn.execute(
+                "UPDATE schedule_occurrences SET exec_status=?, detail=?, lease_owner=NULL, lease_expires_at=NULL, "
+                "finished_at=?, updated_at=? WHERE id=? AND exec_status IN ('pending','claimed')",
+                (status, detail, now, now, occurrence_id)).rowcount
+            return changed > 0
+
+    def recover_expired(self, *, now: datetime, max_run_attempts: int) -> list[Recovery]:
+        """Apply the lease-expiry recovery rules. Never re-runs side-effecting work."""
+        out: list[Recovery] = []
+        ts = iso(now)
+        with self._conn:
+            rows = self._conn.execute(
+                "SELECT * FROM schedule_occurrences WHERE exec_status IN ('claimed','running') AND lease_expires_at<?",
+                (ts,)).fetchall()
+            for row in rows:
+                occ_id, sid = row["id"], row["schedule_id"]
+                if row["exec_status"] == "claimed":
+                    # Crash after claim, before the run started: nothing executed.
+                    self._conn.execute("UPDATE schedule_occurrences SET exec_status='pending', lease_owner=NULL, "
+                                       "lease_expires_at=NULL, detail='re-pended: claim expired before run start', "
+                                       "updated_at=? WHERE id=?", (ts, occ_id))
+                    out.append(Recovery(occ_id, sid, "repended", "claim expired before run start"))
+                    continue
+                self._conn.execute("UPDATE schedule_runs SET status='abandoned', finished_at=?, "
+                                   "error='lease expired while running' WHERE occurrence_id=? AND status='running'",
+                                   (ts, occ_id))
+                if row["run_safety"] == "read_only" and row["attempts"] < max_run_attempts:
+                    self._conn.execute("UPDATE schedule_occurrences SET exec_status='pending', lease_owner=NULL, "
+                                       "lease_expires_at=NULL, detail='re-pended: read-only run interrupted', "
+                                       "updated_at=? WHERE id=?", (ts, occ_id))
+                    out.append(Recovery(occ_id, sid, "repended", "read-only run interrupted; retrying"))
+                elif row["run_safety"] == "read_only":
+                    self._conn.execute("UPDATE schedule_occurrences SET exec_status='failed', lease_owner=NULL, "
+                                       "lease_expires_at=NULL, detail='read-only run kept dying', finished_at=?, "
+                                       "updated_at=? WHERE id=?", (ts, ts, occ_id))
+                    out.append(Recovery(occ_id, sid, "failed", "read-only run exhausted attempts"))
+                else:
+                    self._conn.execute("UPDATE schedule_occurrences SET exec_status='unknown', lease_owner=NULL, "
+                                       "lease_expires_at=NULL, detail='side effects unverifiable after interruption; "
+                                       "not re-run', finished_at=?, updated_at=? WHERE id=?", (ts, ts, occ_id))
+                    out.append(Recovery(occ_id, sid, "unknown", "side-effecting run interrupted; not retried"))
+        return out
+
+    def cancel_schedule(self, schedule_id: str, *, detail: str) -> list[int]:
+        """Cancel unrun occurrences and unsent output; return ids still running."""
+        now = iso(now_utc())
+        with self._conn:
+            self._conn.execute(
+                "UPDATE schedule_occurrences SET exec_status='cancelled', detail=?, lease_owner=NULL, "
+                "lease_expires_at=NULL, finished_at=?, updated_at=? WHERE schedule_id=? "
+                "AND exec_status IN ('pending','claimed')", (detail, now, now, schedule_id))
+            self._conn.execute(
+                "UPDATE schedule_outbox SET status='cancelled', provider_outcome='cancelled: schedule deleted', "
+                "updated_at=? WHERE schedule_id=? AND status='pending'", (now, schedule_id))
+            self._refresh_delivery_for_schedule(schedule_id)
+            rows = self._conn.execute("SELECT id FROM schedule_occurrences WHERE schedule_id=? AND exec_status='running'",
+                                      (schedule_id,)).fetchall()
+        return [r[0] for r in rows]
+
+    def active_schedule_ids(self) -> set[str]:
+        rows = self._conn.execute("SELECT DISTINCT schedule_id FROM schedule_occurrences "
+                                  "WHERE exec_status IN ('pending','claimed','running')").fetchall()
+        rows2 = self._conn.execute("SELECT DISTINCT schedule_id FROM schedule_outbox WHERE status='pending'").fetchall()
+        return {r[0] for r in rows} | {r[0] for r in rows2}
+
+    def recent(self, schedule_id: str | None = None, limit: int = 50) -> list[Occurrence]:
+        sql = "SELECT * FROM schedule_occurrences"
+        args: list[Any] = []
+        if schedule_id:
+            sql += " WHERE schedule_id=?"
+            args.append(schedule_id)
+        rows = self._conn.execute(sql + " ORDER BY id DESC LIMIT ?", (*args, limit)).fetchall()
+        return [self._occ(r) for r in rows]
+
+    def runs(self, occurrence_id: int) -> list[sqlite3.Row]:
+        return self._conn.execute("SELECT * FROM schedule_runs WHERE occurrence_id=? ORDER BY id", (occurrence_id,)).fetchall()
+
+    def outbox(self, occurrence_id: int) -> list[sqlite3.Row]:
+        return self._conn.execute("SELECT * FROM schedule_outbox WHERE occurrence_id=? ORDER BY chunk_index",
+                                  (occurrence_id,)).fetchall()
+
+    def set_exec_status(self, occurrence_id: int, status: str, detail: str) -> None:
+        now = iso(now_utc())
+        with self._conn:
+            self._conn.execute("UPDATE schedule_occurrences SET exec_status=?, detail=?, finished_at=?, updated_at=? "
+                               "WHERE id=?", (status, detail, now, now, occurrence_id))
+
+    # ------------------------------------------------------------------ outbox
+
+    def claim_outbox(self, *, now: datetime, lease_seconds: float, limit: int = 20,
+                     exclude: frozenset[int] = frozenset()) -> list[OutboxItem]:
+        """Claim due chunks. Chunk i is only claimable once chunk i-1 was sent."""
+        ts = iso(now)
+        items: list[OutboxItem] = []
+        with self._conn:
+            rows = self._conn.execute(
+                "SELECT * FROM schedule_outbox o WHERE status='pending' AND next_attempt_at<=? AND (chunk_index=0 OR "
+                "EXISTS (SELECT 1 FROM schedule_outbox p WHERE p.occurrence_id=o.occurrence_id "
+                "AND p.chunk_index=o.chunk_index-1 AND p.status='sent')) ORDER BY occurrence_id, chunk_index LIMIT ?",
+                (ts, limit)).fetchall()
+            for r in rows:
+                if r["id"] in exclude:
+                    continue
+                self._conn.execute(
+                    "UPDATE schedule_outbox SET status='sending', attempts=attempts+1, lease_expires_at=?, updated_at=? "
+                    "WHERE id=?", (iso(now + timedelta(seconds=lease_seconds)), ts, r["id"]))
+                items.append(OutboxItem(r["id"], r["occurrence_id"], r["schedule_id"], r["transport"], r["channel"],
+                                        r["chunk_index"], r["chunk_count"], r["text"], r["attempts"] + 1))
+        return items
+
+    def outbox_sent(self, item: OutboxItem, *, provider_outcome: str = "ok") -> None:
+        self._outbox_done(item, "sent", provider_outcome, None)
+
+    def outbox_failed(self, item: OutboxItem, *, error: str, retryable: bool, max_attempts: int,
+                      backoff_base: float, backoff_max: float) -> str:
+        """Record a failed send. retryable=False means the send may have happened (uncertain)."""
+        now = now_utc()
+        if not retryable:
+            self._outbox_done(item, "uncertain", f"uncertain: {error[:200]}", error)
+            return "uncertain"
+        if item.attempts >= max_attempts:
+            self._outbox_done(item, "failed", f"error: {error[:200]}", error)
+            return "failed"
+        delay = min(backoff_max, backoff_base * (2 ** (item.attempts - 1)))
+        with self._conn:
+            self._conn.execute(
+                "UPDATE schedule_outbox SET status='pending', next_attempt_at=?, provider_outcome=?, last_error=?, "
+                "lease_expires_at=NULL, updated_at=? WHERE id=? AND status='sending'",
+                (iso(now + timedelta(seconds=delay)), f"error (will retry): {error[:200]}", error[:300],
+                 iso(now), item.id))
+        return "pending"
+
+    def _outbox_done(self, item: OutboxItem, status: str, outcome: str, error: str | None) -> None:
+        now = iso(now_utc())
+        with self._conn:
+            self._conn.execute(
+                "UPDATE schedule_outbox SET status=?, provider_outcome=?, last_error=?, lease_expires_at=NULL, "
+                "updated_at=? WHERE id=? AND status='sending'", (status, outcome, error, now, item.id))
+            self._refresh_delivery(item.occurrence_id)
+
+    def recover_outbox(self, *, now: datetime) -> int:
+        """An in-flight send whose lease expired may or may not have been delivered: uncertain, never resent."""
+        ts = iso(now)
+        with self._conn:
+            rows = self._conn.execute("SELECT id, occurrence_id FROM schedule_outbox WHERE status='sending' "
+                                      "AND lease_expires_at<?", (ts,)).fetchall()
+            for r in rows:
+                self._conn.execute(
+                    "UPDATE schedule_outbox SET status='uncertain', provider_outcome='uncertain: send interrupted', "
+                    "lease_expires_at=NULL, updated_at=? WHERE id=?", (ts, r["id"]))
+                self._refresh_delivery(r["occurrence_id"])
+        return len(rows)
+
+    def _refresh_delivery_for_schedule(self, schedule_id: str) -> None:
+        for r in self._conn.execute("SELECT DISTINCT occurrence_id FROM schedule_outbox WHERE schedule_id=?",
+                                    (schedule_id,)).fetchall():
+            self._refresh_delivery(r[0])
+
+    def _refresh_delivery(self, occurrence_id: int) -> None:
+        counts = {r[0]: r[1] for r in self._conn.execute(
+            "SELECT status, COUNT(*) FROM schedule_outbox WHERE occurrence_id=? GROUP BY status", (occurrence_id,))}
+        if not counts:
+            return
+        total = sum(counts.values())
+        if counts.get("uncertain"):
+            status = "uncertain"
+        elif counts.get("failed"):
+            status = "failed"
+        elif counts.get("sent", 0) == total:
+            status = "delivered"
+        elif counts.get("cancelled", 0) == total:
+            status = "cancelled"
+        elif counts.get("sent"):
+            status = "partial"
+        else:
+            status = "pending"
+        self._conn.execute("UPDATE schedule_occurrences SET delivery_status=?, updated_at=? WHERE id=?",
+                           (status, iso(now_utc()), occurrence_id))
+
+    def set_delivery_status(self, occurrence_id: int, status: str) -> None:
+        with self._conn:
+            self._conn.execute("UPDATE schedule_occurrences SET delivery_status=?, updated_at=? WHERE id=?",
+                               (status, iso(now_utc()), occurrence_id))

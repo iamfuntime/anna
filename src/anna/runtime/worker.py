@@ -47,13 +47,13 @@ from anna.tools.slack_alerts_server import (
 from anna.tools.vault_tools import VaultTools
 from anna.tools.web_server import WEB_TOOL_NAMES, build_web_server
 from anna.tools.web_tools import WebTools
-from anna.transports.base import TurnCancelled
 from anna.transports.base import (
     ChannelAdapter,
     ImageAttachment,
     InboundEvent,
     OutboundMessage,
     SignalHandle,
+    TurnCancelled,
 )
 from anna.vault.checkpoint import list_recent_checkpoints, write_checkpoint
 from anna.vault.transcript_resume import (

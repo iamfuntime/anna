@@ -30,6 +30,7 @@ import fcntl
 import os
 from datetime import datetime, timezone
 from pathlib import Path
+from collections.abc import AsyncIterator
 from typing import Any, Awaitable, Callable
 from zoneinfo import ZoneInfo
 
@@ -135,7 +136,7 @@ class ScheduleStore:
         os.replace(tmp, self._path)
 
     @contextlib.asynccontextmanager
-    async def _exclusive(self):
+    async def _exclusive(self) -> AsyncIterator[None]:
         """Per-process supervisor lock plus a cross-process file lock.
 
         Every mutation is a read-modify-write under both: the file is re-read

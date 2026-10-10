@@ -311,6 +311,78 @@ in touched files; `mypy` clean on the new/changed memory modules. Still
 deferred: operator UI/CLI to review/accept `conflict`/`held` candidates, any
 live-model quality evaluation of the extraction prompt, and shared-task state.
 
+## Durable scheduler ledger (occurrences, runs, outbox)
+
+`schedules.yaml` still holds the schedule *definitions* (and a mirrored legacy
+`state` the dashboard reads). Execution truth now lives in
+`state/runtime.sqlite3` (`RuntimeLedger`, WAL, `ledger_migrations`), written
+only by the daemon:
+
+| table | purpose |
+| --- | --- |
+| `schedule_cursors` | last materialized tick per schedule (seeded from legacy `state.last_fired_at`/`created_at`) |
+| `schedule_occurrences` | `UNIQUE(schedule_id, scheduled_for)`; `exec_status` (pending, claimed, running, succeeded, failed, timeout, cancelled, unknown, blocked, skipped_overlap, skipped_misfire) separate from `delivery_status` (none, suppressed, pending, partial, delivered, failed, uncertain, cancelled); lease owner/expiry |
+| `schedule_runs` | one row per attempt: status, `side_effects` (none/possible/unknown), typed `JobResult` JSON |
+| `schedule_outbox` | one row per destination chunk: attempts, `next_attempt_at`, `provider_outcome`, status (pending, sending, sent, failed, uncertain, cancelled) |
+
+Flow per poll: reload YAML (picks up dashboard edits) -> recover expired leases
+-> reconcile schedules deleted by another process -> materialize due ticks
+(occurrence + cursor advance in one transaction; no optimistic `last_fired`) ->
+claim and run (lease = 2*timeout + `lease_grace_seconds`) -> run result and
+outbox rows commit in ONE transaction -> deliver outbox.
+
+- **Misfire:** `run_latest` (default; legacy behavior) runs only the newest due
+  tick after downtime and records older ones `skipped_misfire` (bounded);
+  `skip_late` also skips it if later than `misfire_grace_seconds`. Cron ticks are
+  never replayed. **Overlap:** `skip` (default; records `skipped_overlap`) or
+  `queue` (one waiter). Per-schedule overrides: `misfire_policy`,
+  `misfire_grace_seconds`, `overlap_policy`; defaults in `scheduler.*`.
+- **Recovery (lease expiry):** claimed-not-started -> re-pended (nothing ran);
+  running + `run_safety: read_only` -> retried up to `max_run_attempts`;
+  running + `side_effecting` (default, all legacy agent prompts) -> `unknown`,
+  counted as a failure, **never re-run**. A send in flight at crash/lease expiry
+  -> `uncertain`, **never auto-resent**.
+- **Delivery vs execution:** delivery retries touch only outbox rows with
+  backoff (`delivery_*` settings); chunked at `delivery_chunk_chars`, chunk i+1
+  only after chunk i is sent. Only errors that prove "not sent" (connection
+  errors, HTTP 429, `retry_safe`, missing adapter) retry; other send errors are
+  `uncertain` (opt-in `retry_unknown_send_errors`). Terminal delivery
+  failure/uncertainty counts toward `failure_threshold` and audits.
+- **Cancellation:** `InboundEvent.cancel` reaches the worker. Timeout, schedule
+  deletion (same process via callback, other process via poll reconcile) and
+  shutdown set it; the worker drops a queued turn or calls the SDK
+  `interrupt()` on a running one and reports `turn_meta["turn_state"]`. Verdict:
+  dropped/no tools -> `timeout`/`cancelled` (`side_effects: none`); tools ran ->
+  `unknown`; worker did not acknowledge within `cancel_grace_seconds` ->
+  `blocked`. Unsent output of a deleted schedule is dropped.
+- **Typed jobs:** `Schedule.job_kind` (only `agent_prompt` today) dispatches
+  through `Scheduler._run_job` to a `JobResult(outcome ok|quiet|failed, output,
+  data, tool_call_count, side_effects)` - the seam for the deterministic
+  heartbeat. Legacy quiet/blank/markup/no-tool-call heuristics stay inside the
+  agent-prompt job.
+- **`schedules.yaml` safety:** every mutation is a read-modify-write under the
+  in-process lock plus an `flock` on `schedules.yaml.lock`, re-reading the file
+  first, so the dashboard and daemon no longer overwrite each other's rows or
+  fields. New optional Schedule fields default, so old files load unchanged.
+
+Migration/rollback: first ledger creation copies `schedules.yaml` to
+`schedules.yaml.bak-pre-ledger-<ts>` (once). The ledger is new and additive;
+rollback = run the previous build: it ignores the ledger and the new YAML
+fields (it will resume from the mirrored `state.last_fired_at`). Keep
+`runtime.sqlite3` for forensics; ledger upgrades use the same backup-before-
+migrate pattern as the memory store (`RuntimeLedger.backup`).
+
+Validation: full suite 1,482 passed, 1 skipped (adds `tests/test_scheduler_ledger.py`,
+24 tests: uniqueness/no replay, misfire, overlap, crash after claim, lease-expiry
+unknown vs read-only retry, timeout/cancel propagation incl. real worker drop and
+interrupt, send failure + restart retaining outbox, uncertain sends, chunk retry,
+delete cancel incl. cross-process, store no-clobber, YAML backup/legacy load).
+Manual: a subprocess killed mid-run (`os._exit`) left a running claim; a second
+process recovered it as `unknown` without re-running. `ruff`/`mypy`: no new
+finding categories in touched legacy files; new files clean. Not done: dashboard
+view of occurrences/outbox, operator command to resolve `unknown`/`uncertain`
+rows, the heartbeat job itself.
+
 ## Deferred milestones
 
 1. **Phase 0:** finish exact event coverage/replay.

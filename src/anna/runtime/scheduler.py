@@ -33,7 +33,7 @@ from zoneinfo import ZoneInfo
 from anna.config import AnnaConfig
 from anna.log import audit_event, get_logger
 from anna.runtime.ledger import OutboxItem, Recovery, RuntimeLedger, now_utc
-from anna.runtime.schedule_jobs import JobResult
+from anna.runtime.schedule_jobs import JobResult, Outcome
 from anna.runtime.schedule_store import ScheduleStore
 from anna.runtime.schedule_types import Schedule
 from anna.runtime.worker import (
@@ -58,6 +58,12 @@ if TYPE_CHECKING:
 QUIET_SENTINEL = "[[ANNA_NO_OUTPUT]]"
 
 __all__ = ["QUIET_SENTINEL", "Scheduler"]
+
+
+def _stub_schedule(schedule_id: str) -> Schedule:
+    """Placeholder for a schedule that no longer exists (failure bookkeeping is then a no-op)."""
+    from types import SimpleNamespace
+    return SimpleNamespace(id=schedule_id)  # type: ignore[return-value]
 
 
 class NoAdapterError(RuntimeError):
@@ -105,6 +111,7 @@ class Scheduler:
         router: "ConversationRouter",
         adapters: dict[str, ChannelAdapter],
         alerter: "AdminAlerter",
+        ledger: RuntimeLedger | None = None,
     ) -> None:
         self._config = config
         self._store = store
@@ -121,8 +128,14 @@ class Scheduler:
         # removed by the task done-callback; a key vanishes when its set
         # empties.
         self._tasks_by_schedule: dict[str, set[asyncio.Task[None]]] = {}
+        if ledger is None:
+            _backup_yaml_before_first_ledger(config)
+            ledger = RuntimeLedger(config.state_dir / "runtime.sqlite3")
+        self._ledger = ledger
+        self._owner = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
+        self._spawned: set[int] = set()
         self._shutdown_grace_seconds: float = 5.0
-        self._cancel_grace_seconds: float = 2.0
+        self._cancel_grace_seconds: float = config.scheduler.cancel_grace_seconds + 1.0
 
     # ------------------------------------------------------------------
     # Public lifecycle
@@ -212,6 +225,9 @@ class Scheduler:
         land; stragglers are logged and left to their done-callbacks for
         index cleanup. Returns the number of tasks cancelled.
         """
+        # Durable state first: unrun occurrences become cancelled and unsent
+        # output is dropped, so nothing queued can start or deliver afterwards.
+        self._ledger.cancel_schedule(schedule_id, detail="schedule deleted")
         tasks = [
             task
             for task in self._tasks_by_schedule.get(schedule_id, ())
@@ -251,28 +267,90 @@ class Scheduler:
     # ------------------------------------------------------------------
 
     async def _poll_once(self) -> None:
+        """One scheduler cycle: recover, reconcile, materialize, dispatch, deliver.
+
+        Nothing is marked "fired" optimistically.  A tick becomes a unique
+        ``(schedule_id, scheduled_for)`` occurrence row in the ledger in one
+        transaction with the cursor advance, so a crash can neither lose the
+        tick nor produce it twice.
+        """
         now = datetime.now(timezone.utc)
-        due = self._store.due_schedules(now)
-        for schedule in due:
-            # Optimistically mark the schedule as dispatched BEFORE creating
-            # the fire task. due_schedules() computes the next cron tick from
-            # state.last_fired_at; without this, a long-running fire (>poll
-            # interval) leaves last_fired_at null and every poll re-dispatches
-            # the same schedule. See the 2026-06-01 morning-brief-test
-            # incident: cron `2 15 * * *` produced 4 concurrent fires because
-            # the 153-243s run kept the schedule "due" across 5 polls.
-            await self._store.mark_dispatched(schedule.id, when=now)
-            task = asyncio.create_task(
-                self._guarded_fire(schedule),
-                name=f"scheduler.fire.{schedule.id}",
+        cfg = self._config.scheduler
+        try:
+            await self._store.load()  # pick up dashboard edits and other writers
+        except Exception as exc:
+            self._log.warning("scheduler.reload_failed", error=str(exc))
+        for rec in self._ledger.recover_expired(now=now, max_run_attempts=cfg.max_run_attempts):
+            await self._on_recovery(rec)
+        self._ledger.recover_outbox(now=now)
+        for sid in self._ledger.active_schedule_ids():
+            if self._store.get(sid) is None:  # deleted by another process (dashboard)
+                await self.cancel_schedule_tasks(sid)
+        for schedule in self._store.list():
+            if schedule.enabled:
+                self._materialize(schedule, now)
+        for occ in self._ledger.pending():
+            if occ.id in self._spawned:
+                continue
+            found = self._store.get(occ.schedule_id)
+            if found is None or not found.enabled:
+                self._ledger.end_unrun(occ.id, status="cancelled", detail="schedule missing or disabled")
+                continue
+            self._spawn(found, occ.id)
+        await self._deliver_due()
+
+    def _materialize(self, schedule: Schedule, now: datetime) -> None:
+        cfg = self._config.scheduler
+        try:
+            tz = ZoneInfo(schedule.timezone)
+            baseline = schedule.state.last_fired_at or schedule.created_at
+            if baseline.tzinfo is None:
+                baseline = baseline.replace(tzinfo=timezone.utc)
+            created = self._ledger.materialize(
+                schedule_id=schedule.id, cron=schedule.cron, tz=tz, baseline=baseline, now=now,
+                job_kind=schedule.job_kind, run_safety=schedule.run_safety,
+                overlap=schedule.overlap_policy or cfg.default_overlap_policy,
+                misfire=schedule.misfire_policy or cfg.default_misfire_policy,
+                grace_seconds=schedule.misfire_grace_seconds or cfg.misfire_grace_seconds,
             )
-            self._inflight.add(task)
-            self._tasks_by_schedule.setdefault(schedule.id, set()).add(task)
-            task.add_done_callback(
-                lambda t, schedule_id=schedule.id: self._discard_task(
-                    schedule_id, t
-                )
-            )
+        except Exception as exc:
+            self._log.warning("scheduler.materialize_failed", schedule_id=schedule.id, error=str(exc))
+            return
+        for occ_id in created:
+            audit_event("audit.schedule.occurrence", audit_dir=self._audit_dir, actor="anna",
+                        fsync_on_write=self._fsync, schedule_id=schedule.id, occurrence_id=occ_id)
+
+    def _spawn(self, schedule: Schedule, occurrence_id: int) -> asyncio.Task[None]:
+        self._spawned.add(occurrence_id)
+        task = asyncio.create_task(
+            self._guarded_fire(schedule, occurrence_id=occurrence_id),
+            name=f"scheduler.fire.{schedule.id}",
+        )
+        self._inflight.add(task)
+        self._tasks_by_schedule.setdefault(schedule.id, set()).add(task)
+        sid = schedule.id
+
+        def _done(t: asyncio.Task[None]) -> None:
+            self._task_done(sid, occurrence_id, t)
+
+        task.add_done_callback(_done)
+        return task
+
+    def _task_done(self, schedule_id: str, occurrence_id: int, task: asyncio.Task[None]) -> None:
+        self._spawned.discard(occurrence_id)
+        self._discard_task(schedule_id, task)
+
+    async def _on_recovery(self, rec: Recovery) -> None:
+        level = "WARNING" if rec.action in ("unknown", "failed") else "INFO"
+        audit_event("audit.schedule.recovered", audit_dir=self._audit_dir, actor="anna",
+                    fsync_on_write=self._fsync, level=level, schedule_id=rec.schedule_id,
+                    occurrence_id=rec.occurrence_id, action=rec.action, detail=rec.detail)
+        self._log.warning("scheduler.recovered", schedule_id=rec.schedule_id,
+                          occurrence_id=rec.occurrence_id, action=rec.action)
+        if rec.action in ("unknown", "failed"):
+            await self._handle_failure(
+                self._store.get(rec.schedule_id) or _stub_schedule(rec.schedule_id),
+                reason=rec.detail, kind="unknown" if rec.action == "unknown" else "fail")
 
     def _discard_task(self, schedule_id: str, task: asyncio.Task[None]) -> None:
         """Done-callback: drop a finished fire task from both indexes."""
@@ -284,7 +362,11 @@ class Scheduler:
                 del self._tasks_by_schedule[schedule_id]
 
     async def fire(
-        self, schedule_id: str, *, turn_meta: dict[str, object] | None = None
+        self,
+        schedule_id: str,
+        *,
+        turn_meta: dict[str, object] | None = None,
+        cancel: asyncio.Event | None = None,
     ) -> str:
         """Fire one schedule by id. Returns the reply text the worker produced.
 
@@ -317,6 +399,7 @@ class Scheduler:
             completion_future=completion,
             ephemeral=schedule.ephemeral,
             turn_meta=turn_meta,
+            cancel=cancel,
         )
 
         await self._router.dispatch(event)
@@ -326,147 +409,259 @@ class Scheduler:
     # Guarded fire with timeout + failure handling
     # ------------------------------------------------------------------
 
-    async def _guarded_fire(self, schedule: Schedule) -> None:
+    async def _guarded_fire(self, schedule: Schedule, *, occurrence_id: int | None = None) -> None:
+        """Claim, run and settle one occurrence.
+
+        Execution is recorded in the ledger (claim -> run -> typed result) and
+        delivery is a separate outbox step.  ``occurrence_id=None`` creates an
+        ad-hoc occurrence (tests / a future ``fire_now``).
+        """
+        if occurrence_id is None:
+            occurrence_id = self._ledger.create_manual(
+                schedule_id=schedule.id, job_kind=schedule.job_kind, run_safety=schedule.run_safety)
         async with self._semaphore:
+            lease = 2 * schedule.timeout_seconds + self._config.scheduler.lease_grace_seconds
+            if not self._ledger.claim(occurrence_id, owner=self._owner, lease_seconds=lease):
+                return
             started_at = datetime.now(timezone.utc)
+            try:
+                run_id = self._ledger.start_run(occurrence_id, owner=self._owner)
+            except PermissionError:
+                return
             audit_event(
                 "audit.schedule.fire",
                 audit_dir=self._audit_dir,
                 actor="anna",
                 fsync_on_write=self._fsync,
                 schedule_id=schedule.id,
+                occurrence_id=occurrence_id,
                 fire_at=started_at.isoformat(),
             )
-            self._log.info("scheduler.fire", schedule_id=schedule.id)
+            self._log.info("scheduler.fire", schedule_id=schedule.id, occurrence_id=occurrence_id)
 
+            meta: dict[str, object] = {}
             try:
-                meta: dict[str, object] = {}
-                reply = await asyncio.wait_for(
-                    self.fire(schedule.id, turn_meta=meta),
-                    timeout=schedule.timeout_seconds,
-                )
-                # No-tool-call backstop (2026-07-29 incident:
-                # oem-slide-restock-watch resolved in 2.5s with zero tool
-                # calls and the bare text "I'll read the skill file first",
-                # which the scheduler dutifully posted to the operator's DM;
-                # deals-watch did the same on 2026-07-25). A scheduled run
-                # exists to DO something — a turn that executed no tool
-                # produced an intent, not a result, and its text must never
-                # reach the destination. Retry ONCE into the same session,
-                # exactly like the worker's markup regeneration: zero tools
-                # ran, so the aborted turn has no side effects and the re-run
-                # carries no double-execution risk. AT MOST one retry — a
-                # persistently narrating model degrades to a recorded
-                # failure, never to a loop.
-                if self._is_no_tool_call_prose(reply, meta):
-                    first_reply = reply
-                    audit_event(
-                        "audit.schedule.no_tool_call_retry",
-                        audit_dir=self._audit_dir,
-                        actor="anna",
-                        fsync_on_write=self._fsync,
-                        level="WARNING",
-                        schedule_id=schedule.id,
-                        output_length=len(first_reply),
-                        preview=first_reply[:280],
-                    )
-                    self._log.warning(
-                        "scheduler.no_tool_call_retry",
-                        schedule_id=schedule.id,
-                        output_length=len(first_reply),
-                    )
-                    meta = {}
-                    reply = await asyncio.wait_for(
-                        self.fire(schedule.id, turn_meta=meta),
-                        timeout=schedule.timeout_seconds,
-                    )
-                    if self._is_no_tool_call_prose(reply, meta):
-                        await self._handle_no_tool_call_abort(
-                            schedule, first_reply=first_reply, retry_reply=reply
-                        )
-                        return
-            except asyncio.TimeoutError:
+                result = await self._run_job(schedule, meta)
+            except asyncio.CancelledError:
+                verdict = meta.get("_cancel_verdict")
+                status, effects, detail = verdict if isinstance(verdict, tuple) else (
+                    "unknown", "unknown", "scheduler task cancelled; outcome unverified")
+                self._ledger.finish_run(occurrence_id, run_id, status=status, side_effects=effects,
+                                        error=detail, detail=detail)
+                raise
+            except _TurnTimeout as exc:
+                self._ledger.finish_run(occurrence_id, run_id, status=exc.status, side_effects=exc.side_effects,
+                                        error=exc.detail, detail=exc.detail)
                 await self._handle_failure(
-                    schedule, reason=f"timeout after {schedule.timeout_seconds}s", kind="timeout"
-                )
+                    schedule, reason=f"timeout after {schedule.timeout_seconds}s ({exc.status}: {exc.detail})",
+                    kind="timeout")
                 return
             except Exception as exc:
+                self._ledger.finish_run(occurrence_id, run_id, status="failed", side_effects="unknown",
+                                        error=f"{type(exc).__name__}: {exc}"[:300])
                 await self._handle_failure(schedule, reason=f"error: {exc}", kind="fail")
                 return
 
-            # Quiet sentinel: the skill opted out of posting. Record the run as
-            # a normal success (identical bookkeeping minus the actual send) so
-            # last_fired_at advances and consecutive_failures resets. Do NOT
-            # count this as a failure.
-            #
-            # Match the sentinel per-LINE, not by exact equality of the whole
-            # reply. A skill is supposed to return the bare sentinel on a quiet
-            # tick, but the model occasionally prefixes a stray narration line
-            # ("I'll re-read the skill...") before it. Exact-equality on the
-            # whole reply let that blob post, leaking both the narration and the
-            # literal sentinel token to the operator. If ANY line is exactly the
-            # sentinel, the skill signaled "stay quiet" — honor it and suppress,
-            # matching the quiet-by-default bias. A sentinel embedded mid-line in
-            # genuine alert prose is NOT a quiet signal and still posts.
-            if reply is not None and self._is_quiet_sentinel(reply):
-                self._log.info(
-                    "scheduler.quiet_suppress",
-                    schedule_id=schedule.id,
-                )
-                self._log.info(
-                    f"schedule {schedule.id} returned quiet sentinel — "
-                    f"suppressing post"
-                )
-                await self._record_success(
-                    schedule, reply, started_at=started_at, suppressed=True
-                )
+            if result.outcome == "failed":
+                self._ledger.finish_run(occurrence_id, run_id, status="failed", side_effects=result.side_effects,
+                                        result=result.to_json(), error=result.error, detail=result.error)
+                await self._handle_failure(schedule, reason=result.error or "job failed",
+                                           kind=str(result.data.get("kind", "fail")))
                 return
 
-            # Blank-output guard (2026-07-02 incident: deals-watch emitted a
-            # single stray character on a quiet run instead of the sentinel,
-            # and it flushed to the operator's DM as a blank message). A reply
-            # with no alphanumeric characters — empty, whitespace-only, or a
-            # lone punctuation mark — is never a legitimate scheduled post.
-            # Suppress it identically to the quiet-sentinel path so the run
-            # still counts as a success and last_fired_at advances.
-            if reply is not None and self._is_blank_output(reply):
-                self._log.warning(
-                    "scheduler.blank_output_suppress",
-                    schedule_id=schedule.id,
-                    reply_len=len(reply),
-                )
-                await self._record_success(
-                    schedule, reply, started_at=started_at, suppressed=True
-                )
+            if result.outcome == "quiet":
+                self._ledger.finish_run(occurrence_id, run_id, status="succeeded", side_effects=result.side_effects,
+                                        result=result.to_json(), delivery_status="suppressed",
+                                        detail=result.quiet_reason)
+                await self._record_success(schedule, result.output, started_at=started_at, suppressed=True)
                 return
 
-            # Defense-in-depth tool-call-markup guard. The worker already
-            # suppresses leaked function-call syntax before resolving the
-            # completion future (resolving with QUIET_SENTINEL, handled
-            # above), but if anything slips through we must never route it
-            # to the destination transport. Re-run the same structural check
-            # here and suppress identically to the quiet-sentinel path.
-            if reply is not None and _contains_unparsed_toolcall_markup(reply):
-                self._log.warning(
-                    "scheduler.toolcall_markup_suppress",
-                    schedule_id=schedule.id,
-                    markers=_matched_markers(reply),
-                )
-                await self._record_success(
-                    schedule, reply, started_at=started_at, suppressed=True
-                )
-                return
+            dest = schedule.destination
+            written = self._ledger.finish_run(
+                occurrence_id, run_id, status="succeeded", side_effects=result.side_effects,
+                result=result.to_json(), outbox=[(dest.transport, dest.channel, result.output)],
+                chunk_chars=self._config.scheduler.delivery_chunk_chars)
+            if not written:
+                return  # recovered/cancelled meanwhile: never enqueue a duplicate delivery
+            await self._record_success(schedule, result.output, started_at=started_at)
+        await self._deliver_due()
 
-            # Route the reply to the destination.
-            try:
-                await self._send_to_destination(schedule, reply)
-            except Exception as exc:
+    # ------------------------------------------------------------------
+    # Jobs
+    # ------------------------------------------------------------------
+
+    async def _run_job(self, schedule: Schedule, meta: dict[str, object]) -> JobResult:
+        """Dispatch on ``job_kind``.  Deterministic typed jobs (heartbeat) plug in here."""
+        if schedule.job_kind == "agent_prompt":
+            return await self._run_agent_prompt(schedule, meta)
+        raise RuntimeError(f"unknown job_kind {schedule.job_kind!r}")
+
+    async def _turn(self, schedule: Schedule, meta: dict[str, object]) -> str:
+        """Run one worker turn with timeout; on timeout/cancel, stop the worker turn.
+
+        The cancel event travels on the inbound event: a queued turn is dropped
+        without running, a running turn is interrupted.  The verdict says whether
+        side effects can be ruled out (``timeout``), cannot (``unknown``), or the
+        worker never acknowledged the stop (``blocked``).
+        """
+        cancel = asyncio.Event()
+        task = asyncio.ensure_future(self.fire(schedule.id, turn_meta=meta, cancel=cancel))
+        try:
+            done, _ = await asyncio.wait({task}, timeout=schedule.timeout_seconds)
+            if done:
+                return task.result()
+        except asyncio.CancelledError:
+            meta["_cancel_verdict"] = await self._stop_turn(task, cancel, meta, cancelled_status="cancelled")
+            raise
+        verdict = await self._stop_turn(task, cancel, meta, cancelled_status="timeout")
+        raise _TurnTimeout(*verdict)
+
+    async def _stop_turn(self, task: "asyncio.Future[str]", cancel: asyncio.Event, meta: dict[str, object],
+                         *, cancelled_status: str) -> tuple[str, str, str]:
+        cancel.set()
+        grace = self._config.scheduler.cancel_grace_seconds
+        try:
+            await asyncio.wait({task}, timeout=grace)
+        except asyncio.CancelledError:
+            pass
+        if not task.done():
+            task.cancel()
+            return ("blocked", "unknown", f"worker turn did not acknowledge cancel within {grace}s")
+        if task.cancelled():
+            return ("blocked", "unknown", "turn future cancelled before the worker confirmed it stopped")
+        state = meta.get("turn_state")
+        tools = meta.get("tool_call_count")
+        if state == "dropped":
+            return (cancelled_status, "none", "queued turn dropped before it started")
+        if state == "finished" and tools == 0:
+            return (cancelled_status, "none", "turn interrupted; no tool calls had run")
+        task.exception()  # consume
+        return ("unknown", "possible", f"turn interrupted after {tools if tools is not None else 'unknown'} "
+                "tool call(s); side effects cannot be verified")
+
+    async def _run_agent_prompt(self, schedule: Schedule, meta: dict[str, object]) -> JobResult:
+        """Legacy prompt job with its quiet / no-tool-call / markup heuristics."""
+        reply = await self._turn(schedule, meta)
+        # No-tool-call backstop (2026-07-29 incident: oem-slide-restock-watch
+        # resolved in 2.5s with zero tool calls and the bare text "I'll read the
+        # skill file first", which the scheduler posted to the operator's DM). A
+        # scheduled run exists to DO something - a turn that executed no tool
+        # produced an intent, not a result. Retry ONCE into the same session:
+        # zero tools ran, so the aborted turn has no side effects and the re-run
+        # carries no double-execution risk. AT MOST one retry.
+        if self._is_no_tool_call_prose(reply, meta):
+            first_reply = reply
+            audit_event(
+                "audit.schedule.no_tool_call_retry",
+                audit_dir=self._audit_dir,
+                actor="anna",
+                fsync_on_write=self._fsync,
+                level="WARNING",
+                schedule_id=schedule.id,
+                output_length=len(first_reply),
+                preview=first_reply[:280],
+            )
+            self._log.warning("scheduler.no_tool_call_retry", schedule_id=schedule.id,
+                              output_length=len(first_reply))
+            meta.clear()
+            reply = await self._turn(schedule, meta)
+            if self._is_no_tool_call_prose(reply, meta):
+                return self._no_tool_call_abort(schedule, first_reply=first_reply, retry_reply=reply)
+        count = meta.get("tool_call_count")
+        effects = "none" if count == 0 else ("possible" if isinstance(count, int) else "unknown")
+        tools = count if isinstance(count, int) else None
+
+        def result(outcome: Outcome, reason: str | None = None) -> JobResult:
+            return JobResult(outcome=outcome, output=reply, quiet_reason=reason, tool_call_count=tools,
+                             side_effects=effects)  # type: ignore[arg-type]
+
+        # Quiet sentinel, matched per-LINE: a stray narration line before it must
+        # not leak the sentinel or the narration to the operator.
+        if self._is_quiet_sentinel(reply):
+            self._log.info("scheduler.quiet_suppress", schedule_id=schedule.id)
+            return result("quiet", "quiet_sentinel")
+        # Blank-output guard (2026-07-02 incident: a single stray character flushed
+        # to the operator's DM as a blank message).
+        if self._is_blank_output(reply):
+            self._log.warning("scheduler.blank_output_suppress", schedule_id=schedule.id, reply_len=len(reply))
+            return result("quiet", "blank_output")
+        # Defense-in-depth tool-call-markup guard.
+        if _contains_unparsed_toolcall_markup(reply):
+            self._log.warning("scheduler.toolcall_markup_suppress", schedule_id=schedule.id,
+                              markers=_matched_markers(reply))
+            return result("quiet", "toolcall_markup")
+        return result("ok")
+
+    def _no_tool_call_abort(self, schedule: Schedule, *, first_reply: str, retry_reply: str) -> JobResult:
+        """Both attempts narrated instead of acting: suppress and fail.
+
+        This audit row is the only record of what the model said - it carries
+        both replies in full so the run stays reconstructable.
+        """
+        audit_event(
+            "audit.schedule.no_tool_call_abort",
+            audit_dir=self._audit_dir,
+            actor="anna",
+            fsync_on_write=self._fsync,
+            level="WARNING",
+            schedule_id=schedule.id,
+            first_output=first_reply,
+            retry_output=retry_reply,
+        )
+        self._log.warning("scheduler.no_tool_call_abort", schedule_id=schedule.id,
+                          first_output_length=len(first_reply), retry_output_length=len(retry_reply))
+        return JobResult(outcome="failed", error="no tool call on either attempt (output suppressed)",
+                         side_effects="none", tool_call_count=0, data={"kind": "no_tool_call"})
+
+    # ------------------------------------------------------------------
+    # Delivery (outbox) - retries here never re-run execution
+    # ------------------------------------------------------------------
+
+    async def _deliver_due(self) -> None:
+        cfg = self._config.scheduler
+        attempted: set[int] = set()  # one attempt per row per pass; retries wait for the next poll
+        for _ in range(50):  # chunk i+1 becomes claimable only after chunk i was sent
+            items = self._ledger.claim_outbox(now=now_utc(), lease_seconds=cfg.send_timeout_seconds + 30,
+                                              exclude=frozenset(attempted))
+            if not items:
+                return
+            for item in items:
+                attempted.add(item.id)
+                await self._send_item(item)
+
+    async def _send_item(self, item: OutboxItem) -> None:
+        cfg = self._config.scheduler
+        try:
+            adapter = self._adapters.get(item.transport)
+            if adapter is None:
+                raise NoAdapterError(f"no adapter registered for transport '{item.transport}'")
+            await asyncio.wait_for(
+                adapter.send(OutboundMessage(
+                    conversation_key=self._dest_conv_key(transport=item.transport, channel=item.channel),
+                    text=item.text)),
+                timeout=cfg.send_timeout_seconds)
+        except asyncio.CancelledError:
+            # Interrupted mid-send: delivery unknown. Never resend automatically.
+            self._ledger.outbox_failed(item, error="cancelled mid-send", retryable=False, max_attempts=1,
+                                       backoff_base=0, backoff_max=0)
+            raise
+        except Exception as exc:
+            retryable = classify_send_error(exc) or (
+                cfg.retry_unknown_send_errors and not isinstance(exc, asyncio.TimeoutError))
+            outcome = self._ledger.outbox_failed(
+                item, error=f"{type(exc).__name__}: {exc}", retryable=retryable,
+                max_attempts=cfg.delivery_max_attempts, backoff_base=cfg.delivery_backoff_base_seconds,
+                backoff_max=cfg.delivery_backoff_max_seconds)
+            audit_event("audit.schedule.delivery_attempt_failed", audit_dir=self._audit_dir, actor="anna",
+                        fsync_on_write=self._fsync, level="WARNING", schedule_id=item.schedule_id,
+                        occurrence_id=item.occurrence_id, chunk=item.chunk_index, attempts=item.attempts,
+                        outcome=outcome, error=f"{type(exc).__name__}: {exc}"[:200])
+            if outcome in ("failed", "uncertain"):
                 await self._handle_failure(
-                    schedule, reason=f"send failed: {exc}", kind="fail"
-                )
-                return
-
-            await self._record_success(schedule, reply, started_at=started_at)
+                    self._store.get(item.schedule_id) or _stub_schedule(item.schedule_id),
+                    reason=f"send failed ({outcome}): {exc}", kind="delivery")
+            return
+        self._ledger.outbox_sent(item)
 
     @staticmethod
     def _is_quiet_sentinel(reply: str) -> bool:
@@ -510,40 +705,6 @@ class Scheduler:
             return False
         return not _contains_unparsed_toolcall_markup(reply)
 
-    async def _handle_no_tool_call_abort(
-        self, schedule: Schedule, *, first_reply: str, retry_reply: str
-    ) -> None:
-        """Both attempts narrated instead of acting: suppress and fail.
-
-        Neither attempt's text goes anywhere, so this audit row is the only
-        record of what the model actually said — it carries both replies in
-        full so the run stays reconstructable from the audit log. Failure
-        bookkeeping goes through the shared :meth:`_handle_failure` path, so
-        the run counts toward ``consecutive_failures`` and trips the
-        three-strikes auto-disable exactly as a timeout does.
-        """
-        audit_event(
-            "audit.schedule.no_tool_call_abort",
-            audit_dir=self._audit_dir,
-            actor="anna",
-            fsync_on_write=self._fsync,
-            level="WARNING",
-            schedule_id=schedule.id,
-            first_output=first_reply,
-            retry_output=retry_reply,
-        )
-        self._log.warning(
-            "scheduler.no_tool_call_abort",
-            schedule_id=schedule.id,
-            first_output_length=len(first_reply),
-            retry_output_length=len(retry_reply),
-        )
-        await self._handle_failure(
-            schedule,
-            reason="no tool call on either attempt (output suppressed)",
-            kind="no_tool_call",
-        )
-
     async def _record_success(
         self,
         schedule: Schedule,
@@ -581,19 +742,6 @@ class Scheduler:
             output_length=len(reply),
             suppressed=suppressed,
         )
-
-    async def _send_to_destination(self, schedule: Schedule, text: str) -> None:
-        """Push the worker's reply to the schedule's declared destination."""
-        adapter = self._adapters.get(schedule.destination.transport)
-        if adapter is None:
-            raise RuntimeError(
-                f"no adapter registered for transport '{schedule.destination.transport}'"
-            )
-        dest_conv_key = self._dest_conv_key(
-            transport=schedule.destination.transport,
-            channel=schedule.destination.channel,
-        )
-        await adapter.send(OutboundMessage(conversation_key=dest_conv_key, text=text))
 
     @staticmethod
     def _dest_conv_key(*, transport: str, channel: str) -> str:
