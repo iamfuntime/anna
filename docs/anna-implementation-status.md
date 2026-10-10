@@ -128,6 +128,15 @@ tests/test_worker_periodic_flush.py tests/test_router_identity_alias.py
 60 passed
 ```
 
+Full validation after `eb0fef0`:
+
+```text
+uv run --extra dev pytest -q
+1,395 passed, 1 skipped, 1 warning in 26.88s
+```
+
+The warning is the existing Starlette `TestClient`/httpx deprecation warning.
+
 Migration/rollback: `state/memory.sqlite3` is created automatically with a
 version-1 ledger and WAL mode. It is additive; rollback is to stop using the
 store while retaining the database and transcripts. Use a temporary `ANNA_HOME`
