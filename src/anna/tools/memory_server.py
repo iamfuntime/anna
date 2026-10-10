@@ -1,6 +1,7 @@
 """MCP tools for explicit, transactionally durable fact memory."""
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 from claude_agent_sdk import create_sdk_mcp_server, tool
@@ -9,16 +10,16 @@ from anna.runtime.memory import MemoryStore
 
 
 class MemoryTools:
-    def __init__(self, store: MemoryStore, *, owner_id: str, scope: str, source_event_id: str | None) -> None:
+    def __init__(self, store: MemoryStore, *, owner_id: str, scope: str, source_event_id: Callable[[], str | None]) -> None:
         self.store = store
         self.owner_id = owner_id
         self.scope = scope
-        self.source_event_id = source_event_id
+        self._source_event_id = source_event_id
 
     async def remember(self, *, kind: str, subject: str, content: str) -> dict[str, Any]:
         # remember() returns only after SQLite's transaction has committed.
         fact = self.store.remember(owner_id=self.owner_id, visibility_scope=self.scope, kind=kind,
-                                  subject=subject, content=content, source_event_id=self.source_event_id)
+                                  subject=subject, content=content, source_event_id=self._source_event_id())
         return {"content": [{"type": "text", "text": f"Remembered fact #{fact.id}: {fact.subject}."}]}
 
     async def search(self, *, query: str) -> dict[str, Any]:
@@ -30,7 +31,7 @@ class MemoryTools:
         prior = self.store.get(fact_id)
         if prior.owner_id != self.owner_id or prior.visibility_scope != self.scope:
             return {"content": [{"type": "text", "text": "error: memory is outside this conversation scope"}]}
-        fact = self.store.correct(fact_id, content=content, source_event_id=self.source_event_id)
+        fact = self.store.correct(fact_id, content=content, source_event_id=self._source_event_id())
         return {"content": [{"type": "text", "text": f"Corrected memory #{fact_id} with fact #{fact.id}."}]}
 
     async def forget(self, *, fact_id: int) -> dict[str, Any]:

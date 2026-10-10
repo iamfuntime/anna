@@ -29,9 +29,10 @@ def test_private_scope_never_leaks_to_group(tmp_path: Path) -> None:
 
 async def test_explicit_memory_tools_commit_correct_and_forget(tmp_path: Path) -> None:
     store = MemoryStore(tmp_path / "memory.sqlite3")
-    tools = MemoryTools(store, owner_id="seth", scope="private", source_event_id="telegram:99")
+    tools = MemoryTools(store, owner_id="seth", scope="private", source_event_id=lambda: "telegram:99")
     response = await tools.remember(kind="preference", subject="tea", content="likes earl grey")
     assert "Remembered fact #1" in response["content"][0]["text"]
+    assert store.get(1).source_event_id == "telegram:99"
     assert (await tools.search(query="earl"))["content"][0]["text"].startswith("#1 tea")
     corrected = await tools.correct(fact_id=1, content="likes oolong")
     assert "fact #2" in corrected["content"][0]["text"]
@@ -42,7 +43,7 @@ async def test_explicit_memory_tools_commit_correct_and_forget(tmp_path: Path) -
 
 async def test_memory_tools_reject_cross_scope_mutation(tmp_path: Path) -> None:
     store = MemoryStore(tmp_path / "memory.sqlite3")
-    private = MemoryTools(store, owner_id="seth", scope="private", source_event_id=None)
-    group = MemoryTools(store, owner_id="seth", scope="group:release", source_event_id=None)
+    private = MemoryTools(store, owner_id="seth", scope="private", source_event_id=lambda: None)
+    group = MemoryTools(store, owner_id="seth", scope="group:release", source_event_id=lambda: None)
     await private.remember(kind="preference", subject="secret", content="private value")
     assert "outside" in (await group.forget(fact_id=1))["content"][0]["text"]

@@ -460,6 +460,7 @@ class ConversationWorker:
             f"anna_reply_address_{conversation_key}", default=None
         )
         self._memory_store = MemoryStore(config.anna_home / "state" / "memory.sqlite3")
+        self._active_memory_source_id: str | None = None
         self._on_idle_close = on_idle_close
         # Live transport adapters (same dict the router/alerter hold). Used by
         # the anna_slack_alerts MCP server to post through ANNA's own Slack
@@ -914,7 +915,7 @@ class ConversationWorker:
                 self._memory_store,
                 owner_id=owner_id,
                 scope=memory_scope,
-                source_event_id=None,
+                source_event_id=lambda: self._active_memory_source_id,
             )
         )
 
@@ -2907,10 +2908,13 @@ class ConversationWorker:
         # ``_end_turn`` flushes belong to a DIFFERENT turn and are judged by
         # their own ledger, never by this one.
         self._notification_turn = self._notification_turn_for(event)
+        raw_event_id = event.raw.get("event_id") or event.raw.get("ts") or event.raw.get("message_id")
+        self._active_memory_source_id = str(raw_event_id) if raw_event_id is not None else None
         turn_queue = self._begin_turn()
         try:
             await self._dispatch_turn(event, turn_queue)
         finally:
+            self._active_memory_source_id = None
             ledger = self._notification_turn
             # Cleared BEFORE anything below can send. ``_guarded_send`` consults
             # exactly this attribute, so leaving it set would re-suppress the
