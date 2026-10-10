@@ -246,24 +246,66 @@ def transcript_event(
         return None
 
 
-def _next_transcript_sequence(conv_dir: Path) -> int:
-    """Allocate after the highest durable sequence, repairing a stale hint."""
+_TAIL_BYTES = 65536
+
+
+def _tail_max_sequence(path: Path) -> int:
+    """Highest sequence among the last parseable lines of one JSONL file (bounded read)."""
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as fp:
+            fp.seek(max(0, size - _TAIL_BYTES))
+            chunk = fp.read()
+    except OSError:
+        return 0
     highest = 0
+    for raw in chunk.splitlines():
+        try:
+            obj = json.loads(raw)
+        except (ValueError, UnicodeDecodeError):
+            continue  # partial first line of the window, or a malformed line
+        if isinstance(obj, dict) and isinstance(obj.get("sequence"), int):
+            highest = max(highest, obj["sequence"])
+    return highest
+
+
+def _full_scan_max_sequence(conv_dir: Path) -> int:
+    """Authoritative scan, tolerant per line: one malformed line never hides the rest."""
+    highest = 0
+    for daily in conv_dir.glob("*.jsonl"):
+        try:
+            with daily.open("r", encoding="utf-8", errors="replace") as fp:
+                for raw in fp:
+                    try:
+                        obj = json.loads(raw)
+                    except ValueError:
+                        continue
+                    if isinstance(obj, dict) and isinstance(obj.get("sequence"), int):
+                        highest = max(highest, obj["sequence"])
+        except OSError:
+            continue
+    return highest
+
+
+def _next_transcript_sequence(conv_dir: Path) -> int:
+    """Allocate after the highest durable sequence without rescanning history.
+
+    Fast path: trust ``.cursor.json`` and cross-check only the tail of the newest
+    day file (covers a crash between the JSONL append and the cursor write).  A
+    missing or unreadable cursor falls back to one full, per-line-tolerant scan,
+    after which the cursor is rewritten by the caller.
+    """
     cursor_path = conv_dir / ".cursor.json"
     try:
         cursor = json.loads(cursor_path.read_text(encoding="utf-8"))
-        if isinstance(cursor, dict) and isinstance(cursor.get("sequence"), int):
-            highest = cursor["sequence"]
+        hint = cursor["sequence"] if isinstance(cursor, dict) and isinstance(cursor.get("sequence"), int) else None
     except (OSError, ValueError, TypeError):
-        pass
-    for daily in conv_dir.glob("*.jsonl"):
-        try:
-            for raw in daily.read_text(encoding="utf-8").splitlines():
-                obj = json.loads(raw)
-                if isinstance(obj, dict) and isinstance(obj.get("sequence"), int):
-                    highest = max(highest, obj["sequence"])
-        except (OSError, ValueError, TypeError):
-            continue
+        hint = None
+    if hint is None:
+        return _full_scan_max_sequence(conv_dir) + 1
+    highest = hint
+    for daily in sorted(conv_dir.glob("*.jsonl"), reverse=True)[:2]:
+        highest = max(highest, _tail_max_sequence(daily))
     return highest + 1
 
 

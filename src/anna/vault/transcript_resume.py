@@ -80,7 +80,7 @@ def validated_checkpoint_coverage(
         value = int(sequence.group(1))
         if value <= 0:
             continue
-        for transcript in sorted(base_dir.glob("*.jsonl")):
+        for transcript in sorted(base_dir.glob("*.jsonl"), reverse=True):
             try:
                 raw_lines = transcript.read_text(encoding="utf-8").splitlines()
             except OSError:
@@ -104,22 +104,28 @@ def has_uncovered_event_before(
     conv_key: str,
     sequence: int,
     covered_through_sequence: int | None,
+    *,
+    seen_sequences: set[int] | frozenset[int] = frozenset(),
 ) -> bool:
     """Whether a new worker would skip durable history before ``sequence``.
 
-    This is intentionally conservative: a legacy/no-sequence line or an
-    ordered event outside validated coverage prevents a new closeout summary
-    from advancing the cursor. The raw tail remains available instead.
+    Conservative: a legacy/no-sequence line or an ordered event outside
+    validated coverage blocks a new closeout summary from advancing the cursor.
+    Events the session was explicitly shown at resume (``seen_sequences``, the
+    tail injected into its prompt) count as covered, so one failed closeout does
+    not freeze coverage forever.  Files are scanned newest first and the scan
+    stops once a file lies entirely at or below the covered floor.
     """
     base_dir = transcripts_dir / _safe_key(conv_key)
     floor = covered_through_sequence or 0
     if not base_dir.is_dir():
         return False
-    for path in sorted(base_dir.glob("*.jsonl")):
+    for path in sorted(base_dir.glob("*.jsonl"), reverse=True):
         try:
             raw_lines = path.read_text(encoding="utf-8").splitlines()
         except OSError:
             continue
+        file_max = 0
         for raw in raw_lines:
             try:
                 obj = json.loads(raw)
@@ -130,9 +136,51 @@ def has_uncovered_event_before(
             event_sequence = obj.get("sequence")
             if not isinstance(event_sequence, int):
                 return True
-            if floor < event_sequence < sequence:
+            file_max = max(file_max, event_sequence)
+            if floor < event_sequence < sequence and event_sequence not in seen_sequences:
                 return True
+        if file_max and file_max <= floor:
+            break
     return False
+
+
+def extend_coverage_through_outbound(
+    transcripts_dir: Path, conv_key: str, sequence: int
+) -> tuple[int, str] | None:
+    """Extend a processed inbound sequence over the replies that directly follow it.
+
+    The reply to inbound N is N+1 (same directory, same counter).  A checkpoint
+    that covers the turn covers its replies; stopping at the next inbound keeps
+    unprocessed (queued) messages above coverage.  Reads only the newest files.
+    Returns ``(sequence, event_id)`` of the last covered line, or None if the
+    anchor line itself cannot be found.
+    """
+    base_dir = transcripts_dir / _safe_key(conv_key)
+    if not base_dir.is_dir():
+        return None
+    by_seq: dict[int, dict[str, object]] = {}
+    for path in sorted(base_dir.glob("*.jsonl"), reverse=True)[:2]:
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for raw in lines:
+            try:
+                obj = json.loads(raw)
+            except (ValueError, TypeError):
+                continue
+            seq = obj.get("sequence") if isinstance(obj, dict) else None
+            if isinstance(seq, int) and seq >= sequence:
+                by_seq[seq] = obj
+    anchor = by_seq.get(sequence)
+    if anchor is None or not isinstance(anchor.get("event_id"), str):
+        return None
+    end, end_id = sequence, anchor["event_id"]
+    while True:
+        nxt = by_seq.get(end + 1)
+        if nxt is None or nxt.get("direction") != "outbound" or not isinstance(nxt.get("event_id"), str):
+            return end, end_id
+        end, end_id = end + 1, nxt["event_id"]
 
 
 def _safe_key(conv_key: str) -> str:
@@ -189,13 +237,12 @@ def transcript_tail_since(
     if not base_dir.is_dir():
         return []
 
-    # Read every retained JSONL day. An old event without validated coverage
-    # must remain retrievable; trimming happens below, not by silently
-    # excluding whole days.
-    daily = sorted(base_dir.glob("*.jsonl"))
-
+    # Newest day first; stop once the collected uncovered lines already fill
+    # the turn/token budget, because trimming keeps only the newest window and
+    # older days could not change the result.
     lines: list[dict] = []
-    for path in daily:
+    for path in sorted(base_dir.glob("*.jsonl"), reverse=True):
+        day: list[dict] = []
         try:
             raw = path.read_text(encoding="utf-8")
         except OSError:
@@ -220,7 +267,11 @@ def transcript_tail_since(
                 ts = _parse_ts(obj.get("ts"))
                 if ts is None or ts <= since_mtime:
                     continue
-            lines.append(obj)
+            day.append(obj)
+        lines = day + lines
+        inbound = sum(1 for o in lines if o.get("direction") == "inbound")
+        if inbound > max_turns or sum(count_tokens(o.get("text") or "") for o in lines) > max_tokens:
+            break
 
     if not lines:
         return []

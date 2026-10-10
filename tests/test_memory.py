@@ -46,4 +46,4 @@ async def test_memory_tools_reject_cross_scope_mutation(tmp_path: Path) -> None:
     private = MemoryTools(store, owner_id="seth", scope="private", source_event_id=lambda: None)
     group = MemoryTools(store, owner_id="seth", scope="group:release", source_event_id=lambda: None)
     await private.remember(kind="preference", subject="secret", content="private value")
-    assert "outside" in (await group.forget(fact_id=1))["content"][0]["text"]
+    assert "no such memory" in (await group.forget(fact_id=1))["content"][0]["text"]

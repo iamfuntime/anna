@@ -460,6 +460,7 @@ class TelegramAdapter(ChannelAdapter):
             is_dm=is_dm,
             is_thread=False,
             raw=raw,
+            human_origin=True,
         )
 
     # ------------------------------------------------------------------

@@ -253,6 +253,7 @@ class CLIAdapter(ChannelAdapter):
             is_dm=True,
             is_thread=False,
             raw={"mode": session.mode, "username": session.username},
+            human_origin=True,
             stream_subscriber=_stream,
             # Phase 2 §5 subtask 7: one-shot ``anna ask`` sessions must
             # not write a checkpoint at closeout. The router reads this

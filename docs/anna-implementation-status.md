@@ -383,6 +383,44 @@ finding categories in touched legacy files; new files clean. Not done: dashboard
 view of occurrences/outbox, operator command to resolve `unknown`/`uncertain`
 rows, the heartbeat job itself.
 
+## Review fixes (foundation review `10ff5ba`)
+
+Source: `/tmp/anna-foundation-review-10ff5ba.md`. Regressions: `tests/test_review_fixes.py`
+(27 tests; 23 fail against the pre-fix tree, the 4 that pass pre-fix are guard/hardening
+checks: H2 router-event shape, M6 stale-cursor, M6 early-stop tail read, L4 claim recheck).
+
+| finding | status | fix |
+| --- | --- | --- |
+| H1 outbound split across dirs | fixed | `OutboundMessage.transcript_conversation_key`; worker sets its canonical key, router transcribes there; delivery address unchanged |
+| H2 sub-agent text extracted | fixed | positive allow flag `InboundEvent.human_origin`, set only by the Slack/Telegram/CLI adapters (plus DM-only, interactive, writable-scope); recalled facts are escaped, fenced and labelled untrusted data (`render_memory_block`) |
+| M1 coverage frozen | fixed | closeout coverage extends over the replies that follow the last processed inbound (`extend_coverage_through_outbound`, stops at the next inbound so queued messages stay uncovered); events shown in the session's own resume tail count as seen, so one failed closeout no longer freezes coverage |
+| M2 coverage over failed turn | fixed | a query/receive failure freezes coverage for that worker; later turns cannot hide the unseen one (the next worker's resume tail shows it) |
+| M3 correct revive/fork | fixed | `correct` is one `BEGIN IMMEDIATE` transaction, only for an ACTIVE fact in the caller's owner/scope; forgotten/superseded rejected (`FactNotActive`) |
+| M4 delayed resurrection | fixed | explicit and extraction use `_event_source_id` (transcript event id first); any candidate from a source event whose fact was forgotten/superseded is held; an active explicit fact from the same event makes the candidate a duplicate, regardless of wording |
+| M5 unreachable remember | fixed | schedule / one-shot / ephemeral workers return an explicit "nothing was saved" error for remember/correct/forget (no fake success) |
+| M6 per-message history scan | fixed | sequence allocation trusts the cursor plus a bounded tail read of the newest day files; full scan only when the cursor is missing and is per-line tolerant (a malformed line no longer resets sequences); tail reads go newest-day-first and stop when the budget is full; coverage validation scans newest first |
+| L1 weak evidence | fixed | quote must be >= 10 chars and share a 5-char stem with subject/content, else `insufficient_evidence` |
+| L2 billing env | fixed | extraction refuses to start when `ANTHROPIC_API_KEY`/`AUTH_TOKEN`/Bedrock/Vertex/Foundry selectors are in the environment unless `allow_api_key_billing`; in max mode the extractor also blanks them in its CLI env. Not verified against the live CLI (no credentials used) |
+| L3 existence oracle | fixed | unknown id and other-scope id return one message |
+| L4 claim recheck | fixed (hardening) | `complete_extraction` runs under `BEGIN IMMEDIATE` and the final update carries the `claim_token` predicate |
+| L5 connections / stalls | fixed | memory store opens lazily (ephemeral workers never open it) and is closed in `stop()`; busy timeout 1s (ledger 2s) instead of 10s |
+| L6 retention of forgotten text | fixed | candidates held for forgotten/superseded wording keep no subject/content/evidence (only the dedup hash and reason) |
+| new (security-review) | fixed | `state/*.sqlite3`, backups: 0600, state dir 0700 (`private_file`) |
+
+Deferred (by the review itself): per-thread Slack scopes (design choice); paraphrase of a
+forgotten fact in a LATER, different message can be re-learned (wording-based dedup
+limit); real-extractor behaviour (code-fenced JSON etc.) and the extractor CLI session
+files under `CLAUDE_CONFIG_DIR` need a live model/credentials and were not run.
+
+Retention / purge boundaries (explicit): forgetting a fact deletes its stored evidence
+and any retained candidate text; the source job's text is purged when the job reaches a
+terminal state (a still-pending job keeps its text until it runs). NOT purged by forget:
+the transcript JSONL, checkpoints and audit log (history is retained by design), the
+dedup hash that blocks resurrection, and any copy the extractor's CLI session wrote.
+
+Validation: full suite 1,509 passed, 1 skipped; ruff clean on new/changed memory files
+and tests, mypy clean except pre-existing `dict` generics in `transcript_resume.py`.
+
 ## Deferred milestones
 
 1. **Phase 0:** finish exact event coverage/replay.

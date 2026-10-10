@@ -191,6 +191,11 @@ class InboundEvent:
     # happened in ``turn_meta["turn_state"]`` (dropped | running | finished) and
     # ``turn_meta["cancel_requested"]``.
     cancel: asyncio.Event | None = field(default=None, compare=False, hash=False, repr=False)
+    # Set ONLY by transport adapters for a message positively identified as
+    # typed/spoken by an authorized human. Synthetic events (scheduler,
+    # background sub-agent completions, tool results) leave it False, which is
+    # the gate for memory extraction.
+    human_origin: bool = field(default=False, compare=False, hash=False)
     # The destination that received this event.  ``conversation_key`` can be
     # canonicalized by the router for shared worker state, so it is not by
     # itself a safe reply address.
@@ -209,6 +214,10 @@ class OutboundMessage:
     # Set by the worker for replies to a transport event.  Kept optional so
     # existing direct adapter callers retain their established behavior.
     transport: str | None = None
+    # The worker's canonical conversation key, kept separate from the delivery
+    # address in ``conversation_key`` (an aliased owner replies to a channel but
+    # their transcript belongs to ``user:<canonical>``).
+    transcript_conversation_key: str | None = None
 
 
 @dataclass

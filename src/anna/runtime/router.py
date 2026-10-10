@@ -342,7 +342,7 @@ class ConversationRouter:
             await adapter.send(message)
             transcript_event(
                 channel=transport,
-                conv_key=message.conversation_key,
+                conv_key=message.transcript_conversation_key or message.conversation_key,
                 transcripts_dir=self._config.transcripts_dir,
                 direction="outbound",
                 text=message.text,

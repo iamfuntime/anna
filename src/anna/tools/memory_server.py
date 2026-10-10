@@ -6,21 +6,36 @@ from typing import Any
 
 from claude_agent_sdk import create_sdk_mcp_server, tool
 
-from anna.runtime.memory import MemoryStore
+from anna.runtime.memory import FactNotActive, MemoryStore
 
 
 class MemoryTools:
-    def __init__(self, store: MemoryStore, *, owner_id: str, scope: str, source_event_id: Callable[[], str | None]) -> None:
+    def __init__(self, store: MemoryStore, *, owner_id: str, scope: str, source_event_id: Callable[[], str | None],
+                 writable: bool = True) -> None:
         self.store = store
         self.owner_id = owner_id
         self.scope = scope
         self._source_event_id = source_event_id
+        self.writable = writable
+
+    @staticmethod
+    def _text(message: str) -> dict[str, Any]:
+        return {"content": [{"type": "text", "text": message}]}
+
+    _NOT_WRITABLE = ("error: memory writes are unavailable in scheduled or one-shot sessions "
+                     "(nothing was saved); ask in a normal conversation instead")
+
+    def _missing(self, fact_id: int) -> dict[str, Any]:
+        # One message for "no such id" and "belongs to another scope": no existence oracle.
+        return self._text(f"error: no such memory #{fact_id} in this conversation scope")
 
     async def remember(self, *, kind: str, subject: str, content: str) -> dict[str, Any]:
+        if not self.writable:
+            return self._text(self._NOT_WRITABLE)
         # remember() returns only after SQLite's transaction has committed.
         fact = self.store.remember(owner_id=self.owner_id, visibility_scope=self.scope, kind=kind,
                                   subject=subject, content=content, source_event_id=self._source_event_id())
-        return {"content": [{"type": "text", "text": f"Remembered fact #{fact.id}: {fact.subject}."}]}
+        return self._text(f"Remembered fact #{fact.id}: {fact.subject}.")
 
     async def search(self, *, query: str) -> dict[str, Any]:
         facts = self.store.search(owner_id=self.owner_id, visibility_scopes={self.scope}, query=query)
@@ -28,18 +43,26 @@ class MemoryTools:
         return {"content": [{"type": "text", "text": text}]}
 
     async def correct(self, *, fact_id: int, content: str) -> dict[str, Any]:
-        prior = self.store.get(fact_id)
-        if prior.owner_id != self.owner_id or prior.visibility_scope != self.scope:
-            return {"content": [{"type": "text", "text": "error: memory is outside this conversation scope"}]}
-        fact = self.store.correct(fact_id, content=content, source_event_id=self._source_event_id())
-        return {"content": [{"type": "text", "text": f"Corrected memory #{fact_id} with fact #{fact.id}."}]}
+        if not self.writable:
+            return self._text(self._NOT_WRITABLE)
+        try:
+            fact = self.store.correct(fact_id, content=content, source_event_id=self._source_event_id(),
+                                      owner_id=self.owner_id, visibility_scope=self.scope)
+        except KeyError:
+            return self._missing(fact_id)
+        except FactNotActive:
+            return self._text(f"error: memory #{fact_id} is no longer active (forgotten or already corrected); "
+                              "use memory_search to find the current one or memory_remember to add it again")
+        return self._text(f"Corrected memory #{fact_id} with fact #{fact.id}.")
 
     async def forget(self, *, fact_id: int) -> dict[str, Any]:
-        prior = self.store.get(fact_id)
-        if prior.owner_id != self.owner_id or prior.visibility_scope != self.scope:
-            return {"content": [{"type": "text", "text": "error: memory is outside this conversation scope"}]}
-        self.store.forget(fact_id)
-        return {"content": [{"type": "text", "text": f"Forgot memory #{fact_id}; transcript/audit history is retained."}]}
+        if not self.writable:
+            return self._text(self._NOT_WRITABLE)
+        try:
+            self.store.forget(fact_id, owner_id=self.owner_id, visibility_scope=self.scope)
+        except KeyError:
+            return self._missing(fact_id)
+        return self._text(f"Forgot memory #{fact_id}; transcript/audit history is retained.")
 
 
 def build_memory_server(*, tools: MemoryTools) -> Any:

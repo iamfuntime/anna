@@ -33,6 +33,8 @@ from typing import Any
 
 from croniter import croniter
 
+from anna.runtime.fsutil import private_file
+
 ACTIVE_EXEC = ("claimed", "running")
 TERMINAL_EXEC = ("succeeded", "failed", "timeout", "cancelled", "unknown", "blocked",
                  "skipped_overlap", "skipped_misfire")
@@ -114,9 +116,9 @@ def split_chunks(text: str, limit: int) -> list[str]:
 
 class RuntimeLedger:
     def __init__(self, path: Path) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        private_file(path)
         self._path = path
-        self._conn = sqlite3.connect(path, timeout=10)
+        self._conn = sqlite3.connect(path, timeout=2.0)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
@@ -142,7 +144,7 @@ class RuntimeLedger:
     def backup(self, dest: Path) -> Path:
         if dest.exists():
             raise FileExistsError(dest)
-        target = sqlite3.connect(dest)
+        target = sqlite3.connect(private_file(dest))
         try:
             self._conn.backup(target)
         finally:

@@ -552,6 +552,7 @@ class SlackAdapter(ChannelAdapter):
             is_thread=is_thread,
             raw=event,
             images=images,
+            human_origin=True,
         )
 
     # ------------------------------------------------------------------

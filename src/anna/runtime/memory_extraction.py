@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import unicodedata
 from dataclasses import dataclass
@@ -50,6 +51,27 @@ def _canonical(text: str) -> str:
     """NFKC-fold and drop control/format characters so checks see what a reader sees."""
     folded = unicodedata.normalize("NFKC", text)
     return "".join(ch for ch in folded if unicodedata.category(ch) not in ("Cf", "Cc") or ch in "\n\t ")
+
+
+_API_BILLING_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK",
+                    "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY")
+MIN_EVIDENCE_CHARS = 10
+_TOKEN = re.compile(r"[a-z0-9]{4,}")
+
+
+def evidence_supports(evidence: str, subject: str, content: str) -> bool:
+    """A quote must be substantial and share a stem with what it is claimed to support.
+
+    A bare substring match is trivially satisfiable ("a" is in every sentence), so
+    require a minimum length and at least one shared 5-character word stem with the
+    subject or content.
+    """
+    ev = normalize_text(evidence)
+    if len(ev) < MIN_EVIDENCE_CHARS:
+        return False
+    stems = {t[:5] for t in _TOKEN.findall(ev)}
+    claim = {t[:5] for t in _TOKEN.findall(normalize_text(subject) + " " + normalize_text(content))}
+    return bool(stems & claim)
 
 
 class MalformedExtraction(ValueError):
@@ -99,6 +121,7 @@ def validate_result(raw: str | dict[str, Any], *, source_text: str, max_candidat
             "kind": item["kind"], "subject": item["subject"].strip(), "content": item["content"].strip(),
             "evidence": item["evidence"].strip(), "source_type": item["source"], "confidence": float(conf),
             "evidence_ok": normalize_text(_canonical(item["evidence"])) in source_norm,
+            "evidence_sufficient": evidence_supports(item["evidence"], item["subject"], item["content"]),
             "hidden_chars": hidden,
             "instruction_like": any(_INSTRUCTION_LIKE.search(_canonical(item[k]))
                                     for k in ("subject", "content", "evidence")),
@@ -113,6 +136,12 @@ def extraction_blocked_reason(config: AnnaConfig) -> str | None:
         return "memory.extraction.enabled is false"
     if config.auth.mode == "api_key" and not cfg.allow_api_key_billing:
         return "auth.mode is api_key (metered); set memory.extraction.allow_api_key_billing to opt in"
+    present = [name for name in _API_BILLING_ENV if os.environ.get(name)]
+    if present and not cfg.allow_api_key_billing:
+        # The CLI inherits the daemon's environment; a stray key/provider selector
+        # could meter extraction even though auth.mode is "max".
+        return (f"{', '.join(present)} is set in the environment (metered credentials); unset it or set "
+                "memory.extraction.allow_api_key_billing to opt in")
     return None
 
 
@@ -129,6 +158,9 @@ class SdkMemoryExtractor:
         env = {"CLAUDE_CONFIG_DIR": str(self._config.claude_runtime_dir)}
         if self._config.auth.mode == "max":
             env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] = str(self._config.claude_securestorage_dir)
+            if not cfg.allow_api_key_billing:
+                # Max-plan extraction must never fall through to a metered key.
+                env.update({name: "" for name in _API_BILLING_ENV})
         state = self._config.state_dir / "memory-extractor"
         state.mkdir(parents=True, exist_ok=True)
         return ClaudeAgentOptions(
