@@ -2198,13 +2198,13 @@ class ConversationWorker:
         """Whether to run the interactive-turn watchdog for this turn.
 
         Active only for an enabled, INTERACTIVE (non-scheduler) turn on a
-        buffered transport (Slack/Telegram) — the exact place the buffered
-        transport can hold the operator's channel hostage. The scheduler path
+        buffered transport (Slack/Telegram) — the exact place a long turn can
+        hold the operator's channel hostage. The scheduler path
         (``completion_future`` set) is exempt, and the CLI transport streams
-        deltas live so its channel never goes dead. Unlike the drip gate this
-        stays active under ``consolidate_interactive_turns``: a breach flush is
-        a deliberate override of consolidation because a dead channel outweighs
-        the one-message preference.
+        deltas live so its channel never goes dead. Monitoring remains active
+        even when incremental delivery is disabled so breach telemetry and the
+        next-turn reminder are not lost; the loop separately gates an
+        intermediate flush on the delivery policy.
         """
         if not self._turn_watchdog_cfg.enabled:
             return False
@@ -2244,7 +2244,13 @@ class ConversationWorker:
                     action = watchdog.poll()
                     if action is WatchdogAction.NONE:
                         continue
-                    await self._flush_buffer_now(event, buffer)
+                    # A watchdog breach remains observable even when the
+                    # operator intentionally chose consolidated output (or
+                    # voice-only output). Do not override that choice by
+                    # fragmenting the reply; only an active periodic-delivery
+                    # policy permits an intermediate watchdog flush.
+                    if self._periodic_flush_active(event):
+                        await self._flush_buffer_now(event, buffer)
                     if action is WatchdogAction.SOFT:
                         self._pending_watchdog_reminder = soft_reminder(
                             self._turn_watchdog_cfg.soft_threshold_seconds

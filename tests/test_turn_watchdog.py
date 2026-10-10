@@ -568,6 +568,10 @@ async def test_watchdog_loop_soft_breach_flushes_and_stashes_reminder(
     the operator and stashes the soft forcing reminder for the next turn."""
     sent: list[OutboundMessage] = []
     worker = _make_worker(tmp_path, sent)
+    # The test exercises a text-delivery watchdog flush, not voice-only
+    # delivery (which intentionally remains consolidated).
+    worker._config.voice.outbound.enabled = False
+    worker._flush_interval = 30
 
     clock = FakeClock()
     wd = _watchdog(clock)  # soft 60, hard 120
@@ -607,6 +611,8 @@ async def test_watchdog_loop_hard_breach_records_and_alerts_once(
     alerter = _RecordingAlerter()
     sent: list[OutboundMessage] = []
     worker = _make_worker(tmp_path, sent, alerter=alerter)
+    worker._config.voice.outbound.enabled = False
+    worker._flush_interval = 30
 
     clock = FakeClock()
     wd = _watchdog(clock)  # soft 60, hard 120
