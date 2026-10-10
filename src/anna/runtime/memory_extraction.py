@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import unicodedata
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
@@ -45,6 +46,12 @@ Return ONLY JSON: {"candidates":[{"kind","subject","content","evidence","source"
 - confidence: 0..1. Return {"candidates":[]} when nothing durable is stated."""
 
 
+def _canonical(text: str) -> str:
+    """NFKC-fold and drop control/format characters so checks see what a reader sees."""
+    folded = unicodedata.normalize("NFKC", text)
+    return "".join(ch for ch in folded if unicodedata.category(ch) not in ("Cf", "Cc") or ch in "\n\t ")
+
+
 class MalformedExtraction(ValueError):
     """The extractor result did not match the candidate schema."""
 
@@ -70,7 +77,7 @@ def validate_result(raw: str | dict[str, Any], *, source_text: str, max_candidat
     items = data["candidates"]
     if len(items) > max_candidates:
         raise MalformedExtraction(f"too many candidates ({len(items)} > {max_candidates})")
-    source_norm = normalize_text(source_text)
+    source_norm = normalize_text(_canonical(source_text))
     out: list[dict[str, Any]] = []
     for item in items:
         if not isinstance(item, dict) or set(item) != _CANDIDATE_KEYS:
@@ -85,13 +92,16 @@ def validate_result(raw: str | dict[str, Any], *, source_text: str, max_candidat
             raise MalformedExtraction(f"unknown kind {item['kind']!r}")
         if item["source"] not in SOURCE_TYPES:
             raise MalformedExtraction(f"unknown source {item['source']!r}")
+        if any(_canonical(item[k]) != item[k].replace("\r", "") for k in ("subject", "content", "evidence")):
+            raise MalformedExtraction("candidate contains control or hidden formatting characters")
         if len(item["subject"]) > 120 or len(item["content"]) > 500 or len(item["evidence"]) > 500:
             raise MalformedExtraction("candidate field exceeds length cap")
         out.append({
             "kind": item["kind"], "subject": item["subject"].strip(), "content": item["content"].strip(),
             "evidence": item["evidence"].strip(), "source_type": item["source"], "confidence": float(conf),
-            "evidence_ok": normalize_text(item["evidence"]) in source_norm,
-            "instruction_like": bool(_INSTRUCTION_LIKE.search(item["content"]) or _INSTRUCTION_LIKE.search(item["subject"])),
+            "evidence_ok": normalize_text(_canonical(item["evidence"])) in source_norm,
+            "instruction_like": any(_INSTRUCTION_LIKE.search(_canonical(item[k]))
+                                    for k in ("subject", "content", "evidence")),
         })
     return out
 

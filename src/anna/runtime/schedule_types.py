@@ -76,5 +76,15 @@ class Schedule(BaseModel):
     timeout_seconds: int = 300
     enabled: bool = True
     ephemeral: bool = False
+    # What the scheduler executes. Only the legacy agent prompt exists today;
+    # typed deterministic jobs (heartbeat) register further kinds.
+    job_kind: Literal["agent_prompt"] = "agent_prompt"
+    # Crash-recovery safety. ``side_effecting`` runs interrupted mid-flight are
+    # recorded as unknown and never re-run; ``read_only`` runs may be retried.
+    run_safety: Literal["side_effecting", "read_only"] = "side_effecting"
+    # None inherits scheduler.default_* from config.
+    overlap_policy: Literal["skip", "queue"] | None = None
+    misfire_policy: Literal["run_latest", "skip_late"] | None = None
+    misfire_grace_seconds: int | None = None
     created_at: datetime
     state: ScheduleState = Field(default_factory=ScheduleState)

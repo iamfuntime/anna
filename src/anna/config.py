@@ -1126,6 +1126,24 @@ class SchedulerConfig(BaseModel):
     poll_interval_seconds: int = 30
     failure_threshold: int = 3
 
+    # Durable runtime ledger (state/runtime.sqlite3): occurrences, runs, outbox.
+    # Defaults preserve legacy behavior: one catch-up run after downtime,
+    # no overlapping runs of one schedule.
+    default_overlap_policy: Literal["skip", "queue"] = "skip"
+    default_misfire_policy: Literal["run_latest", "skip_late"] = "run_latest"
+    misfire_grace_seconds: int = 3600
+    lease_grace_seconds: int = 60
+    max_run_attempts: int = 3
+    cancel_grace_seconds: float = 5.0
+    delivery_max_attempts: int = 5
+    delivery_backoff_base_seconds: float = 30.0
+    delivery_backoff_max_seconds: float = 900.0
+    delivery_chunk_chars: int = 3500
+    send_timeout_seconds: float = 30.0
+    # Retry sends whose failure cannot prove "not delivered" (default: no;
+    # they are recorded as uncertain and never auto-resent).
+    retry_unknown_send_errors: bool = False
+
     @property
     def resolved_state_path(self) -> Path:
         return Path(os.path.expanduser(self.state_path))

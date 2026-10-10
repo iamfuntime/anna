@@ -3018,7 +3018,10 @@ class ConversationWorker:
         counted but never raised: the reply has already been handled.
         """
         cfg = self._config.memory.extraction
-        if not cfg.enabled or event.completion_future is not None or event.ephemeral:
+        # Trust boundary: only a direct message from an authorized human is the
+        # owner's own words. Group/channel messages can come from other
+        # participants, so they are never auto-extracted.
+        if not cfg.enabled or event.completion_future is not None or event.ephemeral or not event.is_dm:
             return
         text = (event.text or "").strip()
         if len(text) < cfg.min_source_chars:
