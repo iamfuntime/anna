@@ -244,12 +244,18 @@ async def test_delete_running_cancels_turn_and_drops_unsent_output(tmp_path):
     assert got.exec_status == "cancelled" and adapter.sent == []
 
 
+def router_cancelled(router):
+    return bool(router.events and router.events[0].cancel.is_set())
+
+
 async def test_delete_from_other_process_is_reconciled_on_poll(tmp_path):
     cfg, store, router, adapter, sched = await build(tmp_path, router=Router("honor_cancel", tools=0))
     await sched._poll_once(); await asyncio.sleep(0.02)
     other = ScheduleStore(config=cfg, supervisor=Supervisor(config=cfg))  # the dashboard process
     await other.delete("s1")
-    await sched._poll_once(); await settle(sched)
+    await sched._poll_once()                        # first absence is not trusted yet
+    assert not router_cancelled(router)
+    await sched._poll_once(); await settle(sched)  # confirmed on the second consecutive load
     assert router.events[0].cancel.is_set()
     assert sched._ledger.recent("s1")[0].exec_status == "cancelled"
 
@@ -257,7 +263,7 @@ async def test_delete_from_other_process_is_reconciled_on_poll(tmp_path):
 # ---- delivery is separate from execution -------------------------------------------------
 
 async def test_send_failure_keeps_outbox_and_retry_does_not_rerun_execution(tmp_path):
-    adapter = FakeAdapter(); adapter.send_should_raise = ConnectionError("net down")
+    adapter = FakeAdapter(); adapter.send_should_raise = ConnectionRefusedError("net down")
     cfg, store, router, _, sched = await build(tmp_path, adapter=adapter)
     await sched._poll_once(); await settle(sched)
     occ = sched._ledger.recent("s1")[0]
@@ -310,7 +316,7 @@ async def test_chunks_retry_only_the_failed_chunk_in_order(tmp_path):
         async def send(self, message: OutboundMessage) -> None:
             if "line number 02" in message.text and self.fail_once:
                 self.fail_once = False
-                raise ConnectionError("blip")
+                raise ConnectionRefusedError("blip")
             calls.append(message.text); self.sent.append(message)
 
     adapter = Flaky()

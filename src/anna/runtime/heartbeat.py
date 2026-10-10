@@ -33,6 +33,7 @@ import asyncio
 import hashlib
 import json
 import re
+import time as _time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time, timedelta
@@ -53,6 +54,9 @@ API = "api_error"
 BUSY = "busy"
 PARTIAL = "partial"  # check completed what it could but more is pending
 BACKPRESSURE = "backpressure"
+MISCONF = "misconfigured"  # job cannot run at all (no client / accounts / google disabled)
+JOB_KEY = ("*", "job")  # heartbeat_state row for whole-job failures
+REANNOUNCE_PREFIX = "⚠️ An earlier alert may not have reached you"
 NON_OK = {AUTH, RATE, API, BUSY, PARTIAL, BACKPRESSURE}
 _CTRL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f​-‏‪-‮⁦-⁩]")
 
@@ -107,6 +111,15 @@ def escape_for_transport(transport: str, text: str) -> str:
     return text
 
 
+def heartbeat_min_timeout(cfg: HeartbeatConfig) -> float:
+    """Smallest whole-job timeout that cannot cut off healthy per-check budgets (sequential per account)."""
+    return cfg.check_timeout_seconds * len(cfg.services) + 30.0
+
+
+def cfg_budget(cfg: HeartbeatConfig) -> float:
+    return cfg.gmail_time_budget_seconds
+
+
 def clean(text: str, limit: int = 160) -> str:
     """Untrusted provider text: strip control/bidi characters, collapse whitespace, bound length."""
     text = _CTRL.sub("", text or "")
@@ -135,6 +148,8 @@ class CheckResult:
     pages: int = 0
     resynced: bool = False
     more_pending: bool = False
+    bootstrap_truncated: bool = False  # a bounded resync listed only the newest unread; older ones are NOT pending
+    scan_incomplete: str | None = None
     error_class: str | None = None
     error: str | None = None
     alert: str | None = None
@@ -146,6 +161,7 @@ class CheckResult:
             "checked_at": self.checked_at, "cursor_before": self.cursor_before,
             "cursor_after": self.cursor_after, "new_items": len(self.items), "seen": self.seen,
             "pages": self.pages, "resynced": self.resynced, "more_pending": self.more_pending,
+            "bootstrap_truncated": self.bootstrap_truncated, "scan_incomplete": self.scan_incomplete,
             "error_class": self.error_class, "error": self.error,
         }
         digest = hashlib.sha256(
@@ -157,6 +173,7 @@ class CheckResult:
 class Notice:
     text: str
     urgent: bool = False
+    preescaped: bool = False  # text was already escaped when first queued (re-announcements)
 
 
 @dataclass
@@ -201,8 +218,8 @@ def plan_alert(prev: dict[str, Any] | None, status: str, now: datetime, cfg: Hea
     same = prev_status == status
     failures = failures + 1 if (same or prev_status != OK) else 1
     fields["consecutive_failures"] = failures
-    if status == AUTH:
-        first = prev_status != AUTH
+    if status in (AUTH, MISCONF):
+        first = prev_status != status
     else:
         first = failures == cfg.transient_failures_before_alert and sent == 0
     if first:
@@ -248,6 +265,7 @@ class HeartbeatJob:
         self._ledger = ledger
         self._classifier = classifier
         self._clock = clock
+        self._monotonic = _time.monotonic
         self._log = get_logger("anna.heartbeat")
 
     # ----------------------------------------------------------------- driver
@@ -265,8 +283,7 @@ class HeartbeatJob:
         if not self._config.google.enabled or not targets or self._clients is None:
             reason = ("google integration is disabled" if not self._config.google.enabled else
                       "no google accounts selected" if not targets else "no Google client available")
-            return HeartbeatOutcome("failed", [], [], HeartbeatCommit(),
-                                    {"status": "failed", "error": reason, "checks": []})
+            return self.job_failure(schedule, MISCONF, reason, now, tz)
         by_account: dict[str, list[str]] = {}
         for account, service in targets:
             by_account.setdefault(account, []).append(service)
@@ -274,6 +291,28 @@ class HeartbeatJob:
                                              for a, svcs in by_account.items()))
         checks = [c for group in per_account for c in group]
         return await self._finish(schedule, scheduled_for, checks, now, tz)
+
+    def job_failure(self, schedule: Schedule, status: str, reason: str, now: datetime, tz: ZoneInfo | None = None
+                    ) -> HeartbeatOutcome:
+        """A whole-job failure (timeout, exception, nothing to run) goes through the same
+        transition alerting as a failed check, so it can never look like a quiet healthy tick."""
+        cfg = self._cfg
+        prev = self._ledger.heartbeat_state(schedule.id, *JOB_KEY)
+        kind, fields = plan_alert(prev, status, now, cfg)
+        state = {"account": JOB_KEY[0], "service": JOB_KEY[1], "cursor": (prev or {}).get("cursor"),
+                 "last_checked_at": iso(now), "last_ok_at": (prev or {}).get("last_ok_at"),
+                 "resync_count": int((prev or {}).get("resync_count", 0)), **fields}
+        commit = HeartbeatCommit(states=[state], retention_days=cfg.notified_retention_days)
+        notices = []
+        if kind == "recovered":
+            notices.append(Notice("✅ The Google heartbeat is working again."))
+        elif kind:
+            prefix = "⚠️ Reminder: " if kind == "reminder" else "⚠️ "
+            notices.append(Notice(f"{prefix}The Google heartbeat could not complete ({clean(reason, 120)}). "
+                                  "I can't confirm there is nothing new in your mail or calendar until that is fixed."))
+        summary = {"status": "failed", "error": clean(reason, 200), "checks": [], "job_alert": kind,
+                   "notifications": [n.text[:200] for n in notices]}
+        return HeartbeatOutcome("failed", [], notices, commit, summary)
 
     async def _check_account(self, schedule: Schedule, account: str, services: list[str], now: datetime,
                              tz: ZoneInfo) -> list[CheckResult]:
@@ -309,9 +348,10 @@ class HeartbeatJob:
         cursor = state.get("cursor")
         ids: list[str] = []
         head: str | None = None
+        rec_of: dict[str, int] = {}
         if cursor:
             try:
-                ids, head, res.more_pending = await self._gmail_history(account, cursor, res)
+                ids, head, res.more_pending, rec_of = await self._gmail_history(account, cursor, res)
             except InvalidCursor:
                 res.resynced, cursor = True, None
         if not cursor:
@@ -319,13 +359,28 @@ class HeartbeatJob:
             if not isinstance(profile, dict) or "historyId" not in profile:
                 raise ValueError("malformed gmail profile response")
             head = str(profile["historyId"])  # read BEFORE listing so nothing falls in the gap
-            ids, res.more_pending = await self._gmail_bootstrap(account, res)
+            ids, truncated = await self._gmail_bootstrap(account, res)
+            # The cursor jumps to the profile head, so anything beyond the page cap is NOT
+            # continued on the next tick; report that truthfully instead of "more pending".
+            res.bootstrap_truncated = truncated
+            res.more_pending = truncated
             res.cursor_after = head
         else:
             res.cursor_after = head
         res.seen = len(ids)
         found: list[dict[str, Any]] = []
-        for mid in ids:
+        deadline = self._monotonic() + cfg_budget(self._cfg)
+        for pos, mid in enumerate(ids):
+            if self._monotonic() > deadline:
+                # Total time budget: stop fetching.  On the history path the cursor must not pass the
+                # unfetched messages, so step back to just before the first unfetched record.
+                res.more_pending = True
+                res.scan_incomplete = f"time budget reached after {pos}/{len(ids)} messages"
+                if rec_of and not res.bootstrap_truncated:
+                    first = min(rec_of.get(m, 10**18) for m in ids[pos:])
+                    floor = int(cursor) if cursor else 0
+                    res.cursor_after = str(max(floor, first - 1))
+                break
             try:
                 msg = await self._call(account, "gmail", lambda s, m=mid: s.users().messages().get(  # type: ignore[misc]
                     userId="me", id=m, format="metadata", metadataHeaders=["From", "Subject", "Date"]).execute())
@@ -349,14 +404,17 @@ class HeartbeatJob:
         if res.more_pending:
             res.status = PARTIAL
 
-    async def _gmail_history(self, account: str, cursor: str, res: CheckResult) -> tuple[list[str], str | None, bool]:
+    async def _gmail_history(self, account: str, cursor: str, res: CheckResult
+                             ) -> tuple[list[str], str | None, bool, dict[str, int]]:
         cfg = self._cfg
         ids: list[str] = []
+        rec_of: dict[str, int] = {}
         token: str | None = None
         last_record: int | None = None
         head: str | None = None
         more = False
-        for _page_no in range(cfg.gmail_max_pages):
+        record_pages = empty_pages = 0
+        while True:
             try:
                 resp = await self._call(account, "gmail", lambda s, t=token: s.users().history().list(  # type: ignore[misc]
                     userId="me", startHistoryId=cursor, historyTypes=["messageAdded"], labelId="INBOX",
@@ -368,24 +426,35 @@ class HeartbeatJob:
             if not isinstance(resp, dict):
                 raise ValueError("malformed gmail history response")
             res.pages += 1
-            for rec in resp.get("history") or []:
+            records = resp.get("history") or []
+            for rec in records:
                 try:
-                    last_record = max(last_record or 0, int(rec.get("id", 0)))
+                    rid = int(rec.get("id", 0))
+                    last_record = max(last_record or 0, rid)
                 except (TypeError, ValueError):
-                    pass
+                    rid = 0
                 for added in rec.get("messagesAdded") or []:
                     mid = (added.get("message") or {}).get("id")
                     if mid and mid not in ids:
                         ids.append(mid)
+                        rec_of[mid] = rid
             head = str(resp["historyId"]) if resp.get("historyId") else head
             token = resp.get("nextPageToken")
             if not token:
                 break
-        else:
-            more = bool(token)
+            # Pages without records cost little but must still be bounded, and are reported honestly.
+            if records:
+                record_pages += 1
+            else:
+                empty_pages += 1
+            if record_pages >= cfg.gmail_max_pages or empty_pages >= cfg.gmail_max_empty_pages:
+                more = True
+                break
         if more:  # do not skip history we did not read
             head = str(last_record) if last_record is not None else cursor
-        return ids, head or cursor, more
+            if last_record is None:
+                res.scan_incomplete = f"{empty_pages} history pages without records; scan incomplete"
+        return ids, head or cursor, more, rec_of
 
     async def _gmail_bootstrap(self, account: str, res: CheckResult) -> tuple[list[str], bool]:
         cfg = self._cfg
@@ -475,7 +544,11 @@ class HeartbeatJob:
     async def _finish(self, schedule: Schedule, scheduled_for: str, checks: list[CheckResult], now: datetime,
                       tz: ZoneInfo) -> HeartbeatOutcome:
         cfg = self._cfg
-        backpressure = self._ledger.pending_outbox_count(schedule.id) >= cfg.max_pending_notifications
+        due = self._ledger.pending_outbox_count(schedule.id, now=now)
+        deferred = self._ledger.deferred_outbox_count(schedule.id, now=now)
+        # Quiet-hours rows are deferred, not "due": they bound separately and never starve urgent
+        # reminders or state-change alerts, which are exempt from backpressure.
+        backpressure = due >= cfg.max_pending_notifications or deferred >= cfg.max_deferred_notifications
         commit = HeartbeatCommit(retention_days=cfg.notified_retention_days)
         quiet_end = quiet_until(now, tz, cfg)
         notices: list[Notice] = []
@@ -490,17 +563,17 @@ class HeartbeatJob:
         for c in checks:
             prev = self._ledger.heartbeat_state(schedule.id, c.account, c.service)
             kind, fields = plan_alert(prev, c.status, now, cfg)
-            held = backpressure and c.status in (OK, PARTIAL)
-            if backpressure and kind:
-                # Outbox saturated: keep alert state as-is so the alert fires on a later tick.
-                fields = {k: (prev or {}).get(k, v) for k, v in fields.items()}
-                kind = None
             c.alert = kind
             if kind:
                 notices.append(Notice(self._alert_text(c, kind)))
-            if held and c.items:
-                c.status = BACKPRESSURE  # new items withheld, nothing marked notified, re-read next tick
-            advance = c.status in (OK, PARTIAL)
+            deliver, advance = list(c.items), c.status in (OK, PARTIAL)
+            if backpressure and advance:
+                # Ordinary backlog is bounded: withhold non-urgent items (re-read later, not lost),
+                # but urgent reminders still go out.
+                urgent = [i for i in c.items if i.urgent]
+                if len(urgent) < len(c.items):
+                    c.status = BACKPRESSURE
+                    deliver, advance = urgent, False
             state = {
                 "account": c.account, "service": c.service,
                 "cursor": c.cursor_after if advance else (prev or {}).get("cursor"),
@@ -511,12 +584,32 @@ class HeartbeatJob:
             }
             c.state = state
             commit.states.append(state)
-            if advance:
-                for it in c.items:
-                    commit.notified.append((c.account, c.service, it.key, it.change))
-                if c.items:
-                    notices.append(self._digest(c, classifier_labels))
+            for it in deliver:
+                commit.notified.append((c.account, c.service, it.key, it.change))
+            if deliver:
+                shown = c.items
+                c.items = deliver
+                notices.append(self._digest(c, classifier_labels))
+                c.items = shown
             commit.receipts.append(c.receipt(schedule.id, scheduled_for))
+        # Whole-job transition: a healthy tick closes any earlier job-level failure.
+        prev_job = self._ledger.heartbeat_state(schedule.id, *JOB_KEY)
+        if prev_job is not None:
+            jkind, jfields = plan_alert(prev_job, OK, now, cfg)
+            commit.states.append({"account": JOB_KEY[0], "service": JOB_KEY[1], "cursor": prev_job.get("cursor"),
+                                  "last_checked_at": iso(now), "last_ok_at": iso(now),
+                                  "resync_count": int(prev_job.get("resync_count", 0)), **jfields})
+            if jkind == "recovered":
+                notices.append(Notice("✅ The Google heartbeat is working again."))
+        # Deliveries that ended uncertain/failed must not vanish silently: say so on the next tick.
+        stranded = self._ledger.unannounced_undelivered(schedule.id)
+        for row in stranded:
+            if row["text"].startswith(REANNOUNCE_PREFIX):
+                commit.announced_outbox_ids.append(row["id"])  # never re-announce a re-announcement
+                continue
+            commit.announced_outbox_ids.append(row["id"])
+            notices.append(Notice(f"{REANNOUNCE_PREFIX} ({row['status']} delivery). Repeating it:\n{row['text'][:600]}",
+                                  preescaped=True))
         status = self._job_status(checks, backpressure)
         summary = {
             "status": status,
@@ -563,7 +656,9 @@ class HeartbeatJob:
         extra = len(c.items) - len(lines)
         if extra > 0:
             lines.append(f"…and {extra} more")
-        if c.more_pending:
+        if c.bootstrap_truncated:
+            lines.append("(resync: only the newest unread are listed; older unread mail from this resync is not shown)")
+        elif c.more_pending:
             lines.append("(more pending; continuing on the next check)")
         return Notice("\n".join([head, *lines]), urgent=any(i.urgent for i in c.items))
 
@@ -577,7 +672,8 @@ class HeartbeatJob:
         specs = []
         for n in outcome.notices:
             not_before = iso(quiet_end) if quiet_end and not n.urgent else None
-            specs.append((dest.transport, dest.channel, escape_for_transport(dest.transport, n.text), not_before))
+            text = n.text if n.preescaped else escape_for_transport(dest.transport, n.text)
+            specs.append((dest.transport, dest.channel, text, not_before))
         return specs
 
 

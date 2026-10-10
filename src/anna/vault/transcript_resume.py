@@ -107,6 +107,18 @@ def has_uncovered_event_before(
     *,
     seen_sequences: set[int] | frozenset[int] = frozenset(),
 ) -> bool:
+    return bool(uncovered_sequences_before(transcripts_dir, conv_key, sequence, covered_through_sequence,
+                                           seen_sequences=seen_sequences))
+
+
+def uncovered_sequences_before(
+    transcripts_dir: Path,
+    conv_key: str,
+    sequence: int,
+    covered_through_sequence: int | None,
+    *,
+    seen_sequences: set[int] | frozenset[int] = frozenset(),
+) -> list[int]:
     """Whether a new worker would skip durable history before ``sequence``.
 
     Conservative: a legacy/no-sequence line or an ordered event outside
@@ -119,7 +131,8 @@ def has_uncovered_event_before(
     base_dir = transcripts_dir / _safe_key(conv_key)
     floor = covered_through_sequence or 0
     if not base_dir.is_dir():
-        return False
+        return []
+    gap: list[int] = []
     for path in sorted(base_dir.glob("*.jsonl"), reverse=True):
         try:
             raw_lines = path.read_text(encoding="utf-8").splitlines()
@@ -135,13 +148,14 @@ def has_uncovered_event_before(
                 continue
             event_sequence = obj.get("sequence")
             if not isinstance(event_sequence, int):
-                return True
+                gap.append(-1)  # legacy line without a sequence: cannot be ordered, counts as unseen
+                continue
             file_max = max(file_max, event_sequence)
             if floor < event_sequence < sequence and event_sequence not in seen_sequences:
-                return True
+                gap.append(event_sequence)
         if file_max and file_max <= floor:
             break
-    return False
+    return sorted(set(gap))
 
 
 def extend_coverage_through_outbound(
@@ -175,11 +189,11 @@ def extend_coverage_through_outbound(
     anchor = by_seq.get(sequence)
     if anchor is None or not isinstance(anchor.get("event_id"), str):
         return None
-    end, end_id = sequence, anchor["event_id"]
+    end, end_id = sequence, str(anchor["event_id"])
     while True:
         nxt = by_seq.get(end + 1)
         if nxt is None or nxt.get("direction") != "outbound" or not isinstance(nxt.get("event_id"), str):
-            return end, end_id
+        end, end_id = end + 1, str(nxt["event_id"])
         end, end_id = end + 1, nxt["event_id"]
 
 

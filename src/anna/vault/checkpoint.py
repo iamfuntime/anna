@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 import tempfile
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from anna.vault.paths import safe_conv_key
@@ -26,6 +26,7 @@ def write_checkpoint(
     kind: str = "closeout",
     coverage_end_sequence: int | None = None,
     coverage_end_event_id: str | None = None,
+    unsummarized_events: int = 0,
 ) -> Path:
     """Write a markdown checkpoint and return its path.
 
@@ -47,7 +48,7 @@ def write_checkpoint(
     base_dir = vault_root / "Conversations" / safe_key
     base_dir.mkdir(parents=True, exist_ok=True)
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     stamp = now.strftime("%Y-%m-%d-%H%M%S")
     # Time is presentation metadata, not uniqueness.  A periodic checkpoint
     # and closeout can land in one tick, so give every completed write an ID.
@@ -59,6 +60,7 @@ def write_checkpoint(
             "coverage_version: 1\n"
             f"coverage_end_sequence: {coverage_end_sequence}\n"
             f"coverage_end_event_id: {coverage_end_event_id}\n"
+            + (f"coverage_unsummarized_events: {unsummarized_events}\n" if unsummarized_events else "")
         )
     frontmatter = (
         f"---\n"
@@ -73,6 +75,9 @@ def write_checkpoint(
         f"---\n\n"
     )
     body = f"# Checkpoint\n\n{summary}\n"
+    if unsummarized_events:
+        body += (f"\n> Note: {unsummarized_events} earlier transcript event(s) were never shown to the session that "
+                 "wrote this checkpoint and are NOT summarized here; they remain in the raw transcript.\n")
     if operator_short_name:
         body += f"\nAddressed as: {operator_short_name}\n"
 

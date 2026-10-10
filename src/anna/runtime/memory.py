@@ -148,7 +148,7 @@ class MemoryStore:
         return dest
 
     def _migrate_v1(self) -> None:
-        with self._conn:
+        with self._immediate():  # DDL and ledger row commit together or not at all
             self._conn.execute(
                 """CREATE TABLE facts (
                 id INTEGER PRIMARY KEY, owner_id TEXT NOT NULL,
@@ -179,7 +179,7 @@ class MemoryStore:
 
     def _migrate_v2(self) -> None:
         """Additive: fact provenance columns, extraction queue, candidates, import ledger."""
-        with self._conn:
+        with self._immediate():  # DDL and ledger row commit together or not at all
             self._conn.execute("ALTER TABLE facts ADD COLUMN origin TEXT NOT NULL DEFAULT 'explicit_tool'")
             self._conn.execute("ALTER TABLE facts ADD COLUMN evidence TEXT")
             self._conn.execute("ALTER TABLE facts ADD COLUMN confidence REAL")

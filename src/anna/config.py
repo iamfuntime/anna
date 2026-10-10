@@ -687,6 +687,9 @@ class HeartbeatConfig(BaseModel):
     reminder_interval_hours: float = 24.0
     max_reminders: int = 3
     max_pending_notifications: int = 20
+    max_deferred_notifications: int = 50
+    gmail_max_empty_pages: int = 20
+    gmail_time_budget_seconds: float = 60.0
     notified_retention_days: int = 30
 
     @field_validator(
@@ -694,6 +697,7 @@ class HeartbeatConfig(BaseModel):
         "calendar_lookahead_hours", "calendar_page_size", "calendar_max_pages", "reminder_minutes",
         "urgent_minutes", "max_listed_items", "transient_failures_before_alert",
         "reminder_interval_hours", "max_pending_notifications", "notified_retention_days",
+        "max_deferred_notifications", "gmail_max_empty_pages", "gmail_time_budget_seconds",
     )
     @classmethod
     def _positive(cls, v: float, info: Any) -> float:
@@ -1211,6 +1215,9 @@ class SchedulerConfig(BaseModel):
     delivery_backoff_base_seconds: float = 30.0
     delivery_backoff_max_seconds: float = 900.0
     delivery_chunk_chars: int = 3500
+    retention_days: float = 30.0
+    text_retention_days: float = 7.0
+    prune_interval_hours: float = 6.0
     send_timeout_seconds: float = 30.0
     # Retry sends whose failure cannot prove "not delivered" (default: no;
     # they are recorded as uncertain and never auto-resent).

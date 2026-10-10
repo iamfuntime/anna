@@ -14,12 +14,12 @@ import dataclasses
 import re
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Any
 
 from anna.agents.registry import SubAgentRegistry
 from anna.config import AnnaConfig
@@ -59,9 +59,9 @@ from anna.transports.base import (
 from anna.vault.checkpoint import list_recent_checkpoints, write_checkpoint
 from anna.vault.transcript_resume import (
     extend_coverage_through_outbound,
-    has_uncovered_event_before,
     render_tail_block,
     transcript_tail_since,
+    uncovered_sequences_before,
     validated_checkpoint_coverage,
 )
 
@@ -448,16 +448,16 @@ class ConversationWorker:
         conversation_key: str,
         transport: str,
         config: AnnaConfig,
-        supervisor: "Supervisor",
+        supervisor: Supervisor,
         send: SendCallback,
         on_idle_close: IdleCloseCallback | None = None,
         adapters: dict[str, ChannelAdapter] | None = None,
-        schedule_store: "ScheduleStore | None" = None,
-        google_clients: "GoogleClients | None" = None,
-        subagent_runner: "SubAgentRunner | None" = None,
+        schedule_store: ScheduleStore | None = None,
+        google_clients: GoogleClients | None = None,
+        subagent_runner: SubAgentRunner | None = None,
         ephemeral: bool = False,
         visibility: VisibilityCallbacks = NULL_VISIBILITY,
-        alerter: "AdminAlerter | None" = None,
+        alerter: AdminAlerter | None = None,
     ) -> None:
         self.conversation_key = conversation_key
         self.transport = transport
@@ -612,7 +612,7 @@ class ConversationWorker:
         # do not race a second invocation against the in-flight stop().
         self._idle_close_signalled = False
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         self.last_active: datetime = now
         self.last_event_received_at: datetime | None = None
         self.last_event_processed_at: datetime | None = None
@@ -632,6 +632,7 @@ class ConversationWorker:
         self._last_processed_transcript_sequence: int | None = None
         self._last_processed_transcript_event_id: str | None = None
         self._coverage_advance_allowed: bool | None = None
+        self._coverage_unsummarized = 0
         self.is_dm: bool = conversation_key.split(":")[1].startswith("dm") if ":" in conversation_key else False
 
     # ------------------------------------------------------------------
@@ -707,7 +708,7 @@ class ConversationWorker:
         await self.start()
 
     async def submit(self, event: InboundEvent) -> None:
-        self.last_event_received_at = datetime.now(timezone.utc)
+        self.last_event_received_at = datetime.now(UTC)
         await self._queue.put(event)
 
     async def _send(self, message: OutboundMessage) -> None:
@@ -763,7 +764,7 @@ class ConversationWorker:
                 await asyncio.sleep(poll)
                 if self._stopping or self._idle_close_signalled:
                     return
-                idle = (datetime.now(timezone.utc) - self.last_active).total_seconds()
+                idle = (datetime.now(UTC) - self.last_active).total_seconds()
                 if idle > gap and self._on_idle_close is not None:
                     self._idle_close_signalled = True
                     self._log.info(
@@ -805,7 +806,7 @@ class ConversationWorker:
                     finally:
                         self._reply_address.reset(reply_token)
                 finally:
-                    self.last_event_processed_at = datetime.now(timezone.utc)
+                    self.last_event_processed_at = datetime.now(UTC)
                     self.last_active = self.last_event_processed_at
                     # NOTE: the periodic-checkpoint bookkeeping
                     # (``_turns_since_checkpoint`` / ``_dirty``) is advanced
@@ -1959,6 +1960,7 @@ class ConversationWorker:
                     kind=kind,
                     coverage_end_sequence=coverage_end_sequence,
                     coverage_end_event_id=coverage_end_event_id,
+                    unsummarized_events=self._coverage_unsummarized if coverage_end_sequence else 0,
                 )
             except OSError as exc:
                 self._log.error("worker.checkpoint_write_failed", error=str(exc))
@@ -1989,7 +1991,7 @@ class ConversationWorker:
         # current state. Applies to both periodic and closeout writes.
         self._dirty = False
         self._turns_since_checkpoint = 0
-        self._last_checkpoint_at = datetime.now(timezone.utc)
+        self._last_checkpoint_at = datetime.now(UTC)
         return ckpt_path
 
     async def _maybe_periodic_checkpoint(self) -> None:
@@ -2037,7 +2039,7 @@ class ConversationWorker:
         if not self._dirty:
             return
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         baseline = self._last_checkpoint_at or self._created_at
         minutes_since = (now - baseline).total_seconds() / 60.0
         due = (
@@ -3041,13 +3043,18 @@ class ConversationWorker:
                             self._config.transcripts_dir,
                             self.conversation_key,
                         )
-                        self._coverage_advance_allowed = not has_uncovered_event_before(
+                        gap = uncovered_sequences_before(
                             self._config.transcripts_dir,
                             self.conversation_key,
                             sequence,
                             prior,
                             seen_sequences=self._resume_tail_sequences,
                         )
+                        # Catch-up: older history this session was never shown cannot freeze coverage
+                        # forever, but it is NOT claimed as summarized - the checkpoint records how many
+                        # events were skipped and says so in its body.
+                        self._coverage_unsummarized = len(gap)
+                        self._coverage_advance_allowed = True
                     if self._coverage_advance_allowed:
                         self._last_processed_transcript_sequence = sequence
                         self._last_processed_transcript_event_id = event_id

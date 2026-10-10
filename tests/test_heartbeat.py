@@ -444,7 +444,7 @@ async def test_transient_errors_never_disable_the_heartbeat(env):
 # ---- outbox: delivery failures do not re-fetch -----------------------------------------------
 
 async def test_delivery_failure_retries_delivery_only_not_the_checks(tmp_path):
-    adapter = FakeAdapter(); adapter.send_should_raise = ConnectionError("net down")
+    adapter = FakeAdapter(); adapter.send_should_raise = ConnectionRefusedError("net down")
     e = await Env(tmp_path, adapter=adapter).start()
     e.prov.add_mail("personal", "m1", subject="Important")
     occ = await e.tick()
@@ -464,7 +464,7 @@ async def test_delivery_failure_retries_delivery_only_not_the_checks(tmp_path):
 
 
 async def test_outbox_retry_pass_makes_zero_provider_calls(tmp_path):
-    adapter = FakeAdapter(); adapter.send_should_raise = ConnectionError("net down")
+    adapter = FakeAdapter(); adapter.send_should_raise = ConnectionRefusedError("net down")
     e = await Env(tmp_path, adapter=adapter).start()
     e.prov.add_mail("personal", "m1", subject="Important")
     await e.tick()
@@ -517,8 +517,9 @@ async def test_notification_backpressure_withholds_items_without_losing_them(tmp
     led = e.ledger
     stuck = led.create_manual(schedule_id="hb", job_kind="google_heartbeat", run_safety="read_only")
     led.claim(stuck, owner="x", lease_seconds=60); run = led.start_run(stuck, owner="x")
-    led.finish_run(stuck, run, status="succeeded", side_effects="none",
-                   outbox=[("slack", "CDEST", "stuck", iso(now_utc() + timedelta(days=1)))])
+    led.finish_run(stuck, run, status="succeeded", side_effects="none", outbox=[("slack", "CDEST", "stuck")])
+    led._conn.execute("UPDATE schedule_outbox SET status='sending', lease_expires_at=? WHERE text='stuck'",
+                      (iso(now_utc() + timedelta(days=1)),)); led._conn.commit()      # a DUE row that cannot drain
     occ = await e.tick()
     assert occ.exec_status == "partial" and led.get(occ.id).delivery_status == "none"
     assert not any("Queued behind" in t for t in e.texts())
@@ -592,7 +593,7 @@ async def test_disabled_heartbeat_fails_loudly_instead_of_reporting_healthy(tmp_
     e.cfg.heartbeat.enabled = False
     occ = await e.tick()
     assert occ.exec_status == "failed" and "disabled" in (occ.detail or "")
-    assert e.adapter.sent == []
+    assert len(e.adapter.sent) == 1 and "could not complete" in e.adapter.sent[0].text      # visible, never quiet
 
 
 async def test_no_accounts_is_a_failure_not_a_healthy_empty_check(tmp_path):

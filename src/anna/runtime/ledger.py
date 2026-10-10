@@ -26,7 +26,10 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import sqlite3
+import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -40,6 +43,33 @@ ACTIVE_EXEC = ("claimed", "running")
 TERMINAL_EXEC = ("succeeded", "failed", "timeout", "cancelled", "unknown", "blocked",
                  "skipped_overlap", "skipped_misfire", "partial", "auth_required", "resolved_unknown")
 MAX_RECORDED_MISFIRES = 20
+
+
+def process_start_token(pid: int | None = None) -> str:
+    """Kernel start time of a process (Linux /proc), "" when unavailable. Defeats PID reuse."""
+    try:
+        raw = Path(f"/proc/{pid or os.getpid()}/stat").read_text()
+        return raw.rsplit(")", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return ""
+
+
+def new_owner_id() -> str:
+    """``<pid>-<starttime>-<random>``: lets another process prove this owner is dead."""
+    return f"{os.getpid()}-{process_start_token() or 'x'}-{uuid.uuid4().hex[:8]}"
+
+
+def owner_alive(owner: str | None) -> bool | None:
+    """True = that process is provably alive, False = provably gone, None = cannot tell."""
+    if not owner:
+        return None
+    parts = owner.split("-")
+    if len(parts) != 3 or not parts[0].isdigit() or parts[1] in ("", "x"):
+        return None
+    token = process_start_token(int(parts[0]))
+    if not Path(f"/proc/{parts[0]}").exists():
+        return False if Path("/proc/self").exists() else None
+    return token == parts[1]
 
 
 def iso(dt: datetime) -> str:
@@ -95,6 +125,7 @@ class HeartbeatCommit:
     """
 
     states: list[dict[str, Any]] = field(default_factory=list)
+    announced_outbox_ids: list[int] = field(default_factory=list)
     notified: list[tuple[str, str, str, str]] = field(default_factory=list)  # account, service, key, change
     receipts: list[dict[str, Any]] = field(default_factory=list)
     retention_days: int = 30
@@ -164,6 +195,10 @@ class RuntimeLedger:
             if 2 in applied:
                 self.backup(self._path.with_name(f"{self._path.name}.bak-v2-{iso(now_utc()).replace(':', '')}"))
             self._migrate_v3()
+        if 4 not in applied:
+            if 3 in applied:
+                self.backup(self._path.with_name(f"{self._path.name}.bak-v3-{iso(now_utc()).replace(':', '')}"))
+            self._migrate_v4()
 
     def backup(self, dest: Path) -> Path:
         if dest.exists():
@@ -176,7 +211,7 @@ class RuntimeLedger:
         return dest
 
     def _migrate_v1(self) -> None:
-        with self._conn:
+        with self._immediate():  # DDL + ledger row commit together or not at all
             self._conn.execute("""CREATE TABLE schedule_cursors (
                 schedule_id TEXT PRIMARY KEY, last_scheduled_for TEXT NOT NULL, updated_at TEXT NOT NULL)""")
             self._conn.execute("""CREATE TABLE schedule_occurrences (
@@ -204,7 +239,14 @@ class RuntimeLedger:
 
     def _migrate_v2(self) -> None:
         """Additive: heartbeat cursors/alert state, notified-item dedup, per-check receipts."""
-        with self._conn:
+        with self._immediate():
+            # Recover a database left half-migrated by the earlier NON-atomic implementation
+            # (RENAME committed, copy never ran): put the original table back first.
+            names = {r[0] for r in self._conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if "schedule_outbox_v1" in names:
+                if "schedule_outbox" in names:
+                    self._conn.execute("DROP TABLE schedule_outbox")
+                self._conn.execute("ALTER TABLE schedule_outbox_v1 RENAME TO schedule_outbox")
             # One occurrence can carry several independent messages (alerts, digests):
             # rebuild the outbox with a per-message index so chunk ordering and the
             # uniqueness guard apply within a message, not across the occurrence.
@@ -246,13 +288,21 @@ class RuntimeLedger:
 
     def _migrate_v3(self) -> None:
         """Additive: operator repair intents (inserted by the dashboard, applied only by the daemon)."""
-        with self._conn:
+        with self._immediate():
             self._conn.execute("""CREATE TABLE IF NOT EXISTS repair_requests (
                 id INTEGER PRIMARY KEY, kind TEXT NOT NULL, target_id INTEGER NOT NULL, action TEXT NOT NULL,
                 expected_status TEXT NOT NULL, note TEXT, requested_by TEXT NOT NULL, requested_at TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending', result TEXT, applied_at TEXT)""")
             self._conn.execute("CREATE INDEX IF NOT EXISTS repair_pending ON repair_requests(status, id)")
             self._conn.execute("INSERT INTO ledger_migrations(version, applied_at) VALUES(3, ?)", (iso(now_utc()),))
+
+    def _migrate_v4(self) -> None:
+        """Additive: remember which stranded/uncertain heartbeat deliveries were already re-announced."""
+        with self._immediate():
+            cols = {r[1] for r in self._conn.execute("PRAGMA table_info(schedule_outbox)")}
+            if "announced" not in cols:
+                self._conn.execute("ALTER TABLE schedule_outbox ADD COLUMN announced INTEGER NOT NULL DEFAULT 0")
+            self._conn.execute("INSERT INTO ledger_migrations(version, applied_at) VALUES(4, ?)", (iso(now_utc()),))
 
     # --- operator repairs (daemon is the only applier)
 
@@ -349,10 +399,21 @@ class RuntimeLedger:
                 found.add((key, change))
         return found
 
-    def pending_outbox_count(self, schedule_id: str) -> int:
+    def pending_outbox_count(self, schedule_id: str, *, now: datetime | None = None) -> int:
+        """Rows that are DUE now (deferred quiet-hours rows are counted separately)."""
         return int(self._conn.execute(
-            "SELECT COUNT(*) FROM schedule_outbox WHERE schedule_id=? AND status IN ('pending','sending')",
-            (schedule_id,)).fetchone()[0])
+            "SELECT COUNT(*) FROM schedule_outbox WHERE schedule_id=? AND status IN ('pending','sending') "
+            "AND next_attempt_at<=?", (schedule_id, iso(now or now_utc()))).fetchone()[0])
+
+    def deferred_outbox_count(self, schedule_id: str, *, now: datetime | None = None) -> int:
+        return int(self._conn.execute(
+            "SELECT COUNT(*) FROM schedule_outbox WHERE schedule_id=? AND status='pending' AND next_attempt_at>?",
+            (schedule_id, iso(now or now_utc()))).fetchone()[0])
+
+    def unannounced_undelivered(self, schedule_id: str, limit: int = 3) -> list[sqlite3.Row]:
+        return self._conn.execute(
+            "SELECT id, status, text, created_at FROM schedule_outbox WHERE schedule_id=? AND announced=0 "
+            "AND status IN ('uncertain','failed') ORDER BY id LIMIT ?", (schedule_id, limit)).fetchall()
 
     def receipts(self, occurrence_id: int) -> list[sqlite3.Row]:
         return self._conn.execute("SELECT * FROM heartbeat_receipts WHERE occurrence_id=? ORDER BY id",
@@ -375,6 +436,8 @@ class RuntimeLedger:
             self._conn.execute(
                 "INSERT OR IGNORE INTO heartbeat_notified(schedule_id,account,service,item_key,change_id,notified_at)"
                 " VALUES(?,?,?,?,?,?)", (schedule_id, account, service, key, change, now))
+        for oid in commit.announced_outbox_ids:
+            self._conn.execute("UPDATE schedule_outbox SET announced=1 WHERE id=?", (oid,))
         cutoff = iso(now_utc() - timedelta(days=commit.retention_days))
         self._conn.execute("DELETE FROM heartbeat_notified WHERE schedule_id=? AND notified_at<?", (schedule_id, cutoff))
         for r in commit.receipts:
@@ -574,14 +637,30 @@ class RuntimeLedger:
                 (status, detail, now, now, occurrence_id)).rowcount
             return changed > 0
 
-    def recover_expired(self, *, now: datetime, max_run_attempts: int) -> list[Recovery]:
-        """Apply the lease-expiry recovery rules. Never re-runs side-effecting work."""
+    def recover_expired(self, *, now: datetime, max_run_attempts: int,
+                        owner_alive: Callable[[str | None], bool | None] | None = None) -> list[Recovery]:
+        """Apply the recovery rules. Never re-runs side-effecting work.
+
+        With ``owner_alive`` a claim is recovered when its lease expired AND its owner is not
+        provably alive, or immediately when the owner is provably dead.  A claim whose owner is
+        provably ALIVE (another live daemon, or this one) is never taken over.
+        """
         out: list[Recovery] = []
         ts = iso(now)
         with self._conn:
-            rows = self._conn.execute(
-                "SELECT * FROM schedule_occurrences WHERE exec_status IN ('claimed','running') AND lease_expires_at<?",
-                (ts,)).fetchall()
+            candidates = self._conn.execute(
+                "SELECT * FROM schedule_occurrences WHERE exec_status IN ('claimed','running')").fetchall()
+            rows = []
+            for row in candidates:
+                expired = (row["lease_expires_at"] or "") < ts
+                alive = owner_alive(row["lease_owner"]) if owner_alive is not None else None
+                if alive is True:
+                    if expired:
+                        out.append(Recovery(row["id"], row["schedule_id"], "skipped",
+                                            f"lease expired but owner {row['lease_owner']} is still alive; not taking over"))
+                    continue
+                if expired or alive is False:
+                    rows.append(row)
             for row in rows:
                 occ_id, sid = row["id"], row["schedule_id"]
                 if row["exec_status"] == "claimed":
@@ -610,6 +689,55 @@ class RuntimeLedger:
                                        "not re-run', finished_at=?, updated_at=? WHERE id=?", (ts, ts, occ_id))
                     out.append(Recovery(occ_id, sid, "unknown", "side-effecting run interrupted; not retried"))
         return out
+
+    def repend_running(self, occurrence_id: int, run_id: int, *, owner: str, detail: str) -> bool:
+        """Graceful shutdown of a READ-ONLY run: hand it back to the queue for the next start."""
+        now = iso(now_utc())
+        with self._immediate():
+            changed = self._conn.execute(
+                "UPDATE schedule_occurrences SET exec_status='pending', lease_owner=NULL, lease_expires_at=NULL, "
+                "detail=?, updated_at=? WHERE id=? AND exec_status='running' AND lease_owner=?",
+                (detail, now, occurrence_id, owner)).rowcount
+            if changed:
+                self._conn.execute("UPDATE schedule_runs SET status='abandoned', finished_at=?, error=? WHERE id=?",
+                                   (now, detail, run_id))
+        return bool(changed)
+
+    def prune(self, *, now: datetime, retention_days: float, text_retention_days: float) -> dict[str, int]:
+        """Bounded retention. Anything unresolved (pending/uncertain/failed/unknown) is protected."""
+        cutoff, text_cutoff = iso(now - timedelta(days=retention_days)), iso(now - timedelta(days=text_retention_days))
+        counts = {"occurrences": 0, "outbox_text_purged": 0, "results_redacted": 0, "repairs": 0}
+        with self._immediate():
+            doomed = [r[0] for r in self._conn.execute(
+                "SELECT o.id FROM schedule_occurrences o WHERE COALESCE(o.finished_at, o.created_at) < ? "
+                "AND o.exec_status NOT IN ('pending','claimed','running','unknown','blocked') "
+                "AND NOT EXISTS (SELECT 1 FROM schedule_outbox b WHERE b.occurrence_id=o.id "
+                "AND b.status IN ('pending','sending','uncertain','failed')) "
+                "AND NOT EXISTS (SELECT 1 FROM repair_requests q WHERE q.status='pending' AND "
+                "((q.kind='run' AND q.target_id=o.id) OR (q.kind='outbox' AND q.target_id IN "
+                "(SELECT id FROM schedule_outbox WHERE occurrence_id=o.id))))", (cutoff,))]
+            for oid in doomed:
+                for table in ("heartbeat_receipts", "schedule_outbox", "schedule_runs"):
+                    self._conn.execute(f"DELETE FROM {table} WHERE occurrence_id=?", (oid,))
+                self._conn.execute("DELETE FROM schedule_occurrences WHERE id=?", (oid,))
+            counts["occurrences"] = len(doomed)
+            counts["outbox_text_purged"] = self._conn.execute(
+                "UPDATE schedule_outbox SET text='[purged]' WHERE status IN ('sent','cancelled') AND updated_at<? "
+                "AND text!='[purged]'", (text_cutoff,)).rowcount
+            for r in self._conn.execute("SELECT id, result_json FROM schedule_runs WHERE result_json LIKE '%\"notifications\"%' "
+                                        "AND finished_at<?", (text_cutoff,)).fetchall():
+                try:
+                    data = json.loads(r["result_json"])
+                except ValueError:
+                    continue
+                if isinstance(data, dict) and data.get("notifications"):
+                    data["notifications"] = len(data["notifications"]) if isinstance(data["notifications"], list) else 0
+                    self._conn.execute("UPDATE schedule_runs SET result_json=? WHERE id=?", (json.dumps(data), r["id"]))
+                    counts["results_redacted"] += 1
+            counts["repairs"] = self._conn.execute(
+                "DELETE FROM repair_requests WHERE status!='pending' AND COALESCE(applied_at, requested_at)<?",
+                (cutoff,)).rowcount
+        return counts
 
     def cancel_schedule(self, schedule_id: str, *, detail: str) -> list[int]:
         """Cancel unrun occurrences and unsent output; return ids still running."""
@@ -662,15 +790,14 @@ class RuntimeLedger:
         """Claim due chunks. Chunk i is only claimable once chunk i-1 was sent."""
         ts = iso(now)
         items: list[OutboxItem] = []
+        skip = ",".join(str(int(i)) for i in exclude) or "-1"
         with self._conn:
             rows = self._conn.execute(
-                "SELECT * FROM schedule_outbox o WHERE status='pending' AND next_attempt_at<=? AND (chunk_index=0 OR "
+                f"SELECT * FROM schedule_outbox o WHERE id NOT IN ({skip}) AND status='pending' AND next_attempt_at<=? AND (chunk_index=0 OR "
                 "EXISTS (SELECT 1 FROM schedule_outbox p WHERE p.occurrence_id=o.occurrence_id AND p.msg_index=o.msg_index "
                 "AND p.chunk_index=o.chunk_index-1 AND p.status='sent')) ORDER BY occurrence_id, msg_index, chunk_index LIMIT ?",
                 (ts, limit)).fetchall()
             for r in rows:
-                if r["id"] in exclude:
-                    continue
                 self._conn.execute(
                     "UPDATE schedule_outbox SET status='sending', attempts=attempts+1, lease_expires_at=?, updated_at=? "
                     "WHERE id=?", (iso(now + timedelta(seconds=lease_seconds)), ts, r["id"]))
@@ -706,7 +833,18 @@ class RuntimeLedger:
             self._conn.execute(
                 "UPDATE schedule_outbox SET status=?, provider_outcome=?, last_error=?, lease_expires_at=NULL, "
                 "updated_at=? WHERE id=? AND status='sending'", (status, outcome, error, now, item.id))
+            if status in ("uncertain", "failed", "cancelled"):
+                self._strand_later_chunks(item.id, status)
             self._refresh_delivery(item.occurrence_id)
+
+    def _strand_later_chunks(self, outbox_id: int, why: str) -> None:
+        """Later parts of a message are never released after an earlier part ended without being sent."""
+        self._conn.execute(
+            "UPDATE schedule_outbox SET status='cancelled', provider_outcome=?, updated_at=? WHERE status='pending' "
+            "AND (occurrence_id, msg_index) = (SELECT occurrence_id, msg_index FROM schedule_outbox WHERE id=?) "
+            "AND chunk_index > (SELECT chunk_index FROM schedule_outbox WHERE id=?)",
+            (f"cancelled: an earlier part of this message ended {why} (later parts are not sent out of order)",
+             iso(now_utc()), outbox_id, outbox_id))
 
     def recover_outbox(self, *, now: datetime) -> int:
         """An in-flight send whose lease expired may or may not have been delivered: uncertain, never resent."""
@@ -718,6 +856,7 @@ class RuntimeLedger:
                 self._conn.execute(
                     "UPDATE schedule_outbox SET status='uncertain', provider_outcome='uncertain: send interrupted', "
                     "lease_expires_at=NULL, updated_at=? WHERE id=?", (ts, r["id"]))
+                self._strand_later_chunks(r["id"], "uncertain")
                 self._refresh_delivery(r["occurrence_id"])
         return len(rows)
 

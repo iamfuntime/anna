@@ -195,6 +195,12 @@ class ScheduleStore:
                 "the Google heartbeat is opt-in: set heartbeat.enabled: true in anna.yaml and restart first")
         if not self._config.google.enabled or not self._config.google.accounts:
             raise ScheduleValidationError("the Google heartbeat needs google.enabled and at least one account")
+        from anna.runtime.heartbeat import heartbeat_min_timeout
+        floor = heartbeat_min_timeout(self._config.heartbeat)
+        if schedule.timeout_seconds < floor:
+            raise ScheduleValidationError(
+                f"heartbeat timeout_seconds must be at least {floor:.0f} (per-check budget x services + 30); "
+                f"a shorter job timeout would cut off healthy checks")
         dest = f"{schedule.destination.transport}:{schedule.destination.channel}"
         if dest not in self._config.heartbeat.allowed_destinations:
             raise ScheduleValidationError(

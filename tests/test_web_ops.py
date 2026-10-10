@@ -30,7 +30,7 @@ def home(tmp_path):
 def client(home):
     cfg = AnnaConfig(); object.__setattr__(cfg, "anna_home", home)
     cfg.logging.audit.fsync_on_write = False
-    return TestClient(create_app(cfg), follow_redirects=False)
+    return TestClient(create_app(cfg), follow_redirects=False, base_url="http://127.0.0.1:8765")
 
 
 def ledger(home) -> RuntimeLedger:
@@ -79,7 +79,7 @@ def test_health_shows_dead_receiver_and_stale_sdk_plainly(home, monkeypatch):
         "pid": __import__("os").getpid(), "written_at": now, "started_at": now,
         "transports": {"slack": {"last_checked_at": now, "healthy": False, "receiver_alive": False, "api_ok": True}},
         "sdk": {"last_success_at": (datetime.now(UTC) - timedelta(days=3)).isoformat()}}))
-    html = TestClient(create_app(cfg)).get("/health").text
+    html = TestClient(create_app(cfg), base_url="http://127.0.0.1:8765").get("/health").text
     assert "receiver is NOT running" in html and "stale" in html and "restart the daemon" in html
 
 
@@ -208,9 +208,9 @@ def test_memory_requires_explicit_scope_and_never_lists_across_scopes(client, ho
 def test_memory_cross_scope_mutation_rejected_and_origin_enforced(client, home):
     a, b, c = seed_memory(home)
     wrong = client.post(f"/memory/{c}/forget", data={"owner": "seth", "scope": "private"}, headers=ORIGIN)
-    assert wrong.status_code == 303 and "No+such+active+memory" in wrong.headers["location"]
+    assert wrong.status_code == 303 and "flash=no_active" in wrong.headers["location"]
     wrong2 = client.post(f"/memory/{b}/correct", data={"owner": "seth", "scope": "private", "content": "x"}, headers=ORIGIN)
-    assert "No+such+memory" in wrong2.headers["location"]
+    assert "flash=no_memory" in wrong2.headers["location"]
     m = MemoryStore(home / "state" / "memory.sqlite3")
     assert m.get(b).status == "active" and m.get(c).status == "active" and m.get(b).content == "ship Friday"
     m.close()
@@ -221,17 +221,17 @@ def test_memory_cross_scope_mutation_rejected_and_origin_enforced(client, home):
 def test_memory_correct_and_forget_keep_transactional_invariants(client, home):
     a, b, c = seed_memory(home)
     r = client.post(f"/memory/{a}/correct", data={"owner": "seth", "scope": "private", "content": "prefers tea NEWFACT"}, headers=ORIGIN)
-    assert r.status_code == 303 and "Corrected" in r.headers["location"]
+    assert r.status_code == 303 and "flash=corrected" in r.headers["location"]
     m = MemoryStore(home / "state" / "memory.sqlite3")
     old, new = m.get(a), m.get(a + 3 if False else m._conn.execute("SELECT id FROM facts WHERE supersedes_id=?", (a,)).fetchone()[0])
     assert old.status == "superseded" and new.status == "active" and new.supersedes_id == a
     again = client.post(f"/memory/{a}/correct", data={"owner": "seth", "scope": "private", "content": "fork!"}, headers=ORIGIN)
-    assert "no+longer+active" in again.headers["location"]                          # no fork of a superseded fact
+    assert "flash=not_active" in again.headers["location"]                          # no fork of a superseded fact
     assert m._conn.execute("SELECT COUNT(*) FROM facts WHERE status='active' AND subject='coffee'").fetchone()[0] == 1
     f = client.post(f"/memory/{new.id}/forget", data={"owner": "seth", "scope": "private"}, headers=ORIGIN)
-    assert "Forgot" in f.headers["location"]
+    assert "flash=forgot" in f.headers["location"]
     revive = client.post(f"/memory/{new.id}/correct", data={"owner": "seth", "scope": "private", "content": "revive"}, headers=ORIGIN)
-    assert "no+longer+active" in revive.headers["location"]                         # forgotten facts are never revived
+    assert "flash=not_active" in revive.headers["location"]                         # forgotten facts are never revived
     assert m.search(owner_id="seth", visibility_scopes={"private"}, query="tea") == []
     m.close()
     page = client.get("/memory", params={"owner": "seth", "scope": "private", "status": "forgotten"}).text

@@ -539,6 +539,46 @@ Validation: full suite 1,589 passed, 1 skipped; ruff clean on new files; mypy cl
 Not done (by scope): Google connect/reconnect UI, live provider verification, dashboard polling of
 the status file for push updates.
 
+## Integration review fixes (`/tmp/anna-integration-review-cf72508.md`)
+
+Regressions: `tests/test_integration_fixes.py` (34 tests; 30 fail against the pre-fix tree, the others
+are guards - M4 had already been fixed by `51ea6bb` and is re-verified/extended here, L2 is pinned at the
+`_deliver_due` call site). Full suite 1,623 passed, 1 skipped.
+
+| # | status | fix |
+| --- | --- | --- |
+| H1 | fixed | `classify_send_error` walks the exception chain and treats only **connect-phase** errors as proof of non-delivery: `aiohttp.ClientConnectorError`/proxy errors, `httpx.ConnectError`/`ConnectTimeout`/`PoolTimeout`, `ConnectionRefusedError`, `socket.gaierror`, Telegram `RetryAfter`, HTTP 429, `retry_safe`, and Telegram `NetworkError`/`TimedOut` wrapping those. Resets, broken pipes, `ServerDisconnectedError`, read/write errors and bare `ConnectionError` stay **uncertain** (never auto-resent). An uncertain/failed heartbeat delivery now (a) warns the admin channel immediately and (b) is repeated once, prefixed "An earlier alert may not have reached you", on the next heartbeat tick (`outbox.announced`, ledger v4; a re-announcement is never re-announced) |
+| M1 | fixed | backpressure counts only **due** rows; quiet-hours rows are *deferred* and bounded separately (`max_deferred_notifications`, default 50). Urgent reminders and state-change alerts are never held by either limit; ordinary items beyond the bound are withheld without advancing cursors (re-read, not lost) |
+| M2 | fixed | whole-job timeout / exception / missing client / disabled / no accounts go through the same transition alerting (job-scoped `heartbeat_state` row `*/job`): immediate alert for misconfiguration, alert after N consecutive for timeouts/errors, one "working again" notice. Heartbeat `timeout_seconds` below `check_timeout x services + 30` is rejected at create/update and clamped at run time |
+| M3 | fixed | a schedule's queued/running work and unsent output are cancelled only after it is **absent on two consecutive successful loads** (load errors never count; an empty/missing/truncated file for one poll cancels nothing; pending occurrences of an absent schedule just wait). In-process deletes still cancel immediately |
+| M4 | verified+extended | Slack `& < >` escaping covers sender, subject, calendar title and classifier labels (the whole notice); messages are sent `plain=True` so the Markdown converter cannot create links; re-announcements are marked pre-escaped (no double escaping) |
+| M5 | fixed | shutdown is no longer treated as deletion. Read-only runs (incl. the heartbeat) are put back to `pending` and run after restart; side-effecting runs end `unknown`/`blocked`, emit `audit.schedule.shutdown_interrupted` (kind `unknown`) and record a failure on the schedule. Only a real deletion ends `cancelled` |
+| L1 | fixed | when a chunk ends uncertain/failed/cancelled the remaining parts of that message become `cancelled` (nothing stranded, no phantom active schedule, no permanent backpressure) |
+| L2 | fixed | delivery claims **one row per send**; a lease only covers the in-flight send, so unattempted rows can no longer expire into `uncertain` |
+| L3 | fixed | every migration (ledger v1-v4, memory v1-v2) runs in one `BEGIN IMMEDIATE` transaction; a database left half-migrated by the old non-atomic v2 (renamed table + empty new table) is repaired on open; each upgrade still backs up first |
+| L4 | fixed | coverage no longer freezes on history the session never saw: the worker advances coverage but records `coverage_unsummarized_events: N` in the checkpoint frontmatter and a visible note in its body ("NOT summarized here; remains in the raw transcript"). Unseen history is never claimed as summarized |
+| L5 | fixed | owner ids are `pid-starttime-random`; recovery requires the lease to be expired **and** the owner not provably alive, and a provably dead owner (gone pid or different start time, i.e. PID reuse) is recovered immediately. A provably live owner is never taken over (audited as `recovery_skipped`). Unparsable/legacy owners fall back to lease expiry |
+| L6 | fixed | `RuntimeLedger.prune` runs from the poll (default every 6h): terminal rows older than `scheduler.retention_days` (30) are deleted; outbox text and heartbeat notification previews are purged after `text_retention_days` (7); applied repair requests expire. **Protected, never pruned:** pending/claimed/running/unknown/blocked occurrences, outbox rows pending/sending/uncertain/failed, and anything with a pending repair request. `heartbeat_notified` keeps its own 30-day retention |
+| L7 | fixed | a bounded resync says plainly that older unread mail is *not* shown (it is not "pending"; the cursor moves to the profile head); history pages without records are counted separately (`gmail_max_empty_pages`) and report `scan incomplete` with the cursor unchanged; a total `gmail_time_budget_seconds` stops fetching and steps the cursor back to just before the first unfetched record so nothing is skipped. Provider paging/time behaviour is exercised only with the fake provider |
+
+Dashboard review notices (commit `67f5d49`), also fixed here: banners on `/repairs` and `/memory` come only
+from fixed server-side tables selected by a code (`?flash=queued&n=7`), never from URL text; unknown repair
+kind/action returns 404 without echoing input; `/health*`, `/repairs`, `/memory` reject any `Host` that is not
+the dashboard's own bound address or a loopback name (DNS-rebinding guard; a wildcard bind is unchanged and has
+no such protection). Two further findings in those notices were truncated and could not be addressed.
+
+**Remaining risks (honest):** SQLite rowids of pruned occurrences can be reused (pending repairs protect their
+targets); the Slack/Telegram/aiohttp/httpx classification is verified against the installed library classes,
+not live services; owner-liveness proof needs `/proc` (non-Linux falls back to lease expiry); recovery of a
+live-but-hung other daemon is deliberately manual; the wildcard-bind dashboard has no Host guard; paging/time
+limits for Gmail depend on provider behaviour not exercised live; `unknown` side-effecting shutdown work needs an
+operator decision in `/repairs`.
+
+Migration/rollback: ledger schema v4 (additive `schedule_outbox.announced`), automatic backups
+`runtime.sqlite3.bak-v1|v2|v3-<ts>` before each upgrade step. Roll back by restoring the backup with the older build;
+new config keys (`heartbeat.max_deferred_notifications`, `gmail_max_empty_pages`, `gmail_time_budget_seconds`,
+`scheduler.retention_days`, `text_retention_days`, `prune_interval_hours`) have defaults and are ignored by older builds.
+
 ## Deferred milestones
 
 1. **Phase 0:** finish exact event coverage/replay.

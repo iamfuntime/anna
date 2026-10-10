@@ -22,9 +22,7 @@ the full design.
 from __future__ import annotations
 
 import asyncio
-import os
 import shutil
-import uuid
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -32,8 +30,15 @@ from zoneinfo import ZoneInfo
 
 from anna.config import AnnaConfig
 from anna.log import audit_event, get_logger
-from anna.runtime.heartbeat import Classifier, HeartbeatJob
-from anna.runtime.ledger import OutboxItem, Recovery, RuntimeLedger, now_utc
+from anna.runtime.heartbeat import Classifier, HeartbeatJob, heartbeat_min_timeout
+from anna.runtime.ledger import (
+    OutboxItem,
+    Recovery,
+    RuntimeLedger,
+    new_owner_id,
+    now_utc,
+    owner_alive,
+)
 from anna.runtime.schedule_jobs import JobResult, Outcome
 from anna.runtime.schedule_store import ScheduleStore
 from anna.runtime.schedule_types import Schedule
@@ -81,14 +86,54 @@ class _TurnTimeout(Exception):
         self.status, self.side_effects, self.detail = status, side_effects, detail
 
 
+def _exception_chain(exc: BaseException, limit: int = 6) -> list[BaseException]:
+    chain: list[BaseException] = []
+    cur: BaseException | None = exc
+    while cur is not None and cur not in chain and len(chain) < limit:
+        chain.append(cur)
+        cur = cur.__cause__ or cur.__context__
+    return chain
+
+
+def _connect_phase_types() -> tuple[type[BaseException], ...]:
+    """Exception classes that prove the request never reached the server.
+
+    Only errors raised while *establishing* the connection qualify (refused, DNS, TLS to the proxy,
+    connect timeout, no pooled connection). Resets, broken pipes, read timeouts and "server
+    disconnected" can happen after bytes were sent, so they are deliberately NOT here.
+    """
+    import socket
+    found: list[type[BaseException]] = [ConnectionRefusedError, socket.gaierror]
+    try:
+        import aiohttp
+        found += [aiohttp.ClientConnectorError, aiohttp.ClientProxyConnectionError]
+    except ImportError:
+        pass
+    try:
+        import httpx
+        found += [httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout]
+    except ImportError:
+        pass
+    return tuple(found)
+
+
 def classify_send_error(exc: BaseException) -> bool:
-    """True only when the failure proves the message was NOT delivered (safe to resend)."""
-    if getattr(exc, "retry_safe", False) is True:
-        return True
-    if isinstance(exc, ConnectionError):
-        return True
-    status = getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
-    return status == 429
+    """True only when the failure PROVES the message was not delivered (safe to resend).
+
+    Walks the ``__cause__``/``__context__`` chain so wrappers (python-telegram-bot's
+    ``NetworkError``/``TimedOut`` around httpx, Slack SDK around aiohttp) are judged by the
+    underlying error.  Ambiguous failures stay "uncertain" and are never resent automatically.
+    """
+    connect_types = _connect_phase_types()
+    for err in _exception_chain(exc):
+        if getattr(err, "retry_safe", False) is True or isinstance(err, connect_types):
+            return True
+        if type(err).__name__ == "RetryAfter":  # Telegram flood control: rejected, not delivered
+            return True
+        status = getattr(err, "status_code", None) or getattr(getattr(err, "response", None), "status_code", None)
+        if status == 429:
+            return True
+    return False
 
 
 def _backup_yaml_before_first_ledger(config: AnnaConfig) -> None:
@@ -137,7 +182,11 @@ class Scheduler:
         self._ledger = ledger
         self._google_clients = google_clients
         self._heartbeat_classifier = heartbeat_classifier
-        self._owner = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
+        self._owner = new_owner_id()
+        self._absent: dict[str, int] = {}
+        self._deleted: set[str] = set()
+        self._shutting_down = False
+        self._last_prune = 0.0
         self._spawned: set[int] = set()
         self._shutdown_grace_seconds: float = 5.0
         self._cancel_grace_seconds: float = config.scheduler.cancel_grace_seconds + 1.0
@@ -188,7 +237,12 @@ class Scheduler:
             raise
 
     async def shutdown(self) -> None:
-        """Wait briefly for in-flight fires to land, then drop them."""
+        """Wait briefly for in-flight fires to land, then interrupt them as a SHUTDOWN.
+
+        Shutdown is not deletion: read-only runs go back to the queue for the next start and
+        side-effecting runs are reported honestly as unknown (see ``_guarded_fire``).
+        """
+        self._shutting_down = True
         if not self._inflight:
             return
         self._log.info("scheduler.shutdown.waiting", inflight=len(self._inflight))
@@ -233,6 +287,7 @@ class Scheduler:
         # Durable state first: unrun occurrences become cancelled and unsent
         # output is dropped, so nothing queued can start or deliver afterwards.
         self._ledger.cancel_schedule(schedule_id, detail="schedule deleted")
+        self._deleted.add(schedule_id)
         tasks = [
             task
             for task in self._tasks_by_schedule.get(schedule_id, ())
@@ -281,9 +336,11 @@ class Scheduler:
         """
         now = datetime.now(UTC)
         cfg = self._config.scheduler
+        load_ok = True
         try:
             await self._store.load()  # pick up dashboard edits and other writers
         except Exception as exc:
+            load_ok = False
             self._log.warning("scheduler.reload_failed", error=str(exc))
         for done in self._ledger.apply_repairs():
             audit_event("audit.schedule.repair_applied", audit_dir=self._audit_dir, actor="operator",
@@ -291,12 +348,13 @@ class Scheduler:
                         level="INFO" if done["outcome"] == "applied" else "WARNING", repair_id=done["id"],
                         kind=done["kind"], target_id=done["target_id"], action=done["action"],
                         outcome=done["outcome"], detail=done["detail"], requested_by=done["requested_by"])
-        for rec in self._ledger.recover_expired(now=now, max_run_attempts=cfg.max_run_attempts):
+        for rec in self._ledger.recover_expired(now=now, max_run_attempts=cfg.max_run_attempts,
+                                                owner_alive=owner_alive):
             await self._on_recovery(rec)
         self._ledger.recover_outbox(now=now)
-        for sid in self._ledger.active_schedule_ids():
-            if self._store.get(sid) is None:  # deleted by another process (dashboard)
-                await self.cancel_schedule_tasks(sid)
+        if load_ok:
+            await self._reconcile_deleted()
+        self._maybe_prune(now)
         for schedule in self._store.list():
             if schedule.enabled:
                 self._materialize(schedule, now)
@@ -304,11 +362,50 @@ class Scheduler:
             if occ.id in self._spawned:
                 continue
             found = self._store.get(occ.schedule_id)
-            if found is None or not found.enabled:
-                self._ledger.end_unrun(occ.id, status="cancelled", detail="schedule missing or disabled")
+            if found is None:
+                continue  # absence is not yet confirmed (see _reconcile_deleted); never cancel on one bad read
+            if not found.enabled:
+                self._ledger.end_unrun(occ.id, status="cancelled", detail="schedule disabled")
                 continue
             self._spawn(found, occ.id)
         await self._deliver_due()
+
+    async def _reconcile_deleted(self) -> None:
+        """Cancel work of schedules another process deleted - only once the deletion is CONFIRMED.
+
+        A hand edit or in-place save can leave ``schedules.yaml`` empty, truncated or missing for a
+        moment.  A schedule must therefore be absent on two consecutive successful loads before its
+        queued/running work is cancelled (cancellation is irreversible).  In-process deletes cancel
+        immediately through the store callback and do not depend on this path.
+        """
+        present = {s.id for s in self._store.list()}
+        active = self._ledger.active_schedule_ids()
+        for sid in list(self._absent):
+            if sid in present or sid not in active:
+                self._absent.pop(sid, None)
+        for sid in active - present:
+            self._absent[sid] = self._absent.get(sid, 0) + 1
+            if self._absent[sid] >= 2:
+                self._absent.pop(sid, None)
+                await self.cancel_schedule_tasks(sid)
+
+    def _maybe_prune(self, now: datetime) -> None:
+        cfg = self._config.scheduler
+        mono = asyncio.get_running_loop().time()
+        if self._last_prune and mono - self._last_prune < cfg.prune_interval_hours * 3600:
+            return
+        self._last_prune = mono
+        try:
+            counts = self._ledger.prune(now=now, retention_days=cfg.retention_days,
+                                        text_retention_days=cfg.text_retention_days)
+        except Exception as exc:  # noqa: BLE001
+            self._log.warning("scheduler.prune_failed", error=str(exc)[:200])
+            return
+        if any(counts.values()):
+            audit_event("audit.schedule.pruned", audit_dir=self._audit_dir, actor="anna",
+                        fsync_on_write=self._fsync, occurrences=counts["occurrences"],
+                        outbox_text_purged=counts["outbox_text_purged"], results_redacted=counts["results_redacted"],
+                        repairs=counts["repairs"])
 
     def _materialize(self, schedule: Schedule, now: datetime) -> None:
         cfg = self._config.scheduler
@@ -352,6 +449,11 @@ class Scheduler:
         self._discard_task(schedule_id, task)
 
     async def _on_recovery(self, rec: Recovery) -> None:
+        if rec.action == "skipped":  # another LIVE owner: never taken over, only reported
+            audit_event("audit.schedule.recovery_skipped", audit_dir=self._audit_dir, actor="anna",
+                        fsync_on_write=self._fsync, level="WARNING", schedule_id=rec.schedule_id,
+                        occurrence_id=rec.occurrence_id, detail=rec.detail)
+            return
         level = "WARNING" if rec.action in ("unknown", "failed") else "INFO"
         audit_event("audit.schedule.recovered", audit_dir=self._audit_dir, actor="anna",
                     fsync_on_write=self._fsync, level=level, schedule_id=rec.schedule_id,
@@ -458,11 +560,22 @@ class Scheduler:
             try:
                 result = await self._run_job(schedule, meta)
             except asyncio.CancelledError:
+                if schedule.id not in self._deleted and schedule.run_safety == "read_only":
+                    # SHUTDOWN of a read-only run: hand it back to the queue for the next start.
+                    self._ledger.repend_running(occurrence_id, run_id, owner=self._owner,
+                                                detail="shutdown: read-only run returned to the queue")
+                    self._audit_shutdown(schedule, occurrence_id, "repended")
+                    raise
                 verdict = meta.get("_cancel_verdict")
                 status, effects, detail = verdict if isinstance(verdict, tuple) else (
                     "unknown", "unknown", "scheduler task cancelled; outcome unverified")
                 self._ledger.finish_run(occurrence_id, run_id, status=status, side_effects=effects,
                                         error=detail, detail=detail)
+                if schedule.id not in self._deleted:
+                    # SHUTDOWN of side-effecting work: say plainly that the outcome is unknown.
+                    self._audit_shutdown(schedule, occurrence_id, status)
+                    await self._store.mark_failed(schedule.id, reason=f"shutdown: {status}",
+                                                  when=datetime.now(UTC), kind="fail")
                 raise
             except _TurnTimeout as exc:
                 self._ledger.finish_run(occurrence_id, run_id, status=exc.status, side_effects=exc.side_effects,
@@ -505,36 +618,62 @@ class Scheduler:
     # Built-in read-only Gmail + Calendar heartbeat (no worker turn, no LLM)
     # ------------------------------------------------------------------
 
+    def _audit_shutdown(self, schedule: Schedule, occurrence_id: int, outcome: str) -> None:
+        audit_event("audit.schedule.shutdown_interrupted", audit_dir=self._audit_dir, actor="anna",
+                    fsync_on_write=self._fsync, level="WARNING", schedule_id=schedule.id,
+                    occurrence_id=occurrence_id, outcome=outcome, run_safety=schedule.run_safety,
+                    kind="unknown" if outcome in ("unknown", "blocked") else outcome)
+
     async def _run_heartbeat(self, schedule: Schedule, occurrence_id: int, run_id: int) -> None:
         cfg = self._config
         finish = self._ledger.finish_run
 
-        async def fail(status: str, error: str, kind: str = "fail") -> None:
-            finish(occurrence_id, run_id, status=status, side_effects="none", error=error, detail=error)
-            await self._handle_failure(schedule, reason=error, kind=kind)
-
-        if not cfg.heartbeat.enabled:
-            await fail("failed", "heartbeat is disabled (set heartbeat.enabled: true)")
-            return
-        dest = f"{schedule.destination.transport}:{schedule.destination.channel}"
-        if dest not in cfg.heartbeat.allowed_destinations:
-            await fail("failed", f"heartbeat destination {dest!r} is not in heartbeat.allowed_destinations")
-            return
-        occ = self._ledger.get(occurrence_id)
+        tz = ZoneInfo(schedule.timezone)
         job = HeartbeatJob(config=cfg, clients=self._google_clients, ledger=self._ledger,
                            classifier=self._heartbeat_classifier)
+        dest = f"{schedule.destination.transport}:{schedule.destination.channel}"
+        allowed = dest in cfg.heartbeat.allowed_destinations
+
+        async def fail(exec_status: str, kind: str, error: str) -> None:
+            """Whole-job failure: same transition alerting as a failed check (never a quiet 'healthy' tick)."""
+            now_f = datetime.now(UTC)
+            outcome = job.job_failure(schedule, kind, error, now_f, tz)
+            specs = job.outbox_specs(schedule, outcome, now_f, tz) if allowed else []
+            finish(occurrence_id, run_id, status=exec_status, side_effects="none", result=outcome.summary,
+                   error=error, detail=error, outbox=specs or None,
+                   chunk_chars=cfg.scheduler.delivery_chunk_chars, heartbeat=outcome.commit)
+            audit_event("audit.schedule.heartbeat", audit_dir=self._audit_dir, actor="anna",
+                        fsync_on_write=self._fsync, level="WARNING", schedule_id=schedule.id,
+                        occurrence_id=occurrence_id, status="failed", error=error[:200],
+                        job_alert=outcome.summary.get("job_alert"))
+            await self._store.mark_failed(schedule.id, reason=error, when=now_f, kind="fail")
+            if outcome.notices and not specs:  # cannot go to the (non-allowlisted) destination: tell the admin
+                await self._warn_admin(outcome.notices[0].text)
+
+        if not cfg.heartbeat.enabled:
+            await fail("failed", "misconfigured", "heartbeat is disabled (set heartbeat.enabled: true)")
+            return
+        if not allowed:
+            await fail("failed", "misconfigured", f"destination {dest!r} is not in heartbeat.allowed_destinations")
+            return
+        occ = self._ledger.get(occurrence_id)
+        budget = max(schedule.timeout_seconds, heartbeat_min_timeout(cfg.heartbeat))
         try:
-            outcome = await asyncio.wait_for(job.run(schedule, scheduled_for=occ.scheduled_for),
-                                             timeout=schedule.timeout_seconds)
+            outcome = await asyncio.wait_for(job.run(schedule, scheduled_for=occ.scheduled_for), timeout=budget)
         except asyncio.CancelledError:
-            finish(occurrence_id, run_id, status="cancelled", side_effects="none",
-                   error="heartbeat cancelled (read-only; safe to repeat)", detail="cancelled")
+            if schedule.id in self._deleted:
+                finish(occurrence_id, run_id, status="cancelled", side_effects="none",
+                       error="schedule deleted while the heartbeat ran", detail="cancelled")
+            else:  # shutdown: a read-only heartbeat is simply run again after the restart
+                self._ledger.repend_running(occurrence_id, run_id, owner=self._owner,
+                                            detail="shutdown: read-only heartbeat returned to the queue")
+                self._audit_shutdown(schedule, occurrence_id, "repended")
             raise
         except TimeoutError:
-            await fail("timeout", f"heartbeat timed out after {schedule.timeout_seconds}s", "timeout")
+            await fail("timeout", "api_error", f"heartbeat timed out after {budget:.0f}s")
             return
         except Exception as exc:  # noqa: BLE001
-            await fail("failed", f"heartbeat error: {type(exc).__name__}: {exc}"[:300])
+            await fail("failed", "api_error", f"heartbeat error: {type(exc).__name__}: {str(exc)[:150]}")
             return
         now = datetime.now(UTC)
         specs = job.outbox_specs(schedule, outcome, now, ZoneInfo(schedule.timezone))
@@ -693,13 +832,21 @@ class Scheduler:
         cfg = self._config.scheduler
         attempted: set[int] = set()  # one attempt per row per pass; retries wait for the next poll
         for _ in range(50):  # chunk i+1 becomes claimable only after chunk i was sent
+            # One row per claim: a lease only ever covers the send that is actually in flight, so a row
+            # that has not been attempted can never expire into "uncertain".
             items = self._ledger.claim_outbox(now=now_utc(), lease_seconds=cfg.send_timeout_seconds + 30,
-                                              exclude=frozenset(attempted))
+                                              limit=1, exclude=frozenset(attempted))
             if not items:
                 return
             for item in items:
                 attempted.add(item.id)
                 await self._send_item(item)
+
+    async def _warn_admin(self, message: str, exclude: str | None = None) -> None:
+        try:
+            await asyncio.wait_for(self._alerter.warn(message, exclude_channel=exclude), timeout=15)
+        except Exception as exc:  # noqa: BLE001
+            self._log.warning("scheduler.admin_warn_failed", error=str(exc)[:200])
 
     async def _send_item(self, item: OutboxItem) -> None:
         cfg = self._config.scheduler
@@ -730,6 +877,11 @@ class Scheduler:
                         occurrence_id=item.occurrence_id, chunk=item.chunk_index, attempts=item.attempts,
                         outcome=outcome, error=f"{type(exc).__name__}: {exc}"[:200])
             if outcome in ("failed", "uncertain"):
+                if self._ledger.get(item.occurrence_id).job_kind != "agent_prompt":
+                    await self._warn_admin(
+                        f"A {outcome} delivery of heartbeat output to {item.transport}:{item.channel} could not be "
+                        f"confirmed ({type(exc).__name__}). It will be repeated on the next successful heartbeat.",
+                        exclude=item.transport)
                 await self._handle_failure(
                     self._store.get(item.schedule_id) or _stub_schedule(item.schedule_id),
                     reason=f"send failed ({outcome}): {exc}", kind="delivery")

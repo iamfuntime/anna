@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Form, Request
+from fastapi import APIRouter, Depends, Form, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
@@ -32,8 +32,45 @@ from anna.runtime.repairs import (
 )
 from anna.runtime.state_read import ReadOnlyDB, Unavailable
 from anna_web import audit as web_audit
+from anna_web.middleware import _origin_tuple, is_wildcard_host
 
-router = APIRouter(tags=["ops"])
+
+def require_local_host(request: Request) -> None:
+    """Reject requests whose Host header is not the dashboard's own address (DNS-rebinding guard).
+
+    These pages expose memory facts and delivery metadata to any page that can make the browser talk to
+    the dashboard.  A rebinding attack arrives with an attacker-controlled Host name, so only the bound
+    address (and the loopback names for a loopback bind) are accepted.  A wildcard bind has no single
+    canonical name; it is unchanged (use a loopback bind or a reverse proxy that pins Host).
+    """
+    cfg = request.app.state.cfg
+    bound = str(cfg.web.host).strip("[]").lower()
+    if is_wildcard_host(bound):
+        return
+    allowed = {bound}
+    if bound in ("127.0.0.1", "::1", "localhost"):
+        allowed |= {"127.0.0.1", "::1", "localhost"}
+    host_header = (request.headers.get("host") or "").lower()
+    parsed = _origin_tuple(f"http://{host_header}") if host_header else None
+    if parsed is None or parsed[1] not in allowed or parsed[2] not in (None, cfg.web.port):
+        raise HTTPException(status_code=403, detail="invalid Host header")
+
+
+router = APIRouter(tags=["ops"], dependencies=[Depends(require_local_host)])
+
+# Banner text comes ONLY from these fixed tables (never from the URL), so a crafted link cannot
+# put attacker-written words into a trusted-looking confirmation banner.
+_FLASH = {
+    "queued": "Queued for the daemon; it applies the decision on its next cycle.",
+    "forgot": "Memory forgotten.",
+    "corrected": "Memory corrected.",
+    "no_active": "No such active memory in this owner/scope.",
+    "no_memory": "No such memory in this owner/scope.",
+    "not_active": "That memory is no longer active (forgotten or already corrected).",
+    "select_scope": "Select an owner and scope first.",
+    "missing_fields": "Owner, scope and new content are required.",
+    "bad_scope": "Unknown owner/scope selection.",
+}
 
 
 def _render(request: Request, name: str, ctx: dict[str, Any], status_code: int = 200) -> Response:
@@ -57,11 +94,11 @@ async def get_health_json(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------- repairs
 
 @router.get("/repairs", response_class=HTMLResponse)
-async def get_repairs(request: Request, msg: str = "", err: str = "") -> Response:
+async def get_repairs(request: Request, flash: str = "", n: int = 0) -> Response:
     data = await run_in_threadpool(list_attention, request.app.state.cfg.state_dir)
+    msg = f"{_FLASH['queued']} (request {int(n)})" if flash == "queued" and n > 0 else ""
     return _render(request, "repairs.html", {"active_nav": "repairs", "data": data, "labels": LABELS,
-                                              "msg": msg[:200], "err": err[:200],
-                                              "phrase": expected_confirmation})
+                                              "msg": msg, "err": "", "phrase": expected_confirmation})
 
 
 @router.post("/repairs/{kind}/{target_id}")
@@ -69,6 +106,8 @@ async def post_repair(request: Request, kind: str, target_id: int,
                       action: Annotated[str, Form()], expected_status: Annotated[str, Form()],
                       confirm: Annotated[str, Form()] = "") -> Response:
     cfg = request.app.state.cfg
+    if kind not in ("run", "outbox") or action not in LABELS:
+        raise HTTPException(status_code=404, detail="unknown repair target")  # nothing attacker-chosen is echoed
     if confirm.strip() != expected_confirmation(kind, target_id, action):
         web_audit.emit("repair_rejected", request=request, kind=kind, target_id=target_id, action=action,
                        reason="confirmation phrase mismatch")
@@ -88,7 +127,7 @@ async def post_repair(request: Request, kind: str, target_id: int,
             "msg": "", "err": f"Not queued: {exc}", "phrase": expected_confirmation}, status_code=409)
     web_audit.emit("repair_queued", request=request, kind=kind, target_id=target_id, action=action,
                    repair_id=request_id)
-    return RedirectResponse(f"/repairs?msg=Queued+for+the+daemon+(request+{request_id})", status_code=303)
+    return RedirectResponse(f"/repairs?flash=queued&n={int(request_id)}", status_code=303)
 
 
 # ---------------------------------------------------------------- memory
@@ -129,26 +168,29 @@ def _facts(cfg: Any, owner: str, scope: str, status: str) -> list[dict[str, Any]
 
 @router.get("/memory", response_class=HTMLResponse)
 async def get_memory(request: Request, owner: str = "", scope: str = "", status: str = "active",
-                     msg: str = "", err: str = "") -> Response:
+                     flash: str = "") -> Response:
     cfg = request.app.state.cfg
     scopes = await run_in_threadpool(_scopes, cfg)
     selected = None
     facts: list[dict[str, Any]] = []
+    err = ""
+    msg = _FLASH.get(flash, "") if flash in ("forgot", "corrected") else ""
+    if flash in ("no_active", "no_memory", "not_active", "select_scope", "missing_fields"):
+        err = _FLASH[flash]
     if owner and scope:
         if not any(s["owner_id"] == owner and s["scope"] == scope for s in scopes):
-            err = err or "Unknown owner/scope selection."
+            err = _FLASH["bad_scope"]
         else:
             selected = {"owner": owner, "scope": scope}
             facts = await run_in_threadpool(_facts, cfg, owner, scope, status if status in
                                             ("active", "forgotten", "superseded", "all") else "active")
     return _render(request, "memory.html", {"active_nav": "memory", "scopes": scopes, "selected": selected,
-                                             "facts": facts, "status": status, "msg": msg[:200], "err": err[:200]})
+                                             "facts": facts, "status": status, "msg": msg, "err": err})
 
 
-def _back(owner: str, scope: str, *, msg: str = "", err: str = "") -> RedirectResponse:
+def _back(owner: str, scope: str, *, flash: str) -> RedirectResponse:
     from urllib.parse import urlencode
-    q = urlencode({"owner": owner, "scope": scope, **({"msg": msg} if msg else {}), **({"err": err} if err else {})})
-    return RedirectResponse(f"/memory?{q}", status_code=303)
+    return RedirectResponse(f"/memory?{urlencode({'owner': owner, 'scope': scope, 'flash': flash})}", status_code=303)
 
 
 def _store(cfg: Any) -> MemoryStore:
@@ -160,21 +202,21 @@ async def post_memory_forget(request: Request, fact_id: int, owner: Annotated[st
                              scope: Annotated[str, Form()]) -> Response:
     cfg = request.app.state.cfg
     if not owner or not scope:
-        return _back(owner, scope, err="Select an owner and scope first.")
+        return _back(owner, scope, flash="select_scope")
 
     def _do() -> str:
         store = _store(cfg)
         try:
             store.forget(fact_id, owner_id=owner, visibility_scope=scope)
-            return ""
+            return "forgot"
         except KeyError:
-            return "No such active memory in this owner/scope."
+            return "no_active"
         finally:
             store.close()
 
-    error = await run_in_threadpool(_do)
-    web_audit.emit("memory_forget", request=request, fact_id=fact_id, scope=scope, ok=not error)
-    return _back(owner, scope, msg="" if error else f"Forgot memory #{fact_id}.", err=error)
+    outcome = await run_in_threadpool(_do)
+    web_audit.emit("memory_forget", request=request, fact_id=fact_id, scope=scope, ok=outcome == "forgot")
+    return _back(owner, scope, flash=outcome)
 
 
 @router.post("/memory/{fact_id}/correct")
@@ -182,7 +224,7 @@ async def post_memory_correct(request: Request, fact_id: int, owner: Annotated[s
                               scope: Annotated[str, Form()], content: Annotated[str, Form()]) -> Response:
     cfg = request.app.state.cfg
     if not owner or not scope or not content.strip():
-        return _back(owner, scope, err="Owner, scope and new content are required.")
+        return _back(owner, scope, flash="missing_fields")
 
     def _do() -> str:
         store = _store(cfg)
@@ -190,16 +232,16 @@ async def post_memory_correct(request: Request, fact_id: int, owner: Annotated[s
             store.correct(fact_id, content=content.strip()[:500], source_event_id=f"web:{request.state.request_id}"
                           if hasattr(request.state, "request_id") else "web",
                           owner_id=owner, visibility_scope=scope)
-            return ""
+            return "corrected"
         except KeyError:
-            return "No such memory in this owner/scope."
+            return "no_memory"
         except FactNotActive:
-            return "That memory is no longer active (forgotten or already corrected)."
+            return "not_active"
         finally:
             store.close()
 
-    error = await run_in_threadpool(_do)
-    web_audit.emit("memory_correct", request=request, fact_id=fact_id, scope=scope, ok=not error)
-    return _back(owner, scope, msg="" if error else f"Corrected memory #{fact_id}.", err=error)
+    outcome = await run_in_threadpool(_do)
+    web_audit.emit("memory_correct", request=request, fact_id=fact_id, scope=scope, ok=outcome == "corrected")
+    return _back(owner, scope, flash=outcome)
 
 
