@@ -422,6 +422,10 @@ async def _run(config: AnnaConfig) -> None:
     except Exception as exc:
         log.warning("anna.shutdown.router_failed", error=str(exc))
 
+    if google_clients is not None:
+        # Do not leave account-owned executor threads alive after shutdown.
+        google_clients.close(wait=False)
+
     for adapter in adapters.values():
         try:
             await adapter.stop()

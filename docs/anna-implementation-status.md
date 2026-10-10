@@ -152,6 +152,24 @@ uv run --extra dev pytest -q
 1,397 passed, 1 skipped, 1 warning in 22.67s
 ```
 
+Google call isolation is complete for the read-only tool surface. Each
+`(account, API)` has one bounded single-worker executor: discovery, credential
+refresh, request construction, and synchronous `execute()` stay on that owner
+thread. Calls have a 30-second deadline; timeout/cancellation does not claim
+an uncertain remote result and cannot create more than that account/API's one
+owner thread. Shutdown closes queued executor work after workers stop.
+
+Focused tests cover event-loop heartbeat progress, same-account serialization,
+different-account progress, timeout/queued-work cleanup, and result
+compatibility. `ruff check` is clean for touched Google code; targeted `mypy`
+is blocked only because installed `googleapiclient.discovery` lacks typing
+metadata. No dependency was changed.
+
+```text
+uv run --extra dev pytest -q
+1,400 passed, 1 skipped, 1 warning in 22.48s
+```
+
 Migration/rollback: `state/memory.sqlite3` is created automatically with a
 version-1 ledger and WAL mode. It is additive; rollback is to stop using the
 store while retaining the database and transcripts. Use a temporary `ANNA_HOME`
@@ -159,8 +177,7 @@ in tests; no real provider or credential action is required.
 
 ## Deferred milestones
 
-1. **Phase 0:** finish exact event coverage/replay, receiver liveness, and
-   synchronous Google-call isolation.
+1. **Phase 0:** finish exact event coverage/replay.
 2. **Phase 1:** SQLite-backed owner-scoped memory, FTS retrieval per turn,
    provenance, explicit remember/correct/forget, and durable extraction jobs.
 3. **Phase 2:** durable task/run/outbox records and a mocked, deterministic,
@@ -186,9 +203,8 @@ ANNA_HOME="$(mktemp -d)" uv run --extra dev pytest -q \
   tests/test_worker_periodic_flush.py tests/test_turn_watchdog.py
 ```
 
-Next add receiver startup/liveness tests and safe per-account Google execution
-isolation. Run relevant lint/type checks, then the full suite only after the
-remaining Phase 0 targeted tests pass.
+Next implement exact transcript event coverage/replay. Run relevant lint/type
+checks, then the full suite after its targeted tests pass.
 
 ## Copyable continuation brief
 
@@ -228,8 +244,7 @@ additive and preserve pending records across downgrade/restart.
 - Exact checkpoint coverage is deliberately conservative for now: legacy and
   bounded checkpoints do not suppress transcript replay.
 - Receiver readiness/liveness and Google `.execute()` thread isolation are
-  only partially implemented: receiver liveness is covered, safe Google call
-  isolation remains.
+  implemented for the current read-only Google tools.
 - Memory persistence/retrieval and explicit fact tools are implemented, but
   extraction jobs, source import, durable tasks/runs/outbox, heartbeat, and
   repair UX remain.

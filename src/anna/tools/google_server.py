@@ -16,21 +16,17 @@ read-only surface stays unambiguous.
 
 from __future__ import annotations
 
+import asyncio
 import base64
-from datetime import datetime, time, timedelta, timezone
-from typing import TYPE_CHECKING, Any
+from datetime import UTC, datetime, time
+from typing import Any
 from zoneinfo import ZoneInfo
 
 from claude_agent_sdk import create_sdk_mcp_server, tool
 
 from anna.config import AnnaConfig
 from anna.log import audit_event, get_logger
-from anna.tools.google_auth import GoogleAuthError
 from anna.tools.google_clients import GoogleClients
-
-if TYPE_CHECKING:
-    pass
-
 
 GOOGLE_TOOL_NAMES: tuple[str, ...] = (
     "google_accounts_list",
@@ -135,6 +131,19 @@ class GoogleTools:
             **fields,
         )
 
+    async def _execute(self, account: str, api: str, operation: Any) -> Any:
+        """Execute request construction + HTTP off the event loop.
+
+        Real ``GoogleClients`` owns the service in a one-worker executor.
+        The fallback keeps legacy test doubles compatible while still keeping
+        their synchronous fake execute calls off the loop.
+        """
+        run = getattr(self._clients, "run", None)
+        if run is not None:
+            return await run(account, api, operation)
+        service = self._clients.gmail(account) if api == "gmail" else self._clients.calendar(account)
+        return await asyncio.to_thread(operation, service)
+
     # ------------------------------------------------------------------
     # Accounts
     # ------------------------------------------------------------------
@@ -176,20 +185,11 @@ class GoogleTools:
         if max_results <= 0 or max_results > 500:
             raise ValueError("max_results must be between 1 and 500")
 
-        try:
-            service = self._clients.gmail(account)
-        except GoogleAuthError as exc:
-            return _text_response(f"error: {exc}")
-
         # Gmail's `q` parameter supports `newer_than:Nd|h|m`. Use hours
         # to keep the operator's "last N hours" mental model exact.
         query = f"is:unread in:inbox newer_than:{since_hours}h"
         try:
-            resp = service.users().messages().list(
-                userId="me",
-                q=query,
-                maxResults=max_results,
-            ).execute()
+            resp = await self._execute(account, "gmail", lambda service: service.users().messages().list(userId="me", q=query, maxResults=max_results).execute())
         except Exception as exc:
             self._audit(
                 "audit.google.gmail_list_unread.failed",
@@ -221,12 +221,7 @@ class GoogleTools:
         lines: list[str] = []
         for mid in message_ids:
             try:
-                msg = service.users().messages().get(
-                    userId="me",
-                    id=mid,
-                    format="metadata",
-                    metadataHeaders=["From", "Subject", "Date"],
-                ).execute()
+                msg = await self._execute(account, "gmail", lambda service, message_id=mid: service.users().messages().get(userId="me", id=message_id, format="metadata", metadataHeaders=["From", "Subject", "Date"]).execute())
             except Exception as exc:
                 lines.append(f"- {mid}: (metadata fetch failed: {exc})")
                 continue
@@ -269,16 +264,7 @@ class GoogleTools:
             raise ValueError("max_results must be between 1 and 500")
 
         try:
-            service = self._clients.gmail(account)
-        except GoogleAuthError as exc:
-            return _text_response(f"error: {exc}")
-
-        try:
-            resp = service.users().messages().list(
-                userId="me",
-                q=query,
-                maxResults=max_results,
-            ).execute()
+            resp = await self._execute(account, "gmail", lambda service: service.users().messages().list(userId="me", q=query, maxResults=max_results).execute())
         except Exception as exc:
             self._audit(
                 "audit.google.gmail_search.failed",
@@ -304,12 +290,7 @@ class GoogleTools:
         lines: list[str] = []
         for mid in message_ids:
             try:
-                msg = service.users().messages().get(
-                    userId="me",
-                    id=mid,
-                    format="metadata",
-                    metadataHeaders=["From", "Subject", "Date"],
-                ).execute()
+                msg = await self._execute(account, "gmail", lambda service, message_id=mid: service.users().messages().get(userId="me", id=message_id, format="metadata", metadataHeaders=["From", "Subject", "Date"]).execute())
             except Exception as exc:
                 lines.append(f"- {mid}: (metadata fetch failed: {exc})")
                 continue
@@ -348,16 +329,7 @@ class GoogleTools:
             raise ValueError("message_id cannot be empty")
 
         try:
-            service = self._clients.gmail(account)
-        except GoogleAuthError as exc:
-            return _text_response(f"error: {exc}")
-
-        try:
-            msg = service.users().messages().get(
-                userId="me",
-                id=message_id,
-                format="full",
-            ).execute()
+            msg = await self._execute(account, "gmail", lambda service: service.users().messages().get(userId="me", id=message_id, format="full").execute())
         except Exception as exc:
             self._audit(
                 "audit.google.gmail_read.failed",
@@ -424,31 +396,19 @@ class GoogleTools:
             raise ValueError("max_results must be between 1 and 250")
 
         try:
-            service = self._clients.calendar(account)
-        except GoogleAuthError as exc:
-            return _text_response(f"error: {exc}")
-
-        try:
             start_dt = datetime.fromisoformat(start_iso)
             end_dt = datetime.fromisoformat(end_iso)
         except ValueError as exc:
             raise ValueError(f"invalid ISO-8601 in start/end: {exc}") from exc
         if start_dt.tzinfo is None:
-            start_dt = start_dt.replace(tzinfo=timezone.utc)
+            start_dt = start_dt.replace(tzinfo=UTC)
         if end_dt.tzinfo is None:
-            end_dt = end_dt.replace(tzinfo=timezone.utc)
+            end_dt = end_dt.replace(tzinfo=UTC)
         if end_dt <= start_dt:
             raise ValueError("end_iso must be after start_iso")
 
         try:
-            resp = service.events().list(
-                calendarId="primary",
-                timeMin=start_dt.isoformat(),
-                timeMax=end_dt.isoformat(),
-                singleEvents=True,
-                orderBy="startTime",
-                maxResults=max_results,
-            ).execute()
+            resp = await self._execute(account, "calendar", lambda service: service.events().list(calendarId="primary", timeMin=start_dt.isoformat(), timeMax=end_dt.isoformat(), singleEvents=True, orderBy="startTime", maxResults=max_results).execute())
         except Exception as exc:
             self._audit(
                 "audit.google.calendar_list_events.failed",

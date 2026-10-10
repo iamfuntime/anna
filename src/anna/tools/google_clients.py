@@ -13,7 +13,10 @@ spawn parallel workers that share an instance, swap the cache for an
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Literal
+import asyncio
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Literal, TypeVar
 
 from anna.config import AnnaConfig, GoogleAccountConfig
 from anna.log import get_logger
@@ -23,10 +26,8 @@ from anna.tools.google_auth import (
     load_credentials,
 )
 
-if TYPE_CHECKING:
-    from googleapiclient.discovery import Resource
-
 ApiName = Literal["gmail", "calendar"]
+T = TypeVar("T")
 
 _API_VERSIONS: dict[ApiName, str] = {
     "gmail": "v1",
@@ -48,9 +49,12 @@ class GoogleClients:
     def __init__(self, config: AnnaConfig) -> None:
         self._config = config
         self._log = get_logger("anna.google.clients")
-        # Cache keys are ``(slug, api)``; values are ``Resource`` objects
-        # from ``googleapiclient.discovery.build``.
+        # Each discovery Resource (and its httplib2 transport) belongs to one
+        # dedicated thread.  Discovery, credential refresh, and execute must
+        # never migrate that transport between arbitrary asyncio threads.
         self._cache: dict[tuple[str, ApiName], Any] = {}
+        self._executors: dict[tuple[str, ApiName], ThreadPoolExecutor] = {}
+        self._closed = False
 
     @property
     def config(self) -> AnnaConfig:
@@ -80,6 +84,39 @@ class GoogleClients:
         service = build(api, _API_VERSIONS[api], credentials=creds, cache_discovery=False)
         self._cache[cache_key] = service
         return service
+
+    def _executor(self, slug: str, api: ApiName) -> ThreadPoolExecutor:
+        key = (slug, api)
+        executor = self._executors.get(key)
+        if executor is None:
+            executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"anna-google-{slug}-{api}")
+            self._executors[key] = executor
+        return executor
+
+    async def run(
+        self, slug: str, api: ApiName, operation: Callable[[Any], T], *, timeout_seconds: float = 30.0
+    ) -> T:
+        """Run a complete discovery request on its account/API owner thread.
+
+        Cancellation/timeout stops awaiting but cannot safely kill a Python
+        thread in an in-flight HTTP call. The bounded one-worker executor
+        prevents duplicate concurrent use; callers receive an explicit timeout
+        rather than assuming uncertain remote effects did not happen.
+        """
+        if self._closed:
+            raise RuntimeError("GoogleClients is closed")
+        loop = asyncio.get_running_loop()
+        future = loop.run_in_executor(self._executor(slug, api), lambda: operation(self._service(slug, api)))
+        return await asyncio.wait_for(future, timeout=timeout_seconds)
+
+    def close(self, *, wait: bool = False) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for executor in self._executors.values():
+            executor.shutdown(wait=wait, cancel_futures=True)
+        self._executors.clear()
+        self._cache.clear()
 
     def gmail(self, slug: str) -> Any:
         """Return a Gmail v1 service for the given account."""
