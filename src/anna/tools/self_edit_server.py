@@ -346,9 +346,12 @@ class SelfEditTools:
         tz_name: str = "America/New_York",
         timeout_seconds: int = 300,
         enabled: bool = True,
+        job_kind: str = "agent_prompt",
         creator_conv: str,
     ) -> dict[str, Any]:
         store = self._require_store()
+        if job_kind not in ("agent_prompt", "google_heartbeat"):
+            raise ValueError("job_kind must be 'agent_prompt' or 'google_heartbeat'")
         if (cron is None) == (natural_language is None):
             raise ValueError(
                 "schedule_create requires exactly one of cron or natural_language"
@@ -366,10 +369,11 @@ class SelfEditTools:
             natural_language=natural_language,
             cron=cron_expr,  # type: ignore[arg-type]
             timezone=tz_name,
-            prompt=prompt,
+            prompt=prompt or "[built-in google heartbeat]",
             destination=ScheduleDestination(transport=destination_transport, channel=destination_channel),  # type: ignore[arg-type]
             timeout_seconds=timeout_seconds,
             enabled=enabled,
+            job_kind=job_kind,  # type: ignore[arg-type]
             created_at=datetime.now(timezone.utc),
         )
         await store.create(schedule, actor_conv=creator_conv)
@@ -583,7 +587,7 @@ def build_self_edit_server(*, tools: SelfEditTools, conv_key: str) -> Any:
 
     @tool(
         "schedule_create",
-        "Create a new scheduled task. Either cron (5-field cron expression) or natural_language ('every morning at 6am', 'every weekday at 9am', 'every Monday at 10am', 'every N hours', 'every N minutes', 'daily at HH:MM', 'weekly on DAY at HH:MM') must be set, not both. destination_transport is 'slack' or 'telegram'; destination_channel is the channel id or chat id. The admin channel is reserved for alerter traffic and will be rejected.",
+        "Create a new scheduled task. Either cron (5-field cron expression) or natural_language ('every morning at 6am', 'every weekday at 9am', 'every Monday at 10am', 'every N hours', 'every N minutes', 'daily at HH:MM', 'weekly on DAY at HH:MM') must be set, not both. destination_transport is 'slack' or 'telegram'; destination_channel is the channel id or chat id. The admin channel is reserved for alerter traffic and will be rejected. Optional job_kind: 'agent_prompt' (default) or 'google_heartbeat' (built-in read-only Gmail+Calendar check, no model; requires heartbeat.enabled; prompt is ignored).",
         {
             "id": str,
             "prompt": str,
@@ -594,12 +598,13 @@ def build_self_edit_server(*, tools: SelfEditTools, conv_key: str) -> Any:
             "tz_name": str,
             "timeout_seconds": int,
             "enabled": bool,
+            "job_kind": str,
         },
     )
     async def _schedule_create(args: dict[str, Any]) -> dict[str, Any]:
         return await tools.schedule_create(
             id=args["id"],
-            prompt=args["prompt"],
+            prompt=args.get("prompt") or "",
             destination_transport=args["destination_transport"],
             destination_channel=args["destination_channel"],
             cron=args.get("cron") or None,
@@ -607,6 +612,7 @@ def build_self_edit_server(*, tools: SelfEditTools, conv_key: str) -> Any:
             tz_name=args.get("tz_name") or "America/New_York",
             timeout_seconds=int(args.get("timeout_seconds") or 300),
             enabled=bool(args.get("enabled", True)),
+            job_kind=args.get("job_kind") or "agent_prompt",
             creator_conv=conv_key,
         )
 

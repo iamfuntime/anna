@@ -17,7 +17,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class ScheduleDestination(BaseModel):
@@ -78,7 +78,7 @@ class Schedule(BaseModel):
     ephemeral: bool = False
     # What the scheduler executes. Only the legacy agent prompt exists today;
     # typed deterministic jobs (heartbeat) register further kinds.
-    job_kind: Literal["agent_prompt"] = "agent_prompt"
+    job_kind: Literal["agent_prompt", "google_heartbeat"] = "agent_prompt"
     # Crash-recovery safety. ``side_effecting`` runs interrupted mid-flight are
     # recorded as unknown and never re-run; ``read_only`` runs may be retried.
     run_safety: Literal["side_effecting", "read_only"] = "side_effecting"
@@ -88,3 +88,10 @@ class Schedule(BaseModel):
     misfire_grace_seconds: int | None = None
     created_at: datetime
     state: ScheduleState = Field(default_factory=ScheduleState)
+
+    @model_validator(mode="after")
+    def _heartbeat_is_read_only(self) -> "Schedule":
+        # The built-in heartbeat only reads; an interrupted run is safe to repeat.
+        if self.job_kind == "google_heartbeat" and self.run_safety != "read_only":
+            self.run_safety = "read_only"
+        return self

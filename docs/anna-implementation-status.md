@@ -421,6 +421,69 @@ dedup hash that blocks resurrection, and any copy the extractor's CLI session wr
 Validation: full suite 1,509 passed, 1 skipped; ruff clean on new/changed memory files
 and tests, mypy clean except pre-existing `dict` generics in `transcript_resume.py`.
 
+## Built-in Gmail + Calendar heartbeat (`job_kind: google_heartbeat`)
+
+Read-only, deterministic, **opt-in** (`heartbeat.enabled: false` by default). No model is
+used for collection, empty checks or reminders; it dispatches no worker turn, so nothing from
+mail/calendar can reach the model, memory extraction or `InboundEvent.human_origin` paths.
+
+- **Transport:** the existing serialized `GoogleClients.run(account, api, op)` lanes only
+  (busy lane -> `busy` receipt; no new keys, vendors or sync clients). Only
+  `getProfile`, `messages.list/get` (metadata), `history.list`, `events.list` are called;
+  the fake-provider tests fail on any other method.
+- **Receipts:** every configured `(account, service)` yields a typed receipt (`ok`,
+  `auth_required`, `rate_limited`, `api_error`, `busy`, `partial`, `backpressure`) with
+  `checked_at`, cursor before/after, items seen/new, pages, `resynced`, `more_pending`, error
+  class/message and a sha256 `receipt_hash`; stored in `heartbeat_receipts` and in the run
+  result. One failing account/service never stops the others; exceptions and malformed
+  provider responses are `api_error`, never an empty inbox.
+- **Job outcome** (occurrence `exec_status`): `succeeded` only if every required check is `ok`
+  and nothing was withheld; `partial` (some usable, some not / more pending / backpressure);
+  `auth_required` (all checks need re-authorization); `failed` (otherwise, or heartbeat disabled,
+  no accounts). A heartbeat is never auto-disabled by failures or delivery problems.
+- **Cursors/resync:** Gmail keeps a `historyId`; none or HTTP 404 -> bounded resync (newest unread
+  inbox mail of the last `gmail_bootstrap_hours`, <= `gmail_max_pages` pages; older mail past
+  that cap is not alerted; message-id dedup makes it safe). Incremental history is page-bounded;
+  if pages remain the cursor only advances to the last record processed (`partial`). Calendar
+  uses a rolling window in the schedule timezone (a sync token cannot be combined with a window);
+  dedup key = event id + `updated`; "starting soon" reminders dedup on event id + start.
+- **Atomicity:** cursors, notified keys, alert state and receipts commit in the SAME transaction
+  as the run result and outbox rows (`finish_run(heartbeat=...)`). Crash -> read-only check repeats
+  (`run_safety: read_only` recovery), never loses or duplicates an alert. Delivery retries touch
+  only the outbox; they never re-run the checks.
+- **Alerts:** state transitions only: one alert on entering `auth_required`; transient failures
+  (rate limit/API/busy) alert after `transient_failures_before_alert` consecutive ticks; bounded
+  reminders (`reminder_interval_hours`, `max_reminders`); one "working again" notice. Quiet hours
+  (schedule timezone, wrap-around aware) hold non-urgent notices via the outbox's `next_attempt_at`;
+  reminders within `urgent_minutes` bypass them. If pending notifications exceed
+  `max_pending_notifications`, new items/alerts are withheld **without** advancing cursors or
+  marking items notified (status `backpressure`/`partial`) and re-read later.
+- **Optional classifier:** a `Classifier` protocol (`annotate(items)->labels`) can be injected into
+  `Scheduler(heartbeat_classifier=...)`; it runs only on already-collected candidates, is
+  time-bounded and failure-isolated, and can never affect receipts or status. No SDK-backed
+  implementation is shipped (deferred).
+- **Registration:** `Schedule.job_kind` accepts `google_heartbeat` (forces `run_safety: read_only`);
+  `schedule_create` takes optional `job_kind` (prompt ignored); the store refuses to create one
+  unless `heartbeat.enabled`, `google.enabled` and an account exist. Legacy agent jobs unchanged.
+- **Migration/rollback:** ledger schema v2 (additive tables `heartbeat_state`, `heartbeat_notified`,
+  `heartbeat_receipts`; `schedule_outbox` rebuilt with a per-message `msg_index` so one occurrence
+  can carry several independent messages). An existing ledger is copied to
+  `runtime.sqlite3.bak-v1-<ts>` first. Rollback: set `heartbeat.enabled: false`, delete heartbeat
+  schedules, and restore the backup if reverting the code (the older build ignores the new tables
+  but cannot read the rebuilt outbox column set safely - restore the backup rather than mixing).
+- **Operator setup (isolated, no live provider needed to validate):**
+  1. `ANNA_HOME=$(mktemp -d) uv run --extra dev pytest -q tests/test_heartbeat.py` (fake provider).
+  2. Real accounts: `google.enabled: true`, accounts added with
+     `python -m anna.setup.google_auth add|verify <slug>` (existing flow).
+  3. `heartbeat.enabled: true`, restart; create a schedule with `job_kind: google_heartbeat`
+     (e.g. `*/15 * * * *`) via `schedule_create` or `schedules.yaml`; the config block in
+     `anna.yaml.example` documents every knob.
+
+Validation: full suite 1,547 passed, 1 skipped (`tests/test_heartbeat.py`: 38 tests); ruff clean on
+new files; mypy clean except the existing missing `croniter` stubs. Not exercised: any live
+Google account (by design). Deferred: SDK-backed classifier, dashboard view of receipts, Gmail
+push/watch, calendar sync tokens.
+
 ## Deferred milestones
 
 1. **Phase 0:** finish exact event coverage/replay.

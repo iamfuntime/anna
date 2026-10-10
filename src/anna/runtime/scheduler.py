@@ -25,13 +25,14 @@ import asyncio
 import os
 import shutil
 import uuid
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo
 
 from anna.config import AnnaConfig
 from anna.log import audit_event, get_logger
+from anna.runtime.heartbeat import Classifier, HeartbeatJob
 from anna.runtime.ledger import OutboxItem, Recovery, RuntimeLedger, now_utc
 from anna.runtime.schedule_jobs import JobResult, Outcome
 from anna.runtime.schedule_store import ScheduleStore
@@ -96,7 +97,7 @@ def _backup_yaml_before_first_ledger(config: AnnaConfig) -> None:
     ledger_path = config.state_dir / "runtime.sqlite3"
     if ledger_path.exists() or not yaml_path.exists():
         return
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
     shutil.copy2(yaml_path, yaml_path.with_name(f"{yaml_path.name}.bak-pre-ledger-{stamp}"))
 
 
@@ -108,10 +109,12 @@ class Scheduler:
         *,
         config: AnnaConfig,
         store: ScheduleStore,
-        router: "ConversationRouter",
+        router: ConversationRouter,
         adapters: dict[str, ChannelAdapter],
-        alerter: "AdminAlerter",
+        alerter: AdminAlerter,
         ledger: RuntimeLedger | None = None,
+        google_clients: Any | None = None,
+        heartbeat_classifier: Classifier | None = None,
     ) -> None:
         self._config = config
         self._store = store
@@ -132,6 +135,8 @@ class Scheduler:
             _backup_yaml_before_first_ledger(config)
             ledger = RuntimeLedger(config.state_dir / "runtime.sqlite3")
         self._ledger = ledger
+        self._google_clients = google_clients
+        self._heartbeat_classifier = heartbeat_classifier
         self._owner = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
         self._spawned: set[int] = set()
         self._shutdown_grace_seconds: float = 5.0
@@ -192,7 +197,7 @@ class Scheduler:
                 asyncio.gather(*self._inflight, return_exceptions=True),
                 timeout=self._shutdown_grace_seconds,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             self._log.warning(
                 "scheduler.shutdown.timeout",
                 inflight=len(self._inflight),
@@ -274,7 +279,7 @@ class Scheduler:
         transaction with the cursor advance, so a crash can neither lose the
         tick nor produce it twice.
         """
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         cfg = self._config.scheduler
         try:
             await self._store.load()  # pick up dashboard edits and other writers
@@ -305,7 +310,7 @@ class Scheduler:
             tz = ZoneInfo(schedule.timezone)
             baseline = schedule.state.last_fired_at or schedule.created_at
             if baseline.tzinfo is None:
-                baseline = baseline.replace(tzinfo=timezone.utc)
+                baseline = baseline.replace(tzinfo=UTC)
             created = self._ledger.materialize(
                 schedule_id=schedule.id, cron=schedule.cron, tz=tz, baseline=baseline, now=now,
                 job_kind=schedule.job_kind, run_safety=schedule.run_safety,
@@ -423,7 +428,7 @@ class Scheduler:
             lease = 2 * schedule.timeout_seconds + self._config.scheduler.lease_grace_seconds
             if not self._ledger.claim(occurrence_id, owner=self._owner, lease_seconds=lease):
                 return
-            started_at = datetime.now(timezone.utc)
+            started_at = datetime.now(UTC)
             try:
                 run_id = self._ledger.start_run(occurrence_id, owner=self._owner)
             except PermissionError:
@@ -439,6 +444,10 @@ class Scheduler:
             )
             self._log.info("scheduler.fire", schedule_id=schedule.id, occurrence_id=occurrence_id)
 
+            if schedule.job_kind == "google_heartbeat":
+                await self._run_heartbeat(schedule, occurrence_id, run_id)
+                await self._deliver_due()
+                return
             meta: dict[str, object] = {}
             try:
                 result = await self._run_job(schedule, meta)
@@ -487,6 +496,59 @@ class Scheduler:
         await self._deliver_due()
 
     # ------------------------------------------------------------------
+    # Built-in read-only Gmail + Calendar heartbeat (no worker turn, no LLM)
+    # ------------------------------------------------------------------
+
+    async def _run_heartbeat(self, schedule: Schedule, occurrence_id: int, run_id: int) -> None:
+        cfg = self._config
+        finish = self._ledger.finish_run
+
+        async def fail(status: str, error: str, kind: str = "fail") -> None:
+            finish(occurrence_id, run_id, status=status, side_effects="none", error=error, detail=error)
+            await self._handle_failure(schedule, reason=error, kind=kind)
+
+        if not cfg.heartbeat.enabled:
+            await fail("failed", "heartbeat is disabled (set heartbeat.enabled: true)")
+            return
+        occ = self._ledger.get(occurrence_id)
+        job = HeartbeatJob(config=cfg, clients=self._google_clients, ledger=self._ledger,
+                           classifier=self._heartbeat_classifier)
+        try:
+            outcome = await asyncio.wait_for(job.run(schedule, scheduled_for=occ.scheduled_for),
+                                             timeout=schedule.timeout_seconds)
+        except asyncio.CancelledError:
+            finish(occurrence_id, run_id, status="cancelled", side_effects="none",
+                   error="heartbeat cancelled (read-only; safe to repeat)", detail="cancelled")
+            raise
+        except TimeoutError:
+            await fail("timeout", f"heartbeat timed out after {schedule.timeout_seconds}s", "timeout")
+            return
+        except Exception as exc:  # noqa: BLE001
+            await fail("failed", f"heartbeat error: {type(exc).__name__}: {exc}"[:300])
+            return
+        now = datetime.now(UTC)
+        specs = job.outbox_specs(schedule, outcome, now, ZoneInfo(schedule.timezone))
+        exec_status = {"success": "succeeded"}.get(outcome.status, outcome.status)
+        written = finish(
+            occurrence_id, run_id, status=exec_status, side_effects="none", result=outcome.summary,
+            error=None if outcome.status == "success" else outcome.status,
+            outbox=specs or None, chunk_chars=cfg.scheduler.delivery_chunk_chars,
+            detail=outcome.status, heartbeat=outcome.commit)
+        if not written:
+            return  # recovered / cancelled meanwhile: never double-apply
+        audit_event(
+            "audit.schedule.heartbeat", audit_dir=self._audit_dir, actor="anna", fsync_on_write=self._fsync,
+            level="INFO" if outcome.status == "success" else "WARNING", schedule_id=schedule.id,
+            occurrence_id=occurrence_id, status=outcome.status,
+            checks=[{"account": c.account, "service": c.service, "status": c.status} for c in outcome.checks],
+            notifications=len(specs))
+        if outcome.status == "success":
+            await self._record_success(schedule, "", started_at=now)
+        else:
+            # Recorded for the dashboard, but a heartbeat is never auto-disabled.
+            await self._store.mark_failed(schedule.id, reason=outcome.status, when=now, kind="fail")
+
+    # ------------------------------------------------------------------
     # Jobs
     # ------------------------------------------------------------------
 
@@ -516,7 +578,7 @@ class Scheduler:
         verdict = await self._stop_turn(task, cancel, meta, cancelled_status="timeout")
         raise _TurnTimeout(*verdict)
 
-    async def _stop_turn(self, task: "asyncio.Future[str]", cancel: asyncio.Event, meta: dict[str, object],
+    async def _stop_turn(self, task: asyncio.Future[str], cancel: asyncio.Event, meta: dict[str, object],
                          *, cancelled_status: str) -> tuple[str, str, str]:
         cancel.set()
         grace = self._config.scheduler.cancel_grace_seconds
@@ -720,7 +782,7 @@ class Scheduler:
         use identical bookkeeping. ``suppressed`` only affects telemetry; the
         persisted success state is the same in both cases.
         """
-        completed_at = datetime.now(timezone.utc)
+        completed_at = datetime.now(UTC)
         duration = (completed_at - started_at).total_seconds()
         await self._store.mark_fired(
             schedule.id, status="complete", when=completed_at
@@ -761,7 +823,7 @@ class Scheduler:
         reason: str,
         kind: str,
     ) -> None:
-        when = datetime.now(timezone.utc)
+        when = datetime.now(UTC)
         new_count = await self._store.mark_failed(
             schedule.id, reason=reason, when=when, kind=kind
         )
@@ -783,6 +845,8 @@ class Scheduler:
             kind=kind,
             consecutive_failures=new_count,
         )
+        if getattr(schedule, "job_kind", "agent_prompt") == "google_heartbeat":
+            return  # transient provider trouble must never disable the heartbeat; alerts are rate-limited instead
         if new_count >= self._config.scheduler.failure_threshold:
             await self._store.mark_disabled(schedule.id, reason=reason)
             # AdminAlerter.warn is best-effort; do not block the loop on it.

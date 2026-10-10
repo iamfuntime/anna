@@ -637,6 +637,73 @@ class MemoryExtractionConfig(BaseModel):
         return v
 
 
+class QuietHoursConfig(BaseModel):
+    """Local-time window (in the schedule's timezone) when non-urgent notices are held."""
+
+    enabled: bool = True
+    start: str = "22:00"
+    end: str = "07:00"
+
+    @field_validator("start", "end")
+    @classmethod
+    def _hhmm(cls, v: str) -> str:
+        try:
+            hh, mm = v.split(":")
+            if not (0 <= int(hh) <= 23 and 0 <= int(mm) <= 59):
+                raise ValueError
+        except ValueError:
+            raise ValueError("quiet hours must be HH:MM (24h)") from None
+        return v
+
+
+class HeartbeatConfig(BaseModel):
+    """Built-in read-only Gmail + Calendar heartbeat (job_kind ``google_heartbeat``).
+
+    OPT-IN: off by default. No LLM is used for collection, empty checks, or
+    reminders. Collectors only read through the serialized ``GoogleClients``
+    lanes; nothing is ever written or sent through Google.
+    """
+
+    enabled: bool = False
+    accounts: list[str] = Field(default_factory=list)  # empty = every configured account
+    services: list[Literal["gmail", "calendar"]] = Field(default_factory=lambda: ["gmail", "calendar"])
+    check_timeout_seconds: float = 90.0
+    gmail_page_size: int = 50
+    gmail_max_pages: int = 3
+    gmail_bootstrap_hours: int = 24
+    calendar_lookahead_hours: int = 24
+    calendar_page_size: int = 50
+    calendar_max_pages: int = 2
+    reminder_minutes: int = 30
+    urgent_minutes: int = 15
+    max_listed_items: int = 8
+    quiet_hours: QuietHoursConfig = Field(default_factory=QuietHoursConfig)
+    transient_failures_before_alert: int = 3
+    reminder_interval_hours: float = 24.0
+    max_reminders: int = 3
+    max_pending_notifications: int = 20
+    notified_retention_days: int = 30
+
+    @field_validator(
+        "check_timeout_seconds", "gmail_page_size", "gmail_max_pages", "gmail_bootstrap_hours",
+        "calendar_lookahead_hours", "calendar_page_size", "calendar_max_pages", "reminder_minutes",
+        "urgent_minutes", "max_listed_items", "transient_failures_before_alert",
+        "reminder_interval_hours", "max_pending_notifications", "notified_retention_days",
+    )
+    @classmethod
+    def _positive(cls, v: float, info: Any) -> float:
+        if v <= 0:
+            raise ValueError(f"heartbeat.{info.field_name} must be positive")
+        return v
+
+    @field_validator("gmail_page_size", "calendar_page_size")
+    @classmethod
+    def _page(cls, v: int) -> int:
+        if v > 500:
+            raise ValueError("page size must be <= 500")
+        return v
+
+
 class MemoryConfig(BaseModel):
     extraction: MemoryExtractionConfig = Field(default_factory=MemoryExtractionConfig)
 
@@ -1518,6 +1585,7 @@ class AnnaConfig(BaseModel):
     checkpoint: CheckpointConfig = Field(default_factory=CheckpointConfig)
     admin: AdminConfig = Field(default_factory=AdminConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
+    heartbeat: HeartbeatConfig = Field(default_factory=HeartbeatConfig)
     reports: ReportsConfig = Field(default_factory=ReportsConfig)
     scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
     google: GoogleConfig = Field(default_factory=GoogleConfig)

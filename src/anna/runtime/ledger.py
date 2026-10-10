@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -37,7 +37,7 @@ from anna.runtime.fsutil import private_file
 
 ACTIVE_EXEC = ("claimed", "running")
 TERMINAL_EXEC = ("succeeded", "failed", "timeout", "cancelled", "unknown", "blocked",
-                 "skipped_overlap", "skipped_misfire")
+                 "skipped_overlap", "skipped_misfire", "partial", "auth_required")
 MAX_RECORDED_MISFIRES = 20
 
 
@@ -82,6 +82,21 @@ class OutboxItem:
     chunk_count: int
     text: str
     attempts: int
+
+
+@dataclass
+class HeartbeatCommit:
+    """Heartbeat state applied in the SAME transaction as the run result and outbox rows.
+
+    Cursors and notified-item keys therefore advance if and only if the
+    notifications that justify them were durably queued: a crash can repeat a
+    (read-only) check but never lose or duplicate an alert.
+    """
+
+    states: list[dict[str, Any]] = field(default_factory=list)
+    notified: list[tuple[str, str, str, str]] = field(default_factory=list)  # account, service, key, change
+    receipts: list[dict[str, Any]] = field(default_factory=list)
+    retention_days: int = 30
 
 
 @dataclass(frozen=True)
@@ -140,6 +155,10 @@ class RuntimeLedger:
         applied = {r[0] for r in self._conn.execute("SELECT version FROM ledger_migrations")}
         if 1 not in applied:
             self._migrate_v1()
+        if 2 not in applied:
+            if 1 in applied:
+                self.backup(self._path.with_name(f"{self._path.name}.bak-v1-{iso(now_utc()).replace(':', '')}"))
+            self._migrate_v2()
 
     def backup(self, dest: Path) -> Path:
         if dest.exists():
@@ -177,6 +196,100 @@ class RuntimeLedger:
                 UNIQUE(occurrence_id, chunk_index))""")
             self._conn.execute("CREATE INDEX outbox_due ON schedule_outbox(status, next_attempt_at)")
             self._conn.execute("INSERT INTO ledger_migrations(version, applied_at) VALUES(1, ?)", (iso(now_utc()),))
+
+    def _migrate_v2(self) -> None:
+        """Additive: heartbeat cursors/alert state, notified-item dedup, per-check receipts."""
+        with self._conn:
+            # One occurrence can carry several independent messages (alerts, digests):
+            # rebuild the outbox with a per-message index so chunk ordering and the
+            # uniqueness guard apply within a message, not across the occurrence.
+            self._conn.execute("ALTER TABLE schedule_outbox RENAME TO schedule_outbox_v1")
+            self._conn.execute("DROP INDEX IF EXISTS outbox_due")
+            self._conn.execute("""CREATE TABLE schedule_outbox (
+                id INTEGER PRIMARY KEY, occurrence_id INTEGER NOT NULL REFERENCES schedule_occurrences(id),
+                run_id INTEGER REFERENCES schedule_runs(id), schedule_id TEXT NOT NULL,
+                transport TEXT NOT NULL, channel TEXT NOT NULL, msg_index INTEGER NOT NULL DEFAULT 0,
+                chunk_index INTEGER NOT NULL, chunk_count INTEGER NOT NULL, text TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at TEXT NOT NULL, lease_expires_at TEXT, provider_outcome TEXT, last_error TEXT,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                UNIQUE(occurrence_id, msg_index, chunk_index))""")
+            self._conn.execute("""INSERT INTO schedule_outbox(id,occurrence_id,run_id,schedule_id,transport,channel,
+                chunk_index,chunk_count,text,status,attempts,next_attempt_at,lease_expires_at,provider_outcome,
+                last_error,created_at,updated_at) SELECT id,occurrence_id,run_id,schedule_id,transport,channel,
+                chunk_index,chunk_count,text,status,attempts,next_attempt_at,lease_expires_at,provider_outcome,
+                last_error,created_at,updated_at FROM schedule_outbox_v1""")
+            self._conn.execute("DROP TABLE schedule_outbox_v1")
+            self._conn.execute("CREATE INDEX outbox_due ON schedule_outbox(status, next_attempt_at)")
+            self._conn.execute("""CREATE TABLE IF NOT EXISTS heartbeat_state (
+                schedule_id TEXT NOT NULL, account TEXT NOT NULL, service TEXT NOT NULL,
+                cursor TEXT, last_checked_at TEXT, last_ok_at TEXT, status TEXT NOT NULL DEFAULT 'ok',
+                consecutive_failures INTEGER NOT NULL DEFAULT 0, alerts_sent INTEGER NOT NULL DEFAULT 0,
+                last_alert_at TEXT, resync_count INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL,
+                PRIMARY KEY(schedule_id, account, service))""")
+            self._conn.execute("""CREATE TABLE IF NOT EXISTS heartbeat_notified (
+                schedule_id TEXT NOT NULL, account TEXT NOT NULL, service TEXT NOT NULL,
+                item_key TEXT NOT NULL, change_id TEXT NOT NULL, notified_at TEXT NOT NULL,
+                PRIMARY KEY(schedule_id, account, service, item_key, change_id))""")
+            self._conn.execute("""CREATE TABLE IF NOT EXISTS heartbeat_receipts (
+                id INTEGER PRIMARY KEY, occurrence_id INTEGER NOT NULL REFERENCES schedule_occurrences(id),
+                run_id INTEGER NOT NULL REFERENCES schedule_runs(id), schedule_id TEXT NOT NULL,
+                account TEXT NOT NULL, service TEXT NOT NULL, status TEXT NOT NULL, checked_at TEXT NOT NULL,
+                receipt_hash TEXT NOT NULL, detail_json TEXT NOT NULL,
+                UNIQUE(run_id, account, service))""")
+            self._conn.execute("INSERT INTO ledger_migrations(version, applied_at) VALUES(2, ?)", (iso(now_utc()),))
+
+    # --- heartbeat reads
+
+    def heartbeat_state(self, schedule_id: str, account: str, service: str) -> dict[str, Any] | None:
+        row = self._conn.execute("SELECT * FROM heartbeat_state WHERE schedule_id=? AND account=? AND service=?",
+                                 (schedule_id, account, service)).fetchone()
+        return dict(row) if row else None
+
+    def heartbeat_notified(self, schedule_id: str, account: str, service: str,
+                           pairs: list[tuple[str, str]]) -> set[tuple[str, str]]:
+        found: set[tuple[str, str]] = set()
+        for key, change in pairs:
+            if self._conn.execute(
+                    "SELECT 1 FROM heartbeat_notified WHERE schedule_id=? AND account=? AND service=? "
+                    "AND item_key=? AND change_id=?", (schedule_id, account, service, key, change)).fetchone():
+                found.add((key, change))
+        return found
+
+    def pending_outbox_count(self, schedule_id: str) -> int:
+        return int(self._conn.execute(
+            "SELECT COUNT(*) FROM schedule_outbox WHERE schedule_id=? AND status IN ('pending','sending')",
+            (schedule_id,)).fetchone()[0])
+
+    def receipts(self, occurrence_id: int) -> list[sqlite3.Row]:
+        return self._conn.execute("SELECT * FROM heartbeat_receipts WHERE occurrence_id=? ORDER BY id",
+                                  (occurrence_id,)).fetchall()
+
+    def _apply_heartbeat(self, schedule_id: str, occurrence_id: int, run_id: int, commit: HeartbeatCommit) -> None:
+        now = iso(now_utc())
+        for st in commit.states:
+            self._conn.execute(
+                "INSERT INTO heartbeat_state(schedule_id,account,service,cursor,last_checked_at,last_ok_at,status,"
+                "consecutive_failures,alerts_sent,last_alert_at,resync_count,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(schedule_id,account,service) DO UPDATE SET cursor=excluded.cursor, "
+                "last_checked_at=excluded.last_checked_at, last_ok_at=excluded.last_ok_at, status=excluded.status, "
+                "consecutive_failures=excluded.consecutive_failures, alerts_sent=excluded.alerts_sent, "
+                "last_alert_at=excluded.last_alert_at, resync_count=excluded.resync_count, updated_at=excluded.updated_at",
+                (schedule_id, st["account"], st["service"], st.get("cursor"), st.get("last_checked_at"),
+                 st.get("last_ok_at"), st["status"], st.get("consecutive_failures", 0), st.get("alerts_sent", 0),
+                 st.get("last_alert_at"), st.get("resync_count", 0), now))
+        for account, service, key, change in commit.notified:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO heartbeat_notified(schedule_id,account,service,item_key,change_id,notified_at)"
+                " VALUES(?,?,?,?,?,?)", (schedule_id, account, service, key, change, now))
+        cutoff = iso(now_utc() - timedelta(days=commit.retention_days))
+        self._conn.execute("DELETE FROM heartbeat_notified WHERE schedule_id=? AND notified_at<?", (schedule_id, cutoff))
+        for r in commit.receipts:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO heartbeat_receipts(occurrence_id,run_id,schedule_id,account,service,status,"
+                "checked_at,receipt_hash,detail_json) VALUES(?,?,?,?,?,?,?,?,?)",
+                (occurrence_id, run_id, schedule_id, r["account"], r["service"], r["status"], r["checked_at"],
+                 r["receipt_hash"], json.dumps(r)))
 
     # ------------------------------------------------------------- occurrences
 
@@ -317,8 +430,9 @@ class RuntimeLedger:
 
     def finish_run(self, occurrence_id: int, run_id: int, *, status: str, side_effects: str,
                    result: dict[str, Any] | None = None, error: str | None = None,
-                   outbox: list[tuple[str, str, str]] | None = None, chunk_chars: int = 3500,
-                   delivery_status: str | None = None, detail: str | None = None) -> bool:
+                   outbox: list[tuple[Any, ...]] | None = None, chunk_chars: int = 3500,
+                   delivery_status: str | None = None, detail: str | None = None,
+                   heartbeat: HeartbeatCommit | None = None) -> bool:
         """Atomically close the run, set exec status and enqueue outbox rows.
 
         ``outbox`` is a list of ``(transport, channel, text)``.  Returns False if
@@ -338,15 +452,19 @@ class RuntimeLedger:
             delivery = delivery_status or "none"
             if outbox:
                 delivery = "pending"
-                for transport, channel, text in outbox:
+                for msg_index, spec in enumerate(outbox):
+                    transport, channel, text = spec[:3]
+                    not_before = spec[3] if len(spec) > 3 and spec[3] else now  # quiet hours defer delivery
                     parts = split_chunks(text, chunk_chars)
                     for i, part in enumerate(parts):
                         self._conn.execute(
                             "INSERT INTO schedule_outbox(occurrence_id,run_id,schedule_id,transport,channel,"
-                            "chunk_index,chunk_count,text,next_attempt_at,created_at,updated_at) "
-                            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                            (occurrence_id, run_id, row["schedule_id"], transport, channel, i, len(parts),
-                             part, now, now, now))
+                            "msg_index,chunk_index,chunk_count,text,next_attempt_at,created_at,updated_at) "
+                            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                            (occurrence_id, run_id, row["schedule_id"], transport, channel, msg_index, i, len(parts),
+                             part, not_before, now, now))
+            if heartbeat is not None:
+                self._apply_heartbeat(row["schedule_id"], occurrence_id, run_id, heartbeat)
             self._conn.execute(
                 "UPDATE schedule_occurrences SET exec_status=?, delivery_status=?, detail=?, lease_owner=NULL, "
                 "lease_expires_at=NULL, finished_at=?, updated_at=? WHERE id=?",
@@ -435,7 +553,7 @@ class RuntimeLedger:
         return self._conn.execute("SELECT * FROM schedule_runs WHERE occurrence_id=? ORDER BY id", (occurrence_id,)).fetchall()
 
     def outbox(self, occurrence_id: int) -> list[sqlite3.Row]:
-        return self._conn.execute("SELECT * FROM schedule_outbox WHERE occurrence_id=? ORDER BY chunk_index",
+        return self._conn.execute("SELECT * FROM schedule_outbox WHERE occurrence_id=? ORDER BY msg_index, chunk_index",
                                   (occurrence_id,)).fetchall()
 
     def set_exec_status(self, occurrence_id: int, status: str, detail: str) -> None:
@@ -454,8 +572,8 @@ class RuntimeLedger:
         with self._conn:
             rows = self._conn.execute(
                 "SELECT * FROM schedule_outbox o WHERE status='pending' AND next_attempt_at<=? AND (chunk_index=0 OR "
-                "EXISTS (SELECT 1 FROM schedule_outbox p WHERE p.occurrence_id=o.occurrence_id "
-                "AND p.chunk_index=o.chunk_index-1 AND p.status='sent')) ORDER BY occurrence_id, chunk_index LIMIT ?",
+                "EXISTS (SELECT 1 FROM schedule_outbox p WHERE p.occurrence_id=o.occurrence_id AND p.msg_index=o.msg_index "
+                "AND p.chunk_index=o.chunk_index-1 AND p.status='sent')) ORDER BY occurrence_id, msg_index, chunk_index LIMIT ?",
                 (ts, limit)).fetchall()
             for r in rows:
                 if r["id"] in exclude:

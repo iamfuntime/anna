@@ -361,6 +361,7 @@ async def _run(config: AnnaConfig) -> None:
             router=router,
             adapters=adapters,
             alerter=alerter,
+            google_clients=google_clients,
         )
         # Deleting a schedule must also cancel its queued/in-flight fire
         # tasks (2026-06-01 incident: leftover queued fires failed loudly

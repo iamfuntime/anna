@@ -28,10 +28,10 @@ import asyncio
 import contextlib
 import fcntl
 import os
-from datetime import datetime, timezone
+from collections.abc import AsyncIterator, Awaitable, Callable
+from datetime import UTC, datetime
 from pathlib import Path
-from collections.abc import AsyncIterator
-from typing import Any, Awaitable, Callable
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import yaml
@@ -41,7 +41,6 @@ from anna.config import AnnaConfig
 from anna.log import audit_event, get_logger
 from anna.runtime.schedule_types import Schedule, ScheduleDestination, ScheduleState
 from anna.runtime.supervisor import Supervisor
-
 
 _STORE_KEY = "schedules.yaml"
 
@@ -188,6 +187,15 @@ class ScheduleStore:
                 f"for AdminAlerter traffic. Pick a different chat for scheduled output."
             )
 
+    def _check_job_kind(self, schedule: Schedule) -> None:
+        if schedule.job_kind != "google_heartbeat":
+            return
+        if not self._config.heartbeat.enabled:
+            raise ScheduleValidationError(
+                "the Google heartbeat is opt-in: set heartbeat.enabled: true in anna.yaml and restart first")
+        if not self._config.google.enabled or not self._config.google.accounts:
+            raise ScheduleValidationError("the Google heartbeat needs google.enabled and at least one account")
+
     def _check_cron(self, expr: str) -> None:
         if not croniter.is_valid(expr):
             raise ScheduleValidationError(
@@ -202,6 +210,7 @@ class ScheduleStore:
     async def create(self, schedule: Schedule, *, actor_conv: str | None = None) -> Schedule:
         self._check_destination(schedule.destination)
         self._check_cron(schedule.cron)
+        self._check_job_kind(schedule)
         async with self._exclusive():
             if schedule.id in self._cache:
                 raise ScheduleValidationError(f"Schedule '{schedule.id}' already exists")
@@ -385,7 +394,7 @@ class ScheduleStore:
     def due_schedules(self, now: datetime) -> list[Schedule]:
         """Return enabled schedules whose next-fire time has passed."""
         if now.tzinfo is None:
-            now = now.replace(tzinfo=timezone.utc)
+            now = now.replace(tzinfo=UTC)
         due: list[Schedule] = []
         for schedule in self._cache.values():
             if not schedule.enabled:
@@ -402,7 +411,7 @@ class ScheduleStore:
 
             baseline = schedule.state.last_fired_at or schedule.created_at
             if baseline.tzinfo is None:
-                baseline = baseline.replace(tzinfo=timezone.utc)
+                baseline = baseline.replace(tzinfo=UTC)
             baseline_local = baseline.astimezone(tz)
 
             try:
@@ -417,7 +426,7 @@ class ScheduleStore:
                 )
                 continue
 
-            next_fire_utc = next_fire_local.astimezone(timezone.utc)
+            next_fire_utc = next_fire_local.astimezone(UTC)
             if next_fire_utc <= now:
                 due.append(schedule)
         return due

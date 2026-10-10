@@ -759,3 +759,28 @@ memory:
     concurrency: 1
     max_attempts: 3
     min_confidence: 0.8
+
+# ============================================================
+# Built-in read-only Gmail + Calendar heartbeat (opt-in, no LLM)
+# ============================================================
+# 1. Connect accounts (google.enabled + google.accounts) and verify them with
+#    `python -m anna.setup.google_auth verify <slug>`.
+# 2. Turn the job on:   heartbeat.enabled: true   (restart)
+# 3. Create the schedule (schedule_create tool or schedules.yaml) with
+#    job_kind: google_heartbeat and a cron like "*/15 * * * *"; the prompt is
+#    ignored. It only reads: no sends, drafts, labels or calendar writes.
+heartbeat:
+  enabled: false
+  accounts: []              # empty = every configured Google account
+  services: [gmail, calendar]
+  gmail_page_size: 50
+  gmail_max_pages: 3        # bounds first sync / resync and each incremental read
+  gmail_bootstrap_hours: 24
+  calendar_lookahead_hours: 24
+  reminder_minutes: 30      # "starting soon" notice window
+  urgent_minutes: 15        # reminders this close bypass quiet hours
+  quiet_hours: {enabled: true, start: "22:00", end: "07:00"}   # schedule timezone
+  transient_failures_before_alert: 3
+  reminder_interval_hours: 24
+  max_reminders: 3
+  max_pending_notifications: 20
