@@ -44,6 +44,7 @@ from anna.runtime.turn_watchdog import (
     hard_reminder,
     soft_reminder,
 )
+from anna.runtime.memory import MemoryStore
 from anna.runtime.visibility import NULL_VISIBILITY, VisibilityCallbacks
 from anna.transports.base import (
     ChannelAdapter,
@@ -453,6 +454,7 @@ class ConversationWorker:
         self._reply_address: ContextVar[tuple[str, str] | None] = ContextVar(
             f"anna_reply_address_{conversation_key}", default=None
         )
+        self._memory_store = MemoryStore(config.anna_home / "state" / "memory.sqlite3")
         self._on_idle_close = on_idle_close
         # Live transport adapters (same dict the router/alerter hold). Used by
         # the anna_slack_alerts MCP server to post through ANNA's own Slack
@@ -2961,6 +2963,26 @@ class ConversationWorker:
         # CADENCE.md without restarting ANNA. An empty / missing file
         # degrades gracefully to the unmodified event text.
         query_text = event.text
+        # Refresh retrieval for every turn, including an already-live worker.
+        # Owner-scoped DMs use their canonical owner key; non-DM conversations
+        # remain isolated in a private group scope.
+        owner_id = self.conversation_key.removeprefix("user:")
+        scope = "private" if self.conversation_key.startswith("user:") else f"group:{self.conversation_key}"
+        try:
+            facts = self._memory_store.search(
+                owner_id=owner_id,
+                visibility_scopes={scope},
+                query=event.text,
+                limit=6,
+            )
+        except Exception as exc:
+            self._log.warning("worker.memory.retrieve_failed", error=str(exc))
+            facts = []
+        if facts:
+            memory_block = "\n".join(
+                f"- {fact.subject}: {fact.content} (fact #{fact.id})" for fact in facts
+            )
+            query_text = f"<durable-memory>\n{memory_block}\n</durable-memory>\n\n{query_text}"
         if (
             self.transport in ("slack", "telegram")
             and self._visibility.cadence_reminder_loader is not None
