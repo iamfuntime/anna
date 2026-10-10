@@ -24,6 +24,9 @@ For first fires (no recorded ``last_fired_at``) the baseline is
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import fcntl
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -131,6 +134,32 @@ class ScheduleStore:
                 os.fsync(fp.fileno())
         os.replace(tmp, self._path)
 
+    @contextlib.asynccontextmanager
+    async def _exclusive(self):
+        """Per-process supervisor lock plus a cross-process file lock.
+
+        Every mutation is a read-modify-write under both: the file is re-read
+        after the lock is taken, so a dashboard edit and a daemon state write
+        can never silently overwrite each other (each only changes its own row
+        and fields on top of the freshest on-disk content).
+        """
+        async with await self._supervisor.acquire(_STORE_KEY):
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(str(self._path) + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                for _ in range(100):
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        await asyncio.sleep(0.05)
+                else:
+                    raise TimeoutError("schedules.yaml is locked by another process")
+                await self.load()
+                yield
+            finally:
+                os.close(fd)  # closing releases the flock
+
     # ------------------------------------------------------------------
     # Read helpers (no lock needed; cache is read-mostly)
     # ------------------------------------------------------------------
@@ -170,11 +199,11 @@ class ScheduleStore:
     # ------------------------------------------------------------------
 
     async def create(self, schedule: Schedule, *, actor_conv: str | None = None) -> Schedule:
-        if schedule.id in self._cache:
-            raise ScheduleValidationError(f"Schedule '{schedule.id}' already exists")
         self._check_destination(schedule.destination)
         self._check_cron(schedule.cron)
-        async with await self._supervisor.acquire(_STORE_KEY):
+        async with self._exclusive():
+            if schedule.id in self._cache:
+                raise ScheduleValidationError(f"Schedule '{schedule.id}' already exists")
             self._cache[schedule.id] = schedule
             await self.save()
         audit_event(
@@ -197,23 +226,22 @@ class ScheduleStore:
         actor_conv: str | None = None,
         **changes: Any,
     ) -> Schedule:
-        if schedule_id not in self._cache:
-            raise ScheduleValidationError(f"Schedule '{schedule_id}' does not exist")
         if "id" in changes:
             raise ScheduleValidationError("schedule.id is immutable; create a new schedule instead")
-        existing = self._cache[schedule_id]
-        merged = existing.model_dump()
-        # Only touch fields the caller actually passed.
         applied_fields: list[str] = []
-        for key, value in changes.items():
-            if key not in merged and key not in {"destination", "state"}:
-                raise ScheduleValidationError(f"Unknown field '{key}' for Schedule")
-            merged[key] = value
-            applied_fields.append(key)
-        new_schedule = Schedule.model_validate(merged)
-        self._check_destination(new_schedule.destination)
-        self._check_cron(new_schedule.cron)
-        async with await self._supervisor.acquire(_STORE_KEY):
+        async with self._exclusive():
+            if schedule_id not in self._cache:
+                raise ScheduleValidationError(f"Schedule '{schedule_id}' does not exist")
+            merged = self._cache[schedule_id].model_dump()
+            # Only touch fields the caller actually passed.
+            for key, value in changes.items():
+                if key not in merged and key not in {"destination", "state"}:
+                    raise ScheduleValidationError(f"Unknown field '{key}' for Schedule")
+                merged[key] = value
+                applied_fields.append(key)
+            new_schedule = Schedule.model_validate(merged)
+            self._check_destination(new_schedule.destination)
+            self._check_cron(new_schedule.cron)
             self._cache[schedule_id] = new_schedule
             await self.save()
         audit_event(
@@ -228,9 +256,9 @@ class ScheduleStore:
         return new_schedule
 
     async def delete(self, schedule_id: str, *, actor_conv: str | None = None) -> None:
-        if schedule_id not in self._cache:
-            raise ScheduleValidationError(f"Schedule '{schedule_id}' does not exist")
-        async with await self._supervisor.acquire(_STORE_KEY):
+        async with self._exclusive():
+            if schedule_id not in self._cache:
+                raise ScheduleValidationError(f"Schedule '{schedule_id}' does not exist")
             del self._cache[schedule_id]
             await self.save()
         # Cancel queued + in-flight fire tasks AFTER the cache removal so a
@@ -279,7 +307,7 @@ class ScheduleStore:
         completion or failure paths overwrite the full state when they
         land.
         """
-        async with await self._supervisor.acquire(_STORE_KEY):
+        async with self._exclusive():
             schedule = self._cache.get(schedule_id)
             if schedule is None:
                 return
@@ -297,7 +325,7 @@ class ScheduleStore:
         status: str,
         when: datetime,
     ) -> None:
-        async with await self._supervisor.acquire(_STORE_KEY):
+        async with self._exclusive():
             schedule = self._cache.get(schedule_id)
             if schedule is None:
                 return
@@ -317,7 +345,7 @@ class ScheduleStore:
         kind: str = "fail",
     ) -> int:
         """Increment consecutive_failures. Returns the new count."""
-        async with await self._supervisor.acquire(_STORE_KEY):
+        async with self._exclusive():
             schedule = self._cache.get(schedule_id)
             if schedule is None:
                 return 0
@@ -332,7 +360,7 @@ class ScheduleStore:
             return new_count
 
     async def mark_disabled(self, schedule_id: str, *, reason: str) -> None:
-        async with await self._supervisor.acquire(_STORE_KEY):
+        async with self._exclusive():
             schedule = self._cache.get(schedule_id)
             if schedule is None:
                 return

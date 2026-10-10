@@ -92,14 +92,14 @@ def validate_result(raw: str | dict[str, Any], *, source_text: str, max_candidat
             raise MalformedExtraction(f"unknown kind {item['kind']!r}")
         if item["source"] not in SOURCE_TYPES:
             raise MalformedExtraction(f"unknown source {item['source']!r}")
-        if any(_canonical(item[k]) != item[k].replace("\r", "") for k in ("subject", "content", "evidence")):
-            raise MalformedExtraction("candidate contains control or hidden formatting characters")
+        hidden = any(_canonical(item[k]) != item[k].replace("\r", "") for k in ("subject", "content", "evidence"))
         if len(item["subject"]) > 120 or len(item["content"]) > 500 or len(item["evidence"]) > 500:
             raise MalformedExtraction("candidate field exceeds length cap")
         out.append({
             "kind": item["kind"], "subject": item["subject"].strip(), "content": item["content"].strip(),
             "evidence": item["evidence"].strip(), "source_type": item["source"], "confidence": float(conf),
             "evidence_ok": normalize_text(_canonical(item["evidence"])) in source_norm,
+            "hidden_chars": hidden,
             "instruction_like": any(_INSTRUCTION_LIKE.search(_canonical(item[k]))
                                     for k in ("subject", "content", "evidence")),
         })

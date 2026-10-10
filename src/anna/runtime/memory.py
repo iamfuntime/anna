@@ -393,6 +393,8 @@ class MemoryStore:
     def _classify(self, job: ExtractionJob, cand: dict[str, Any], min_confidence: float) -> tuple[str, str | None, int | None]:
         if cand["source_type"] != "user_stated":
             return "rejected", f"source_type:{cand['source_type']}", None
+        if cand.get("hidden_chars"):
+            return "rejected", "hidden_characters", None
         if not cand["evidence_ok"]:
             return "rejected", "evidence_not_in_source", None
         if cand.get("instruction_like"):

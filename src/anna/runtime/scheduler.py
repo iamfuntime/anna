@@ -22,12 +22,18 @@ the full design.
 from __future__ import annotations
 
 import asyncio
+import os
+import shutil
+import uuid
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
+from zoneinfo import ZoneInfo
 
 from anna.config import AnnaConfig
 from anna.log import audit_event, get_logger
+from anna.runtime.ledger import OutboxItem, Recovery, RuntimeLedger, now_utc
+from anna.runtime.schedule_jobs import JobResult
 from anna.runtime.schedule_store import ScheduleStore
 from anna.runtime.schedule_types import Schedule
 from anna.runtime.worker import (
@@ -52,6 +58,40 @@ if TYPE_CHECKING:
 QUIET_SENTINEL = "[[ANNA_NO_OUTPUT]]"
 
 __all__ = ["QUIET_SENTINEL", "Scheduler"]
+
+
+class NoAdapterError(RuntimeError):
+    """The destination transport is not connected; nothing was sent."""
+
+    retry_safe = True
+
+
+class _TurnTimeout(Exception):
+    """The worker turn exceeded its timeout; carries the cancellation verdict."""
+
+    def __init__(self, status: str, side_effects: str, detail: str) -> None:
+        super().__init__(detail)
+        self.status, self.side_effects, self.detail = status, side_effects, detail
+
+
+def classify_send_error(exc: BaseException) -> bool:
+    """True only when the failure proves the message was NOT delivered (safe to resend)."""
+    if getattr(exc, "retry_safe", False) is True:
+        return True
+    if isinstance(exc, ConnectionError):
+        return True
+    status = getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
+    return status == 429
+
+
+def _backup_yaml_before_first_ledger(config: AnnaConfig) -> None:
+    """One-time copy of schedules.yaml the first time the ledger is created."""
+    yaml_path = config.scheduler.resolved_state_path
+    ledger_path = config.state_dir / "runtime.sqlite3"
+    if ledger_path.exists() or not yaml_path.exists():
+        return
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    shutil.copy2(yaml_path, yaml_path.with_name(f"{yaml_path.name}.bak-pre-ledger-{stamp}"))
 
 
 class Scheduler:

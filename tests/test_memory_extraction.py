@@ -508,3 +508,11 @@ async def test_group_messages_are_never_enqueued(tmp_path, sdk_fakes):
     ev = _event(event_id="g1"); object.__setattr__(ev, "is_dm", False)
     await w._handle(ev)
     assert w._memory_store.extraction_stats() == {}
+
+
+async def test_hidden_character_candidate_rejected_without_retry(store):
+    enqueue(store)
+    ex = FakeExtractor(payload(cand(content="Prefers espresso\u200b")))
+    await drain(store, ex)
+    assert len(ex.calls) == 1 and facts(store) == [] and store.extraction_stats() == {"done": 1}
+    assert store.list_candidates(owner_id=OWNER, visibility_scope=SCOPE)[0]["reason"] == "hidden_characters"

@@ -102,6 +102,10 @@ class ImageAttachment:
     data: bytes
 
 
+class TurnCancelled(RuntimeError):
+    """A scheduler-cancelled turn was dropped before it started."""
+
+
 @dataclass(frozen=True)
 class InboundEvent:
     """Normalized event from any transport.
@@ -182,6 +186,11 @@ class InboundEvent:
     turn_meta: dict[str, Any] | None = field(
         default=None, compare=False, hash=False, repr=False
     )
+    # Set by the scheduler to cancel this turn: a queued event is dropped
+    # without running; a running turn is interrupted.  The worker reports what
+    # happened in ``turn_meta["turn_state"]`` (dropped | running | finished) and
+    # ``turn_meta["cancel_requested"]``.
+    cancel: asyncio.Event | None = field(default=None, compare=False, hash=False, repr=False)
     # The destination that received this event.  ``conversation_key`` can be
     # canonicalized by the router for shared worker state, so it is not by
     # itself a safe reply address.

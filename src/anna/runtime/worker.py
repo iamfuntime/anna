@@ -47,6 +47,7 @@ from anna.tools.slack_alerts_server import (
 from anna.tools.vault_tools import VaultTools
 from anna.tools.web_server import WEB_TOOL_NAMES, build_web_server
 from anna.tools.web_tools import WebTools
+from anna.transports.base import TurnCancelled
 from anna.transports.base import (
     ChannelAdapter,
     ImageAttachment,
@@ -784,6 +785,14 @@ class ConversationWorker:
                         event.reply_conversation_key or event.conversation_key,
                     ))
                     try:
+                        if event.cancel is not None and event.cancel.is_set():
+                            # Cancelled while queued: never started, no side effects.
+                            if event.turn_meta is not None:
+                                event.turn_meta["turn_state"] = "dropped"
+                            fut = event.completion_future
+                            if fut is not None and not fut.done():
+                                fut.set_exception(TurnCancelled("turn cancelled before start"))
+                            continue
                         await self._handle(event)
                     finally:
                         self._reply_address.reset(reply_token)
@@ -2938,10 +2947,22 @@ class ConversationWorker:
         self._active_memory_source_id = str(raw_event_id) if raw_event_id is not None else None
         turn_queue = self._begin_turn()
         completed_normally = False
+        cancel_task: asyncio.Task[None] | None = None
+        if event.cancel is not None:
+            if event.turn_meta is not None:
+                event.turn_meta["turn_state"] = "running"
+            cancel_task = asyncio.create_task(
+                self._interrupt_on_cancel(event), name=f"worker.cancel.{self.conversation_key}"
+            )
         try:
             await self._dispatch_turn(event, turn_queue)
             completed_normally = True
         finally:
+            if cancel_task is not None:
+                cancel_task.cancel()
+                await asyncio.gather(cancel_task, return_exceptions=True)
+            if event.turn_meta is not None and event.cancel is not None:
+                event.turn_meta["turn_state"] = "finished"
             self._active_memory_source_id = None
             ledger = self._notification_turn
             # Cleared BEFORE anything below can send. ``_guarded_send`` consults
@@ -3004,6 +3025,22 @@ class ConversationWorker:
                     if self._coverage_advance_allowed:
                         self._last_processed_transcript_sequence = sequence
                         self._last_processed_transcript_event_id = event_id
+
+    async def _interrupt_on_cancel(self, event: InboundEvent) -> None:
+        """Propagate a scheduler cancel into the running SDK turn."""
+        assert event.cancel is not None
+        await event.cancel.wait()
+        if event.turn_meta is not None:
+            event.turn_meta["cancel_requested"] = True
+        client = self._client
+        if client is None:
+            return
+        try:
+            await client.interrupt()  # type: ignore[attr-defined]
+        except Exception as exc:
+            if event.turn_meta is not None:
+                event.turn_meta["interrupt_error"] = str(exc)[:200]
+            self._log.warning("worker.turn.interrupt_failed", error=str(exc))
 
     def _memory_owner_scope(self) -> tuple[str, str]:
         owner_id = self.conversation_key.removeprefix("user:")
