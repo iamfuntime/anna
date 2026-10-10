@@ -153,6 +153,7 @@ uv run --extra dev pytest -q
 ```
 
 Google isolation was strengthened after review of the initial executor design.
+Commit `6b7300d` contains this bounded per-account ownership follow-up.
 One single-worker owner lane is now allocated only after a configured account
 slug is validated, and that lane is shared by Gmail and Calendar for the same
 account. Discovery, OAuth refresh, request construction, cached resources,
