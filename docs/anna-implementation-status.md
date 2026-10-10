@@ -116,6 +116,14 @@ turn. The first cross-transport policy correction also uses the event transport
 for voice-only/drip eligibility. Explicit memory MCP tools, extraction jobs,
 legacy import, and UI remain unfinished.
 
+Commit `b07ea37` mounts `anna_memory` in every worker with explicit
+`memory_remember`, `memory_search`, `memory_correct`, and `memory_forget`
+tools. Successful remember responses are emitted only after the SQLite commit;
+the current inbound provider event ID is stored as provenance. Corrections and
+forget operations refuse facts outside the caller's owner/scope; restart and
+private-group isolation are covered by `tests/test_memory.py`. Commit
+`e6c01cf` attaches the per-event provenance binding.
+
 Focused continuation validation:
 
 ```text
@@ -136,6 +144,13 @@ uv run --extra dev pytest -q
 ```
 
 The warning is the existing Starlette `TestClient`/httpx deprecation warning.
+
+Full validation after the memory MCP additions:
+
+```text
+uv run --extra dev pytest -q
+1,397 passed, 1 skipped, 1 warning in 22.67s
+```
 
 Migration/rollback: `state/memory.sqlite3` is created automatically with a
 version-1 ledger and WAL mode. It is additive; rollback is to stop using the
@@ -215,5 +230,6 @@ additive and preserve pending records across downgrade/restart.
 - Receiver readiness/liveness and Google `.execute()` thread isolation are
   only partially implemented: receiver liveness is covered, safe Google call
   isolation remains.
-- Memory persistence/retrieval is started, but explicit tools, extraction,
-  source import, durable tasks/runs/outbox, heartbeat, and repair UX remain.
+- Memory persistence/retrieval and explicit fact tools are implemented, but
+  extraction jobs, source import, durable tasks/runs/outbox, heartbeat, and
+  repair UX remain.
