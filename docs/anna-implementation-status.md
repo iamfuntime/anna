@@ -305,7 +305,7 @@ concurrency, a per-day job cap, per-job retry with exponential backoff
   tokenized to a safe OR-query; and the cadence reminder overwrote the
   `<durable-memory>` block on Slack/Telegram — now preserved.
 
-Validation: `uv run --extra dev pytest -q` → 1,455 passed, 1 skipped (45 new in
+Commit `49a4fb6`. Validation: `uv run --extra dev pytest -q` → 1,455 passed, 1 skipped (45 new in
 `tests/test_memory_extraction.py`); `ruff` clean on new files, no new findings
 in touched files; `mypy` clean on the new/changed memory modules. Still
 deferred: operator UI/CLI to review/accept `conflict`/`held` candidates, any
