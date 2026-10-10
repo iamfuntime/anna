@@ -1,6 +1,6 @@
 # Anna reliability implementation status
 
-## Checkpoint: Phase 0 watchdog fix in progress
+## Checkpoint: Phase 0 routing and checkpoint safety milestone
 
 This worktree is on `iamfuntime/anna-reliability`, based on
 `e7a701594d7839ef66959e496d1b9a2905361b32`.
@@ -22,15 +22,12 @@ worktree.
 
 - Original full-suite baseline reported by the handoff: `uv run --extra dev
   pytest -q` on Python 3.13.15: 1,388 passed, 2 failed, 1 skipped.
-- The two known failures have a concrete watchdog/consolidation diagnosis;
-  current focused validation is pending as described below.
-- `orca account list --json` was retried with the correct
-  `result.rateLimits` filter, but returned `null`; this is unavailable usage
-  data, not a low-quota signal. Updating the worktree card was unavailable
-  because the local Orca runtime was not running; no restart was attempted.
-- The user-supplied copied plan remains the only intended untracked file.
+- The original watchdog regression is fixed and the pending focused rerun is
+  green (43 passed).
+- The user-supplied copied plan is intentionally untracked until this
+  documentation milestone commit, where it will be included.
 
-## Current Phase 0 change
+## Verified Phase 0 changes
 
 Changed files:
 
@@ -54,24 +51,58 @@ uv run --extra dev pytest -q tests/test_worker_periodic_flush.py \
 
 The two failures were `test_voice_only_never_drips` and
 `test_disabled_interval_never_drips`; both showed two messages caused by the
-watchdog's hard-threshold flush. A subsequent focused watchdog run after the
-worker change showed the periodic-flush tests passing but two direct watchdog
-flush tests failing because their fixture defaults to voice-only output. Those
-two tests have now been corrected to explicitly disable voice output; **they
-have not been rerun after that final fixture correction** because the user
-requested an immediate safe stopping point. Do not claim this checkpoint is
-green.
+watchdog's hard-threshold flush. The direct watchdog tests now explicitly
+select text/incremental delivery. The pending rerun is green:
+
+```text
+ANNA_HOME="$(mktemp -d)" uv run --extra dev pytest -q \
+  tests/test_worker_periodic_flush.py tests/test_turn_watchdog.py
+43 passed
+```
+
+The continuation added these tested safety fixes:
+
+- Per-event reply addresses are captured before owner aliasing. A shared
+  `user:<canonical>` worker routes final, periodic, and watchdog sends to the
+  transport and conversation key that supplied the queued event, rather than
+  retaining the first channel callback.
+- Checkpoint files use unique IDs and atomic replacement. Same-clock-tick
+  writes cannot overwrite one another, and readers cannot observe a partial
+  markdown file.
+- Failed/empty closeout summary attempts are audited but are not written as
+  fake summaries. Resume no longer treats checkpoint mtime or bounded excerpt
+  output as a coverage cursor; it replays the bounded transcript tail. This
+  can repeat context, but it cannot silently hide transcript events. Exact
+  event-ID coverage remains follow-up work.
+
+Targeted validation after these changes:
+
+```text
+uv run --extra dev pytest -q \
+  tests/test_checkpoint.py tests/test_transcript_resume.py \
+  tests/test_worker_periodic_checkpoint.py tests/test_worker_resume_context.py \
+  tests/test_worker_closeout.py tests/test_router_identity_alias.py \
+  tests/test_transport_outbound_alias.py tests/test_worker_periodic_flush.py \
+  tests/test_turn_watchdog.py
+114 passed
+```
+
+`ruff check` was run on the touched files. It reports pre-existing strict-lint
+findings in these long-lived modules (including old import/UTC annotations);
+the new route callback closure and unused local finding were corrected. No
+full suite has been rerun yet.
 
 ## Completed milestones
 
-No phase exit is complete. The watchdog diagnosis/fix is the only in-progress
-Phase 0 slice.
+No phase exit is complete. Watchdog behavior, event-addressed replies, and
+basic checkpoint write/replay safety are complete slices; receiver liveness,
+safe Google isolation, exact checkpoint event coverage, and later phases
+remain.
 
 ## Deferred milestones
 
-1. **Phase 0:** add and pass regressions for event-bound reply routing,
-   checkpoint coverage/atomicity, receiver liveness, synchronous Google-call
-   isolation, and periodic-flush behavior.
+1. **Phase 0:** finish exact event coverage/replay, receiver liveness, and
+   synchronous Google-call isolation.
 2. **Phase 1:** SQLite-backed owner-scoped memory, FTS retrieval per turn,
    provenance, explicit remember/correct/forget, and durable extraction jobs.
 3. **Phase 2:** durable task/run/outbox records and a mocked, deterministic,
@@ -90,17 +121,16 @@ git status --short --branch
 ANNA_HOME="$(mktemp -d)" uv run --extra dev pytest -q tests/test_worker_periodic_flush.py
 ```
 
-First run the currently pending focused validation:
+The current isolated regression command is:
 
 ```bash
 ANNA_HOME="$(mktemp -d)" uv run --extra dev pytest -q \
   tests/test_worker_periodic_flush.py tests/test_turn_watchdog.py
 ```
 
-If green, run the earlier Phase 0 set, then inspect router/checkpoint contracts
-and add focused tests before each implementation increment. Run relevant
-lint/type checks from `pyproject.toml`, and run the full suite only after
-targeted tests pass.
+Next add receiver startup/liveness tests and safe per-account Google execution
+isolation. Run relevant lint/type checks, then the full suite only after the
+remaining Phase 0 targeted tests pass.
 
 ## Copyable continuation brief
 
@@ -137,8 +167,9 @@ additive and preserve pending records across downgrade/restart.
 
 ## Unresolved blockers
 
-- Pending focused test rerun after the final watchdog-test fixture correction.
-- The local Orca runtime was unavailable for worktree-status updates; this is
-  non-blocking for code work.
-- The local Orca runtime was unavailable for worktree-status updates; this is
-  non-blocking for code work once resources permit.
+- Exact checkpoint coverage is deliberately conservative for now: legacy and
+  bounded checkpoints do not suppress transcript replay.
+- Receiver readiness/liveness and Google `.execute()` thread isolation are
+  not implemented.
+- Memory, durable tasks/runs/outbox, heartbeat, and account repair UX have
+  not started.

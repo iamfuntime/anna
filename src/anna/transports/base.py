@@ -182,6 +182,11 @@ class InboundEvent:
     turn_meta: dict[str, Any] | None = field(
         default=None, compare=False, hash=False, repr=False
     )
+    # The destination that received this event.  ``conversation_key`` can be
+    # canonicalized by the router for shared worker state, so it is not by
+    # itself a safe reply address.
+    reply_transport: str | None = field(default=None, compare=False, hash=False)
+    reply_conversation_key: str | None = field(default=None, compare=False, hash=False)
 
 
 @dataclass(frozen=True)
@@ -192,6 +197,9 @@ class OutboundMessage:
     structured: dict[str, Any] | None = None
     files: list[str] | None = None
     reply_to: str | None = None
+    # Set by the worker for replies to a transport event.  Kept optional so
+    # existing direct adapter callers retain their established behavior.
+    transport: str | None = None
 
 
 @dataclass

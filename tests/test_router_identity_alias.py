@@ -25,7 +25,7 @@ from anna.runtime.router import (
     _identifier_from_event,
 )
 from anna.runtime.supervisor import Supervisor
-from anna.transports.base import InboundEvent
+from anna.transports.base import InboundEvent, OutboundMessage
 
 
 # ---------------------------------------------------------------------------
@@ -46,6 +46,14 @@ def _make_router(tmp_path, identities: list[IdentityAliasEntry] | None = None) -
     cfg.core_dir.mkdir(parents=True, exist_ok=True)
     supervisor = Supervisor(config=cfg)
     return ConversationRouter(config=cfg, supervisor=supervisor, adapters={})
+
+
+class _RecordingAdapter:
+    def __init__(self) -> None:
+        self.sent: list[OutboundMessage] = []
+
+    async def send(self, message: OutboundMessage) -> None:
+        self.sent.append(message)
 
 
 def _slack_dm_event(user_id: str) -> InboundEvent:
@@ -94,6 +102,62 @@ def _cli_local_event(username: str) -> InboundEvent:
         is_dm=True,
         is_thread=False,
     )
+
+
+async def test_shared_owner_reply_callback_uses_each_event_address(tmp_path) -> None:
+    """A canonical owner worker must not retain its first channel's sender."""
+    slack = _RecordingAdapter()
+    telegram = _RecordingAdapter()
+    router = _make_router(
+        tmp_path,
+        identities=[
+            IdentityAliasEntry(
+                canonical="seth",
+                slack_user_id="USLACK",
+                telegram_chat_id="12345",
+            )
+        ],
+    )
+    router._adapters = {"slack": slack, "telegram": telegram}  # type: ignore[assignment]
+
+    slack_event = _slack_dm_event("USLACK")
+    telegram_event = _telegram_dm_event("12345")
+    # Exercise the same normalization path dispatch uses, without starting an
+    # SDK worker.  The reply destination is captured before canonicalization.
+    import dataclasses
+
+    slack_event = dataclasses.replace(
+        slack_event,
+        reply_transport=slack_event.transport,
+        reply_conversation_key=slack_event.conversation_key,
+        conversation_key=router._normalize_conv_key(slack_event),
+    )
+    telegram_event = dataclasses.replace(
+        telegram_event,
+        reply_transport=telegram_event.transport,
+        reply_conversation_key=telegram_event.conversation_key,
+        conversation_key=router._normalize_conv_key(telegram_event),
+    )
+    assert slack_event.conversation_key == telegram_event.conversation_key == "user:seth"
+
+    send = router._send_factory()
+    await send(
+        OutboundMessage(
+            conversation_key=slack_event.reply_conversation_key or "",
+            text="slack reply",
+            transport=slack_event.reply_transport,
+        )
+    )
+    await send(
+        OutboundMessage(
+            conversation_key=telegram_event.reply_conversation_key or "",
+            text="telegram reply",
+            transport=telegram_event.reply_transport,
+        )
+    )
+
+    assert [message.conversation_key for message in slack.sent] == ["slack:dm:USLACK"]
+    assert [message.conversation_key for message in telegram.sent] == ["telegram:dm:12345"]
 
 
 def _cli_oneshot_event(uuid_str: str, username: str) -> InboundEvent:

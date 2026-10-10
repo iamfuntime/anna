@@ -250,8 +250,9 @@ def test_stale_checkpoint_older_than_lines_yields_tail(tmp_path: Path) -> None:
     assert "newer than stale checkpoint" in prompt
 
 
-def test_dedup_no_tail_when_checkpoint_newer_than_lines(tmp_path: Path) -> None:
-    # Subtask 9: every transcript line is OLDER than the latest checkpoint.
+def test_legacy_checkpoint_never_claims_transcript_coverage(tmp_path: Path) -> None:
+    # Filesystem mtime is not an event-coverage cursor. A legacy checkpoint
+    # cannot prove it captured these transcript lines, so replay them.
     worker = _make_worker(tmp_path)
     vault_root = worker._config.vault.resolved_path
 
@@ -273,8 +274,8 @@ def test_dedup_no_tail_when_checkpoint_newer_than_lines(tmp_path: Path) -> None:
         format_rule="(no rule)",
     )
     assert "# Recent checkpoints (resume context)" in prompt
-    assert TAIL_HEADING not in prompt
-    assert "already checkpointed" not in prompt
+    assert TAIL_HEADING in prompt
+    assert "already checkpointed" in prompt
 
 
 def test_budget_respects_turn_and_token_caps(tmp_path: Path) -> None:

@@ -31,9 +31,9 @@ def test_filename_carries_seconds(tmp_path: Path) -> None:
         conversation_key=CONV_KEY,
         summary="hello",
     )
-    # Stem is YYYY-MM-DD-HHMMSS (second granularity): date plus a 6-digit
-    # zero-padded time component.
-    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}-\d{6}", path.stem), path.stem
+    # Human-readable seconds plus an opaque unique suffix.  The suffix avoids
+    # same-tick collisions without depending on wall-clock resolution.
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}-\d{6}-[0-9a-f]{32}", path.stem), path.stem
     # And it is glob-discoverable as a markdown file.
     assert path.suffix == ".md"
     assert path in list((tmp_path / "Conversations" / _safe(CONV_KEY)).glob("*.md"))
@@ -79,8 +79,8 @@ def test_two_writes_over_a_second_apart_are_distinct(
     )
 
     assert first != second
-    assert first.name == "2026-06-03-123015.md"
-    assert second.name == "2026-06-03-123017.md"
+    assert first.name.startswith("2026-06-03-123015-")
+    assert second.name.startswith("2026-06-03-123017-")
 
 
 def test_same_minute_writes_do_not_collide(tmp_path: Path, monkeypatch) -> None:
@@ -124,6 +124,24 @@ def test_same_minute_writes_do_not_collide(tmp_path: Path, monkeypatch) -> None:
     conv_dir = tmp_path / "Conversations" / _safe(CONV_KEY)
     files = list(conv_dir.glob("*.md"))
     assert len(files) == 2
+
+
+def test_same_second_writes_do_not_collide(tmp_path: Path, monkeypatch) -> None:
+    """Concurrent-style writes in one clock tick retain both summaries."""
+    import anna.vault.checkpoint as cp
+    from datetime import datetime, timezone
+
+    class _FakeDateTime:
+        @staticmethod
+        def now(tz=None):
+            return datetime(2026, 6, 3, 9, 5, 1, tzinfo=timezone.utc)
+
+    monkeypatch.setattr(cp, "datetime", _FakeDateTime)
+    first = write_checkpoint(vault_root=tmp_path, transport="telegram", conversation_key=CONV_KEY, summary="one")
+    second = write_checkpoint(vault_root=tmp_path, transport="telegram", conversation_key=CONV_KEY, summary="two")
+    assert first != second
+    assert first.read_text(encoding="utf-8").endswith("one\n")
+    assert second.read_text(encoding="utf-8").endswith("two\n")
 
 
 # ---------------------------------------------------------------------------
@@ -170,10 +188,10 @@ def test_list_recent_orders_newest_first(tmp_path: Path, monkeypatch) -> None:
         limit=3,
     )
     names = [p.name for p in recent]
-    assert names == [
-        "2026-06-03-123100.md",  # newest first
-        "2026-06-03-123059.md",
-        "2026-06-03-123005.md",
+    assert [name[:17] for name in names] == [
+        "2026-06-03-123100",  # newest first
+        "2026-06-03-123059",
+        "2026-06-03-123005",
     ]
 
 

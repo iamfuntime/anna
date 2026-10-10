@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import dataclasses
 import re
 import time
 import uuid
@@ -51,11 +52,7 @@ from anna.transports.base import (
     SignalHandle,
 )
 from anna.vault.checkpoint import list_recent_checkpoints, write_checkpoint
-from anna.vault.transcript_resume import (
-    latest_checkpoint_mtime,
-    render_tail_block,
-    transcript_tail_since,
-)
+from anna.vault.transcript_resume import render_tail_block, transcript_tail_since
 
 if TYPE_CHECKING:
     from anna.runtime.alerter import AdminAlerter
@@ -738,7 +735,31 @@ class ConversationWorker:
             while not self._stopping:
                 event = await self._queue.get()
                 try:
-                    await self._handle(event)
+                    # A canonical worker may receive events from several
+                    # transports.  Scope its normal send callback to the
+                    # event being handled so every final/drip/watchdog reply
+                    # returns to that event's original destination.
+                    inherited_send = self._send
+
+                    async def _send_to_event(
+                        message: OutboundMessage,
+                        send_callback: SendCallback = inherited_send,
+                        reply_key: str = event.reply_conversation_key or event.conversation_key,
+                        reply_transport: str = event.reply_transport or event.transport,
+                    ) -> None:
+                        await send_callback(
+                            dataclasses.replace(
+                                message,
+                                conversation_key=reply_key,
+                                transport=reply_transport,
+                            )
+                        )
+
+                    self._send = _send_to_event
+                    try:
+                        await self._handle(event)
+                    finally:
+                        self._send = inherited_send
                 finally:
                     self.last_event_processed_at = datetime.now(timezone.utc)
                     self.last_active = self.last_event_processed_at
@@ -1727,11 +1748,12 @@ class ConversationWorker:
         if not ckpt_cfg.resume_from_transcript or self._ephemeral:
             return ""
         try:
-            since_mtime = latest_checkpoint_mtime(vault_root, self.conversation_key)
             tail = transcript_tail_since(
                 transcripts_dir=self._config.transcripts_dir,
                 conv_key=self.conversation_key,
-                since_mtime=since_mtime,
+                # A bounded checkpoint is an excerpt, not proof that all
+                # older transcript events are covered.
+                since_mtime=None,
                 max_turns=ckpt_cfg.tail_max_turns,
                 max_tokens=ckpt_cfg.tail_max_tokens,
             )
@@ -1780,7 +1802,18 @@ class ConversationWorker:
         # regardless of whether a periodic checkpoint just landed. The
         # dirty-flag gate lives only in ``_maybe_periodic_checkpoint``.
         summary = await self._ask_checkpoint_summary()
-        await self._write_checkpoint_now(summary, kind="closeout")
+        if summary is None:
+            self._log.warning("worker.closeout.checkpoint_summary_unavailable")
+            audit_event(
+                "audit.checkpoint.summary_unavailable",
+                audit_dir=self._config.audit_dir,
+                actor="anna",
+                conv_key=self.conversation_key,
+                fsync_on_write=self._config.logging.audit.fsync_on_write,
+                level="WARNING",
+            )
+        else:
+            await self._write_checkpoint_now(summary, kind="closeout")
 
         # ----- 2. Per-core-file eviction ---------------------------------
         # eviction.py drains ``receive_response()`` on the shared client
@@ -1937,12 +1970,12 @@ class ConversationWorker:
             return
 
         try:
-            vault_root = self._config.vault.resolved_path
-            since_mtime = latest_checkpoint_mtime(vault_root, self.conversation_key)
             tail = transcript_tail_since(
                 transcripts_dir=self._config.transcripts_dir,
                 conv_key=self.conversation_key,
-                since_mtime=since_mtime,
+                # Legacy checkpoints and bounded excerpts have no exact
+                # event-coverage ledger.  Replay rather than hide text.
+                since_mtime=None,
                 max_turns=ckpt_cfg.tail_max_turns,
                 max_tokens=ckpt_cfg.tail_max_tokens,
             )
@@ -1986,14 +2019,14 @@ class ConversationWorker:
                 error=str(exc),
             )
 
-    async def _ask_checkpoint_summary(self) -> str:
+    async def _ask_checkpoint_summary(self) -> str | None:
         """Round-trip the SDK for a closing summary. Best-effort.
 
-        If the SDK is unavailable or errors, falls back to a minimal
-        placeholder so the checkpoint file still lands. Never raises.
+        If the SDK is unavailable or errors, returns no summary.  A failure
+        placeholder must not be persisted as if it covered the conversation.
         """
         if self._client is None:
-            return "(no SDK client available at closeout; placeholder checkpoint)"
+            return None
 
         try:
             from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
@@ -2012,7 +2045,7 @@ class ConversationWorker:
                 await self._client.query(prompt)  # type: ignore[attr-defined]
             except Exception as exc:
                 self._log.warning("worker.closeout.query_failed", error=str(exc))
-                return f"(closeout query failed: {exc})"
+                return None
 
             try:
                 async for msg in self._turn_messages(turn_queue):
@@ -2024,12 +2057,12 @@ class ConversationWorker:
                         break
             except Exception as exc:
                 self._log.warning("worker.closeout.receive_failed", error=str(exc))
-                return f"(closeout receive failed: {exc})"
+                return None
         finally:
             await self._end_turn(turn_queue)
 
         text = "\n".join(c for c in chunks if c).strip()
-        return text or "(empty closeout summary)"
+        return text or None
 
     async def _close_client(self) -> None:
         # The stream consumer reads the client's message stream; stop it

@@ -7,6 +7,9 @@ reads the two most recent checkpoints on resume.
 
 from __future__ import annotations
 
+import os
+import tempfile
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -44,7 +47,9 @@ def write_checkpoint(
 
     now = datetime.now(timezone.utc)
     stamp = now.strftime("%Y-%m-%d-%H%M%S")
-    path = base_dir / f"{stamp}.md"
+    # Time is presentation metadata, not uniqueness.  A periodic checkpoint
+    # and closeout can land in one tick, so give every completed write an ID.
+    path = base_dir / f"{stamp}-{uuid.uuid4().hex}.md"
 
     frontmatter = (
         f"---\n"
@@ -61,7 +66,21 @@ def write_checkpoint(
     if operator_short_name:
         body += f"\nAddressed as: {operator_short_name}\n"
 
-    path.write_text(frontmatter + body, encoding="utf-8")
+    # A resume reader must see either the old complete set or this complete
+    # checkpoint, never a torn markdown file after interruption.
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=base_dir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fp:
+            fp.write(frontmatter + body)
+            fp.flush()
+            os.fsync(fp.fileno())
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
+        raise
     return path
 
 
