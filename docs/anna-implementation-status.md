@@ -147,6 +147,7 @@ The warning is the existing Starlette `TestClient`/httpx deprecation warning.
 
 ## Exact transcript/checkpoint coverage follow-up
 
+Commit `8e458f1` implements this coverage contract.
 The former mtime-based resume heuristic has been replaced with durable
 per-conversation transcript records. Each newly appended inbound or outbound
 JSONL event has an opaque `event_id` and a monotonically allocated `sequence`;
