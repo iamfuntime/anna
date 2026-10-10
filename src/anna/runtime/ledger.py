@@ -412,7 +412,7 @@ class RuntimeLedger:
 
     def unannounced_undelivered(self, schedule_id: str, limit: int = 3) -> list[sqlite3.Row]:
         return self._conn.execute(
-            "SELECT id, status, text, created_at FROM schedule_outbox WHERE schedule_id=? AND announced=0 "
+            "SELECT id, status, text, transport, channel, created_at FROM schedule_outbox WHERE schedule_id=? AND announced=0 "
             "AND status IN ('uncertain','failed') ORDER BY id LIMIT ?", (schedule_id, limit)).fetchall()
 
     def receipts(self, occurrence_id: int) -> list[sqlite3.Row]:

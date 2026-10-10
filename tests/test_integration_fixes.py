@@ -633,3 +633,19 @@ async def test_l2_deliver_due_claims_exactly_one_row_per_send(tmp_path):
         env.prov.add_mail("personal", f"m{i}", subject=f"S{i}")
     await env.tick()
     assert limits and set(limits) == {1}
+
+
+async def test_reannouncement_never_copies_content_to_a_different_destination(tmp_path):
+    from anna.runtime.schedule_types import ScheduleDestination
+    env = await Env(tmp_path, accounts=("personal",)).start()
+    env.cfg.heartbeat.allowed_destinations = ["slack:CDEST", "slack:COTHER"]
+    await env.tick()
+    env.prov.add_mail("personal", "m1", subject="Confidential merger terms")
+    env.adapter.send_should_raise = RuntimeError("socket closed mid-write")
+    await env.tick()
+    env.adapter.send_should_raise = None
+    env.store.get("hb").destination = ScheduleDestination(transport="slack", channel="COTHER")
+    await env.tick()
+    sent = [m for m in env.adapter.sent if m.conversation_key.endswith("COTHER")]
+    assert sent and all("Confidential" not in m.text for m in sent)
+    assert any("previous destination" in m.text for m in sent)

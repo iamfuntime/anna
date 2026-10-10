@@ -608,6 +608,13 @@ class HeartbeatJob:
                 commit.announced_outbox_ids.append(row["id"])  # never re-announce a re-announcement
                 continue
             commit.announced_outbox_ids.append(row["id"])
+            dest = schedule.destination
+            if (row["transport"], row["channel"]) != (dest.transport, dest.channel):
+                # The destination changed since that message was queued: never copy its content to a
+                # different channel (disclosure) or re-use text escaped for another transport.
+                notices.append(Notice(f"{REANNOUNCE_PREFIX} ({row['status']} delivery to a previous destination). "
+                                      "Its content is not repeated here."))
+                continue
             notices.append(Notice(f"{REANNOUNCE_PREFIX} ({row['status']} delivery). Repeating it:\n{row['text'][:600]}",
                                   preescaped=True))
         status = self._job_status(checks, backpressure)
