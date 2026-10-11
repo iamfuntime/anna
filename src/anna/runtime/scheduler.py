@@ -604,7 +604,7 @@ class Scheduler:
         if rec.action in ("unknown", "failed"):
             await self._handle_failure(
                 self._store.get(rec.schedule_id) or _stub_schedule(rec.schedule_id),
-                reason=rec.detail, kind="unknown" if rec.action == "unknown" else "fail")
+                reason=rec.detail, kind="interrupted" if rec.action == "unknown" else "fail")
 
     def _discard_task(self, schedule_id: str, task: asyncio.Task[None]) -> None:
         """Done-callback: drop a finished fire task from both indexes."""
@@ -846,7 +846,7 @@ class Scheduler:
                     # SHUTDOWN of side-effecting work: say plainly that the outcome is unknown.
                     self._audit_shutdown(schedule, occurrence_id, status)
                     await self._store.mark_failed(schedule.id, reason=f"shutdown: {status}",
-                                                  when=datetime.now(UTC), kind="fail")
+                                                  when=datetime.now(UTC), kind="interrupted")
                 raise
             except _TurnTimeout as exc:
                 self._ledger.finish_run(occurrence_id, run_id, status=exc.status, side_effects=exc.side_effects,
@@ -1368,6 +1368,8 @@ class Scheduler:
             kind=kind,
             consecutive_failures=new_count,
         )
+        if kind == "interrupted":
+            return  # restart/crash is not a job failure: never counts toward auto-disable
         if getattr(schedule, "job_kind", "agent_prompt") == "google_heartbeat":
             return  # transient provider trouble must never disable the heartbeat; alerts are rate-limited instead
         if new_count >= self._config.scheduler.failure_threshold:

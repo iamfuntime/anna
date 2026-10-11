@@ -175,7 +175,8 @@ async def test_expired_running_side_effecting_is_unknown_and_never_rerun(tmp_pat
     assert got.exec_status == "unknown" and "not re-run" in got.detail
     assert router.events == [] and adapter.sent == []
     assert sched._ledger.runs(occ.id)[0]["status"] == "abandoned"
-    assert store.get("s1").state.consecutive_failures == 1  # visible to the operator
+    assert store.get("s1").state.consecutive_failures == 0  # infrastructure interruption: not a job failure
+    assert store.get("s1").enabled
 
 
 async def test_expired_running_read_only_retries_then_gives_up(tmp_path):

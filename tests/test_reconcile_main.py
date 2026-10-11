@@ -190,3 +190,50 @@ async def test_legitimate_pending_occurrence_still_recovered_despite_newer_state
     await sched._poll_once(); await settle(sched)
     assert len(router.events) == 1 and len(adapter.sent) == 1  # recovered once, no duplicate effects
     assert [o.exec_status for o in ledger.recent("s1", 100)] == ["succeeded"]
+
+
+# ---------------------------------------------------------------------------
+# Restart-interrupted jobs are infrastructure, not job failures
+# ---------------------------------------------------------------------------
+
+import asyncio  # noqa: E402
+from anna.runtime.ledger import iso  # noqa: E402
+from tests.test_scheduler_ledger import Router  # noqa: E402
+
+
+async def _interrupt_once(sched, store, minutes_ago: int) -> None:
+    with sched._ledger._conn:
+        sched._ledger._insert_occurrence(
+            schedule_id="s1", scheduled_for=now_utc() - timedelta(minutes=minutes_ago), trigger="cron",
+            job_kind="agent_prompt", run_safety="side_effecting", status="pending", detail=None)
+    [occ] = sched._ledger.pending()
+    sched._ledger.claim(occ.id, owner="dead", lease_seconds=-1)
+    sched._ledger.start_run(occ.id, owner="dead")
+    sched._ledger._conn.execute("UPDATE schedule_occurrences SET lease_expires_at=? WHERE id=?",
+                                (iso(now_utc() - timedelta(seconds=1)), occ.id))
+    sched._ledger._conn.commit()
+    await sched._poll_once(); await settle(sched)
+
+
+async def test_repeated_restart_interruptions_never_auto_disable(tmp_path):
+    cfg, store, router, adapter, sched = await build(tmp_path)
+    cfg.scheduler.failure_threshold = 3
+    for i in range(5):
+        await _interrupt_once(sched, store, i + 10)
+    got = store.get("s1")
+    assert len([o for o in sched._ledger.recent("s1", 100) if o.exec_status == "unknown"]) == 5
+    assert got.enabled and got.state.consecutive_failures == 0
+
+
+async def test_real_failures_still_auto_disable_and_interruptions_do_not_reset_them(tmp_path):
+    cfg, store, router, adapter, sched = await build(tmp_path, router=Router("reply"))
+    cfg.scheduler.failure_threshold = 3
+    await store.mark_failed("s1", reason="boom", when=now_utc(), kind="fail")
+    await store.mark_failed("s1", reason="restart", when=now_utc(), kind="interrupted")
+    got = store.get("s1")
+    assert got.state.consecutive_failures == 1 and got.state.last_status == "fail"
+    await sched._handle_failure(got, reason="restart", kind="interrupted")
+    assert store.get("s1").state.consecutive_failures == 1 and store.get("s1").enabled
+    await sched._handle_failure(got, reason="boom2", kind="fail")
+    await sched._handle_failure(got, reason="boom3", kind="fail")
+    assert not store.get("s1").enabled  # genuine failures still trip the breaker

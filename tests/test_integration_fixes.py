@@ -265,7 +265,9 @@ async def test_m5_shutdown_reports_side_effecting_work_as_unknown_not_silent(tmp
     audits = [json.loads(line) for p in cfg.audit_dir.glob("*.jsonl") for line in p.read_text().splitlines()]
     assert any(a.get("event") == "audit.schedule.shutdown_interrupted" and a.get("kind") == "unknown" for a in audits)
     await store.load()
-    assert store.get("s1").state.consecutive_failures == 1                                          # visible failure record
+    # a restart interruption is infrastructure, not a job failure: it is audited but never counts toward auto-disable
+    assert store.get("s1").state.consecutive_failures == 0
+    assert store.get("s1").state.last_fired_at is not None
 
 
 async def test_m5_heartbeat_shutdown_is_requeued_not_dropped(tmp_path):

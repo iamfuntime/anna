@@ -366,11 +366,27 @@ class ScheduleStore:
         when: datetime,
         kind: str = "fail",
     ) -> int:
-        """Increment consecutive_failures. Returns the new count."""
+        """Increment consecutive_failures. Returns the new count.
+
+        ``kind="interrupted"`` is an INFRASTRUCTURE interruption (restart,
+        shutdown, crash) rather than a verdict on the job: it advances
+        ``last_fired_at`` (so a rollback does not replay the tick) but leaves
+        ``last_status`` and ``consecutive_failures`` untouched, so restarts can
+        never auto-disable a healthy schedule.  ``last_status`` deliberately
+        gains no new value so an older build can still load the file.
+        """
         async with self._exclusive():
             schedule = self._cache.get(schedule_id)
             if schedule is None:
                 return 0
+            if kind == "interrupted":
+                schedule.state = ScheduleState(
+                    last_fired_at=when,
+                    last_status=schedule.state.last_status,
+                    consecutive_failures=schedule.state.consecutive_failures,
+                )
+                await self.save()
+                return schedule.state.consecutive_failures
             new_count = schedule.state.consecutive_failures + 1
             last_status = "timeout" if kind == "timeout" else "fail"
             schedule.state = ScheduleState(
