@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% block title %}Memory — ANNA Dashboard{% endblock %}
+{% block content %}
+  <h1>Memory</h1>
+  {% if disabled %}
+  <p role="alert"><strong>Memory is disabled</strong> (<code>memory.enabled: false</code> in anna.yaml). No memory database is opened or
+    created, no facts are listed and nothing can be corrected or forgotten here. <code>core/MEMORY.md</code> (the file memory) is a
+    separate mechanism and is not affected by this setting.</p>
+  {% else %}
+  <p><small>Pick an owner and scope explicitly — facts are never listed across scopes. Changes use the same
+    rules as the assistant's memory tools: only active facts, only inside the selected scope, atomic.
+    Fact text is shown here (that is the feature) but is never written to the audit log.</small></p>
+  {% if msg %}<p role="status"><strong>{{ msg }}</strong></p>{% endif %}
+  {% if err %}<p role="alert"><strong>{{ err }}</strong></p>{% endif %}
+  <h2>Owner / scope</h2>
+  <ul>
+  {% for s in scopes %}
+    <li><a href="/memory?owner={{ s.owner_id | urlencode }}&amp;scope={{ s.scope | urlencode }}">{{ s.owner_id }} · {{ s.scope }}</a>
+      ({{ s.active or 0 }} active / {{ s.n }} total)</li>
+  {% else %}<li>No memory yet.</li>{% endfor %}
+  </ul>
+  {% if selected %}
+    <h2>{{ selected.owner }} · {{ selected.scope }}</h2>
+    <p>Show: {% for st in ['active', 'forgotten', 'superseded', 'all'] %}
+      <a href="/memory?owner={{ selected.owner | urlencode }}&amp;scope={{ selected.scope | urlencode }}&amp;status={{ st }}"{% if st == status %} aria-current="true"{% endif %}>{{ st }}</a>{% endfor %}</p>
+    <table><thead><tr><th>#</th><th>Fact</th><th>Source</th><th>Status</th><th></th></tr></thead><tbody>
+    {% for f in facts %}
+      <tr>
+        <td>{{ f.id }}</td>
+        <td><strong>{{ f.subject }}</strong>: {{ f.content }}<br><small>{{ f.kind }}{% if f.confidence %} · conf {{ f.confidence }}{% endif %}</small></td>
+        <td><small>{{ f.origin }}<br><code>{{ (f.source_event_id or 'none')[:18] }}</code>{% if f.has_evidence %}<br>evidence kept{% endif %}</small></td>
+        <td>{{ f.status }}</td>
+        <td>{% if f.status == 'active' %}
+          <form method="post" action="/memory/{{ f.id }}/correct">
+            <input type="hidden" name="owner" value="{{ selected.owner }}"><input type="hidden" name="scope" value="{{ selected.scope }}">
+            <input name="content" placeholder="corrected text" required maxlength="500"><button type="submit">Correct</button></form>
+          <form method="post" action="/memory/{{ f.id }}/forget" onsubmit="return confirm('Forget memory #{{ f.id }}?');">
+            <input type="hidden" name="owner" value="{{ selected.owner }}"><input type="hidden" name="scope" value="{{ selected.scope }}">
+            <button type="submit">Forget</button></form>
+        {% endif %}</td>
+      </tr>
+    {% else %}<tr><td colspan="5">Nothing in this view.</td></tr>{% endfor %}
+    </tbody></table>
+  {% endif %}
+  {% endif %}
+{% endblock %}

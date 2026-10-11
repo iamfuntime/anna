@@ -20,6 +20,7 @@ from typing import Any
 
 from anna.config import AnnaConfig
 from anna.log import audit_event, get_logger
+from anna.runtime.status import get_recorder
 from anna.transports.base import ChannelAdapter
 
 
@@ -78,6 +79,7 @@ class Watchdog:
                     transport=name,
                     error=str(exc),
                 )
+            await self._record_transport(name, adapter, healthy)
             if healthy:
                 if self._transport_failures[name] > 0:
                     downtime = self._transport_failures[name] * self._config.watchdog.interval_seconds
@@ -135,6 +137,17 @@ class Watchdog:
                                 error=str(exc),
                             )
                     self._transport_failures[name] = 0
+
+    async def _record_transport(self, name: str, adapter: ChannelAdapter, healthy: bool) -> None:
+        recorder = get_recorder()
+        if recorder is None:
+            return
+        try:
+            detail = await asyncio.wait_for(adapter.health_detail(), timeout=10)
+        except Exception as exc:  # noqa: BLE001
+            detail = {"receiver_alive": None, "api_ok": None, "error": type(exc).__name__}
+        recorder.transport(name, healthy=healthy, receiver_alive=detail.get("receiver_alive"),
+                           api_ok=detail.get("api_ok"), error=detail.get("error"))
 
     # ------------------------------------------------------------------
     # SDK session

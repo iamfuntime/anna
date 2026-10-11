@@ -24,10 +24,14 @@ For first fires (no recorded ``last_fired_at``) the baseline is
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import fcntl
 import os
-from datetime import datetime, timezone
+from collections.abc import AsyncIterator, Awaitable, Callable
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import yaml
@@ -37,7 +41,6 @@ from anna.config import AnnaConfig
 from anna.log import audit_event, get_logger
 from anna.runtime.schedule_types import Schedule, ScheduleDestination, ScheduleState
 from anna.runtime.supervisor import Supervisor
-
 
 _STORE_KEY = "schedules.yaml"
 
@@ -131,6 +134,32 @@ class ScheduleStore:
                 os.fsync(fp.fileno())
         os.replace(tmp, self._path)
 
+    @contextlib.asynccontextmanager
+    async def _exclusive(self) -> AsyncIterator[None]:
+        """Per-process supervisor lock plus a cross-process file lock.
+
+        Every mutation is a read-modify-write under both: the file is re-read
+        after the lock is taken, so a dashboard edit and a daemon state write
+        can never silently overwrite each other (each only changes its own row
+        and fields on top of the freshest on-disk content).
+        """
+        async with await self._supervisor.acquire(_STORE_KEY):
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(str(self._path) + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                for _ in range(100):
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        await asyncio.sleep(0.05)
+                else:
+                    raise TimeoutError("schedules.yaml is locked by another process")
+                await self.load()
+                yield
+            finally:
+                os.close(fd)  # closing releases the flock
+
     # ------------------------------------------------------------------
     # Read helpers (no lock needed; cache is read-mostly)
     # ------------------------------------------------------------------
@@ -158,6 +187,26 @@ class ScheduleStore:
                 f"for AdminAlerter traffic. Pick a different chat for scheduled output."
             )
 
+    def _check_job_kind(self, schedule: Schedule) -> None:
+        if schedule.job_kind != "google_heartbeat":
+            return
+        if not self._config.heartbeat.enabled:
+            raise ScheduleValidationError(
+                "the Google heartbeat is opt-in: set heartbeat.enabled: true in anna.yaml and restart first")
+        if not self._config.google.enabled or not self._config.google.accounts:
+            raise ScheduleValidationError("the Google heartbeat needs google.enabled and at least one account")
+        from anna.runtime.heartbeat import heartbeat_min_timeout
+        floor = heartbeat_min_timeout(self._config.heartbeat)
+        if schedule.timeout_seconds < floor:
+            raise ScheduleValidationError(
+                f"heartbeat timeout_seconds must be at least {floor:.0f} (per-check budget x services + 30); "
+                f"a shorter job timeout would cut off healthy checks")
+        dest = f"{schedule.destination.transport}:{schedule.destination.channel}"
+        if dest not in self._config.heartbeat.allowed_destinations:
+            raise ScheduleValidationError(
+                f"heartbeat output may only go to destinations the operator allowlisted in "
+                f"heartbeat.allowed_destinations; {dest!r} is not listed")
+
     def _check_cron(self, expr: str) -> None:
         if not croniter.is_valid(expr):
             raise ScheduleValidationError(
@@ -170,11 +219,12 @@ class ScheduleStore:
     # ------------------------------------------------------------------
 
     async def create(self, schedule: Schedule, *, actor_conv: str | None = None) -> Schedule:
-        if schedule.id in self._cache:
-            raise ScheduleValidationError(f"Schedule '{schedule.id}' already exists")
         self._check_destination(schedule.destination)
         self._check_cron(schedule.cron)
-        async with await self._supervisor.acquire(_STORE_KEY):
+        self._check_job_kind(schedule)
+        async with self._exclusive():
+            if schedule.id in self._cache:
+                raise ScheduleValidationError(f"Schedule '{schedule.id}' already exists")
             self._cache[schedule.id] = schedule
             await self.save()
         audit_event(
@@ -197,23 +247,23 @@ class ScheduleStore:
         actor_conv: str | None = None,
         **changes: Any,
     ) -> Schedule:
-        if schedule_id not in self._cache:
-            raise ScheduleValidationError(f"Schedule '{schedule_id}' does not exist")
         if "id" in changes:
             raise ScheduleValidationError("schedule.id is immutable; create a new schedule instead")
-        existing = self._cache[schedule_id]
-        merged = existing.model_dump()
-        # Only touch fields the caller actually passed.
         applied_fields: list[str] = []
-        for key, value in changes.items():
-            if key not in merged and key not in {"destination", "state"}:
-                raise ScheduleValidationError(f"Unknown field '{key}' for Schedule")
-            merged[key] = value
-            applied_fields.append(key)
-        new_schedule = Schedule.model_validate(merged)
-        self._check_destination(new_schedule.destination)
-        self._check_cron(new_schedule.cron)
-        async with await self._supervisor.acquire(_STORE_KEY):
+        async with self._exclusive():
+            if schedule_id not in self._cache:
+                raise ScheduleValidationError(f"Schedule '{schedule_id}' does not exist")
+            merged = self._cache[schedule_id].model_dump()
+            # Only touch fields the caller actually passed.
+            for key, value in changes.items():
+                if key not in merged and key not in {"destination", "state"}:
+                    raise ScheduleValidationError(f"Unknown field '{key}' for Schedule")
+                merged[key] = value
+                applied_fields.append(key)
+            new_schedule = Schedule.model_validate(merged)
+            self._check_destination(new_schedule.destination)
+            self._check_cron(new_schedule.cron)
+            self._check_job_kind(new_schedule)
             self._cache[schedule_id] = new_schedule
             await self.save()
         audit_event(
@@ -228,9 +278,9 @@ class ScheduleStore:
         return new_schedule
 
     async def delete(self, schedule_id: str, *, actor_conv: str | None = None) -> None:
-        if schedule_id not in self._cache:
-            raise ScheduleValidationError(f"Schedule '{schedule_id}' does not exist")
-        async with await self._supervisor.acquire(_STORE_KEY):
+        async with self._exclusive():
+            if schedule_id not in self._cache:
+                raise ScheduleValidationError(f"Schedule '{schedule_id}' does not exist")
             del self._cache[schedule_id]
             await self.save()
         # Cancel queued + in-flight fire tasks AFTER the cache removal so a
@@ -279,7 +329,7 @@ class ScheduleStore:
         completion or failure paths overwrite the full state when they
         land.
         """
-        async with await self._supervisor.acquire(_STORE_KEY):
+        async with self._exclusive():
             schedule = self._cache.get(schedule_id)
             if schedule is None:
                 return
@@ -297,7 +347,7 @@ class ScheduleStore:
         status: str,
         when: datetime,
     ) -> None:
-        async with await self._supervisor.acquire(_STORE_KEY):
+        async with self._exclusive():
             schedule = self._cache.get(schedule_id)
             if schedule is None:
                 return
@@ -316,11 +366,27 @@ class ScheduleStore:
         when: datetime,
         kind: str = "fail",
     ) -> int:
-        """Increment consecutive_failures. Returns the new count."""
-        async with await self._supervisor.acquire(_STORE_KEY):
+        """Increment consecutive_failures. Returns the new count.
+
+        ``kind="interrupted"`` is an INFRASTRUCTURE interruption (restart,
+        shutdown, crash) rather than a verdict on the job: it advances
+        ``last_fired_at`` (so a rollback does not replay the tick) but leaves
+        ``last_status`` and ``consecutive_failures`` untouched, so restarts can
+        never auto-disable a healthy schedule.  ``last_status`` deliberately
+        gains no new value so an older build can still load the file.
+        """
+        async with self._exclusive():
             schedule = self._cache.get(schedule_id)
             if schedule is None:
                 return 0
+            if kind == "interrupted":
+                schedule.state = ScheduleState(
+                    last_fired_at=when,
+                    last_status=schedule.state.last_status,
+                    consecutive_failures=schedule.state.consecutive_failures,
+                )
+                await self.save()
+                return schedule.state.consecutive_failures
             new_count = schedule.state.consecutive_failures + 1
             last_status = "timeout" if kind == "timeout" else "fail"
             schedule.state = ScheduleState(
@@ -332,7 +398,7 @@ class ScheduleStore:
             return new_count
 
     async def mark_disabled(self, schedule_id: str, *, reason: str) -> None:
-        async with await self._supervisor.acquire(_STORE_KEY):
+        async with self._exclusive():
             schedule = self._cache.get(schedule_id)
             if schedule is None:
                 return
@@ -356,7 +422,7 @@ class ScheduleStore:
     def due_schedules(self, now: datetime) -> list[Schedule]:
         """Return enabled schedules whose next-fire time has passed."""
         if now.tzinfo is None:
-            now = now.replace(tzinfo=timezone.utc)
+            now = now.replace(tzinfo=UTC)
         due: list[Schedule] = []
         for schedule in self._cache.values():
             if not schedule.enabled:
@@ -373,7 +439,7 @@ class ScheduleStore:
 
             baseline = schedule.state.last_fired_at or schedule.created_at
             if baseline.tzinfo is None:
-                baseline = baseline.replace(tzinfo=timezone.utc)
+                baseline = baseline.replace(tzinfo=UTC)
             baseline_local = baseline.astimezone(tz)
 
             try:
@@ -388,7 +454,7 @@ class ScheduleStore:
                 )
                 continue
 
-            next_fire_utc = next_fire_local.astimezone(timezone.utc)
+            next_fire_utc = next_fire_local.astimezone(UTC)
             if next_fire_utc <= now:
                 due.append(schedule)
         return due

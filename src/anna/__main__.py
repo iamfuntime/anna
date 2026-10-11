@@ -30,16 +30,24 @@ import os
 import signal
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from anna.agents.registry import SubAgentRegistry
 from anna.auth import ensure_isolated_config_dir
-from anna.config import AnnaConfig, load_config
+from anna.config import AnnaConfig, load_config, refuse_foreign_home
 from anna.log import configure_logging, get_logger
 from anna.runtime.alerter import AdminAlerter
 from anna.runtime.router import ConversationRouter
 from anna.runtime.schedule_store import ScheduleStore
+from anna.runtime.memory_extraction import (
+    MemoryExtractionRunner,
+    SdkMemoryExtractor,
+    extraction_blocked_reason,
+)
 from anna.runtime.scheduler import Scheduler
+from anna.runtime.status import StatusRecorder
+from anna.runtime.status import set_recorder as set_status_recorder
 from anna.runtime.startup import (
     build_startup_message,
     read_and_clear_sentinel,
@@ -68,6 +76,7 @@ _CLI_SUBCOMMANDS: dict[str, str] = {
     "chat": "anna.cli.chat",
     "ask": "anna.cli.ask",
     "admin": "anna.cli.admin",
+    "doctor": "anna.cli.doctor",
 }
 
 
@@ -342,6 +351,10 @@ async def _run(config: AnnaConfig) -> None:
     last_clean = read_and_clear_sentinel(config.state_dir)
     boot_time = datetime.now(timezone.utc)
 
+    status_recorder = StatusRecorder(config.state_dir / "runtime-status.json")
+    set_status_recorder(status_recorder)
+    status_recorder.flush(force=True)
+
     # Start every adapter listener concurrently. Each lives in its own task
     # so a Slack outage cannot block Telegram.
     listener_tasks = [asyncio.create_task(a.start(), name=f"listener.{a.name}") for a in adapters.values()]
@@ -356,6 +369,7 @@ async def _run(config: AnnaConfig) -> None:
             router=router,
             adapters=adapters,
             alerter=alerter,
+            google_clients=google_clients,
         )
         # Deleting a schedule must also cancel its queued/in-flight fire
         # tasks (2026-06-01 incident: leftover queued fires failed loudly
@@ -364,6 +378,26 @@ async def _run(config: AnnaConfig) -> None:
         # tool, which only holds the store.
         schedule_store.set_cancel_callback(scheduler.cancel_schedule_tasks)
         scheduler_task = asyncio.create_task(scheduler.run(), name="scheduler")
+        status_recorder.scheduler(running=True)
+
+    # Opt-in durable memory extraction (off by default; never silently metered).
+    memory_store: Any = None
+    memory_task: asyncio.Task[Any] | None = None
+    blocked = extraction_blocked_reason(config)
+    if blocked is None:
+        from anna.runtime.memory import MemoryStore
+
+        memory_store = MemoryStore(config.state_dir / "memory.sqlite3")
+        memory_task = asyncio.create_task(
+            MemoryExtractionRunner(
+                store=memory_store, extractor=SdkMemoryExtractor(config),
+                cfg=config.memory.extraction,
+            ).run(),
+            name="memory_extraction",
+        )
+    elif config.memory.extraction.enabled:
+        log.warning("anna.memory_extraction.blocked", reason=blocked)
+    status_recorder.memory_extraction(running=memory_task is not None, blocked_reason=blocked)
 
     # Schedule the operator startup ping. It waits a few seconds for
     # adapters to attach, then fires once. We use a background task so
@@ -401,11 +435,14 @@ async def _run(config: AnnaConfig) -> None:
     await stop_event.wait()
 
     log.info("anna.shutdown.start")
+    status_recorder.stopped()
     aux_tasks: list[asyncio.Task[Any]] = [*listener_tasks, watchdog_task, housekeeping_task]
     if startup_alert_task is not None:
         aux_tasks.append(startup_alert_task)
     if scheduler_task is not None:
         aux_tasks.append(scheduler_task)
+    if memory_task is not None:
+        aux_tasks.append(memory_task)
     for task in aux_tasks:
         task.cancel()
 
@@ -421,6 +458,13 @@ async def _run(config: AnnaConfig) -> None:
         await router.shutdown()
     except Exception as exc:
         log.warning("anna.shutdown.router_failed", error=str(exc))
+
+    if memory_store is not None:
+        memory_store.close()
+
+    if google_clients is not None:
+        # Do not leave account-owned executor threads alive after shutdown.
+        google_clients.close(wait=False)
 
     for adapter in adapters.values():
         try:
@@ -539,6 +583,11 @@ def run_daemon() -> int:
         # Logging is not configured yet at this point, so write the failure
         # to stderr and exit with a non-zero code. Systemd will restart us.
         sys.stderr.write(f"anna: failed to load config: {exc}\n")
+        return 2
+
+    # Trial/test homes must be self-contained: refuse to open the live
+    # ~/anna schedules, vault, socket, credentials or config from another ANNA_HOME.
+    if refuse_foreign_home(config, "anna", "start"):
         return 2
 
     configure_logging(level=config.logging.level, format=config.logging.format)

@@ -10,24 +10,36 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import dataclasses
 import re
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace as dataclass_replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from functools import lru_cache
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Any
 
 from anna.agents.registry import SubAgentRegistry
 from anna.config import AnnaConfig
 from anna.core.eviction import evict_if_over_cap
 from anna.core.identity import CORE_FILES, CoreFile, read_core_file
 from anna.log import audit_event, get_logger
+from anna.runtime.memory import MemoryStore, render_memory_block
+from anna.runtime.status import get_recorder
+from anna.runtime.turn_watchdog import (
+    TurnWatchdog,
+    WatchdogAction,
+    hard_reminder,
+    soft_reminder,
+)
+from anna.runtime.visibility import NULL_VISIBILITY, VisibilityCallbacks
 from anna.skills.registry import SkillRegistry
 from anna.tools.delegate_server import DELEGATE_TOOL_NAMES, build_delegate_server
 from anna.tools.google_server import GOOGLE_TOOL_NAMES, GoogleTools, build_google_server
+from anna.tools.memory_server import MEMORY_TOOL_NAMES, MemoryTools, build_memory_server
 from anna.tools.self_edit_server import SELF_EDIT_TOOL_NAMES, SelfEditTools, build_self_edit_server
 from anna.tools.slack_alerts_server import (
     SLACK_ALERTS_TOOL_NAMES,
@@ -37,28 +49,26 @@ from anna.tools.slack_alerts_server import (
 from anna.tools.vault_tools import VaultTools
 from anna.tools.web_server import WEB_TOOL_NAMES, build_web_server
 from anna.tools.web_tools import WebTools
-from anna.runtime.turn_watchdog import (
-    TurnWatchdog,
-    WatchdogAction,
-    hard_reminder,
-    soft_reminder,
-)
-from anna.runtime.visibility import NULL_VISIBILITY, VisibilityCallbacks
 from anna.transports.base import (
     ChannelAdapter,
     ImageAttachment,
     InboundEvent,
     OutboundMessage,
     SignalHandle,
+    TurnCancelled,
 )
 from anna.vault.checkpoint import list_recent_checkpoints, write_checkpoint
 from anna.vault.transcript_resume import (
     delivered_posts_since,
-    latest_checkpoint_mtime,
+    extend_coverage_through_outbound,
     latest_ts,
     render_delivered_posts,
     render_tail_block,
+    legacy_checkpoint_cutoff,
+    legacy_line_key,
     transcript_tail_since,
+    uncovered_sequences_before,
+    validated_checkpoint_coverage,
 )
 
 if TYPE_CHECKING:
@@ -78,6 +88,7 @@ _SLACK_ALERTS_PREFIX = "mcp__anna_slack_alerts__"
 _GOOGLE_PREFIX = "mcp__anna_google__"
 _WEB_PREFIX = "mcp__anna_web__"
 _DELEGATE_PREFIX = "mcp__anna_delegate__"
+_MEMORY_PREFIX = "mcp__anna_memory__"
 
 
 def _tool_belongs_to_servers(tool_name: str, server_names: set[str]) -> bool:
@@ -100,6 +111,7 @@ def _allowed_tool_names(
     include_google: bool,
     include_web: bool,
     include_delegate: bool = False,
+    include_memory: bool = True,
 ) -> list[str]:
     names = (
         list(_DEFAULT_FS_TOOLS)
@@ -112,6 +124,8 @@ def _allowed_tool_names(
         names.extend(f"{_WEB_PREFIX}{name}" for name in WEB_TOOL_NAMES)
     if include_delegate:
         names.extend(f"{_DELEGATE_PREFIX}{name}" for name in DELEGATE_TOOL_NAMES)
+    if include_memory:
+        names.extend(f"{_MEMORY_PREFIX}{name}" for name in MEMORY_TOOL_NAMES)
     return names
 
 
@@ -795,23 +809,39 @@ class ConversationWorker:
         conversation_key: str,
         transport: str,
         config: AnnaConfig,
-        supervisor: "Supervisor",
+        supervisor: Supervisor,
         send: SendCallback,
         on_idle_close: IdleCloseCallback | None = None,
         adapters: dict[str, ChannelAdapter] | None = None,
-        schedule_store: "ScheduleStore | None" = None,
-        google_clients: "GoogleClients | None" = None,
-        subagent_runner: "SubAgentRunner | None" = None,
+        schedule_store: ScheduleStore | None = None,
+        google_clients: GoogleClients | None = None,
+        subagent_runner: SubAgentRunner | None = None,
         ephemeral: bool = False,
         model_override: str | None = None,
         visibility: VisibilityCallbacks = NULL_VISIBILITY,
-        alerter: "AdminAlerter | None" = None,
+        alerter: AdminAlerter | None = None,
     ) -> None:
         self.conversation_key = conversation_key
         self.transport = transport
         self._config = config
         self._supervisor = supervisor
-        self._send = send
+        self._send_callback = send
+        self._reply_address: ContextVar[tuple[str, str] | None] = ContextVar(
+            f"anna_reply_address_{conversation_key}", default=None
+        )
+        self._memory_store_obj: MemoryStore | None = None  # opened lazily; ephemeral workers never touch it
+        self._active_memory_source_id: str | None = None
+        self.memory_enqueue_failures = 0
+        self._sdk_turn_failed = False
+        self._sdk_result_seen = False
+        self._coverage_frozen = False
+        self._resume_tail_sequences: set[int] = set()
+        self._resume_legacy_cutoff: float | None = None
+        # Unsequenced (main-era) lines the resume tail showed this session, and
+        # the newest of their timestamps: the closeout that summarizes them
+        # advances the durable legacy boundary over them (and only them).
+        self._resume_legacy_shown: set[tuple[str, str, str]] = set()
+        self._resume_legacy_shown_ts: float | None = None
         self._on_idle_close = on_idle_close
         # Live transport adapters (same dict the router/alerter hold). Used by
         # the anna_slack_alerts MCP server to post through ANNA's own Slack
@@ -965,7 +995,7 @@ class ConversationWorker:
         # do not race a second invocation against the in-flight stop().
         self._idle_close_signalled = False
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         self.last_active: datetime = now
         self.last_event_received_at: datetime | None = None
         self.last_event_processed_at: datetime | None = None
@@ -991,6 +1021,13 @@ class ConversationWorker:
         self._turns_since_checkpoint: int = 0
         self._last_checkpoint_at: datetime | None = None
         self._dirty: bool = False
+        # Only an inbound event that completed its normal turn handling may
+        # advance closeout coverage. A durable queued event is not proof that
+        # its content was presented to the summarizer.
+        self._last_processed_transcript_sequence: int | None = None
+        self._last_processed_transcript_event_id: str | None = None
+        self._coverage_advance_allowed: bool | None = None
+        self._coverage_unsummarized = 0
         self.is_dm: bool = conversation_key.split(":")[1].startswith("dm") if ":" in conversation_key else False
 
     # ------------------------------------------------------------------
@@ -1057,6 +1094,7 @@ class ConversationWorker:
                     self._closed_out = True
         finally:
             await self._close_client()
+            self._close_memory_store()
             self._log.info("worker.complete")
 
     async def restart(self) -> None:
@@ -1065,8 +1103,26 @@ class ConversationWorker:
         await self.start()
 
     async def submit(self, event: InboundEvent) -> None:
-        self.last_event_received_at = datetime.now(timezone.utc)
+        self.last_event_received_at = datetime.now(UTC)
         await self._queue.put(event)
+
+    async def _send(self, message: OutboundMessage) -> None:
+        """Send using this task's event destination, without shared mutation.
+
+        Stream-consumer/unsolicited tasks have no active inbound context. They
+        intentionally fall back to this worker's creation transport, which is
+        also compatible with the existing canonical-key adapter reverse map.
+        """
+        address = self._reply_address.get()
+        transport, conversation_key = address or (self.transport, message.conversation_key)
+        await self._send_callback(
+            dataclasses.replace(
+                message,
+                transport=message.transport or transport,
+                conversation_key=conversation_key if address else message.conversation_key,
+                transcript_conversation_key=message.transcript_conversation_key or self.conversation_key,
+            )
+        )
 
     # ------------------------------------------------------------------
     # Inner loop
@@ -1103,7 +1159,7 @@ class ConversationWorker:
                 await asyncio.sleep(poll)
                 if self._stopping or self._idle_close_signalled:
                     return
-                idle = (datetime.now(timezone.utc) - self.last_active).total_seconds()
+                idle = (datetime.now(UTC) - self.last_active).total_seconds()
                 if idle > gap and self._on_idle_close is not None:
                     self._idle_close_signalled = True
                     self._log.info(
@@ -1125,9 +1181,27 @@ class ConversationWorker:
             while not self._stopping:
                 event = await self._queue.get()
                 try:
-                    await self._handle(event)
+                    # Context-local state follows watchdog/drip tasks spawned
+                    # by this turn, without leaking its address to the stream
+                    # consumer or another concurrent task.
+                    reply_token = self._reply_address.set((
+                        event.reply_transport or event.transport,
+                        event.reply_conversation_key or event.conversation_key,
+                    ))
+                    try:
+                        if event.cancel is not None and event.cancel.is_set():
+                            # Cancelled while queued: never started, no side effects.
+                            if event.turn_meta is not None:
+                                event.turn_meta["turn_state"] = "dropped"
+                            fut = event.completion_future
+                            if fut is not None and not fut.done():
+                                fut.set_exception(TurnCancelled("turn cancelled before start"))
+                            continue
+                        await self._handle(event)
+                    finally:
+                        self._reply_address.reset(reply_token)
                 finally:
-                    self.last_event_processed_at = datetime.now(timezone.utc)
+                    self.last_event_processed_at = datetime.now(UTC)
                     self.last_active = self.last_event_processed_at
                     # NOTE: the periodic-checkpoint bookkeeping
                     # (``_turns_since_checkpoint`` / ``_dirty``) is advanced
@@ -1256,11 +1330,25 @@ class ConversationWorker:
             tools=slack_alert_tools,
             conv_key=self.conversation_key,
         )
-
+        owner_id = self.conversation_key.removeprefix("user:")
+        memory_scope = (
+            "private" if self.conversation_key.startswith("user:")
+            else f"group:{self.conversation_key}"
+        )
         mcp_servers: dict[str, Any] = {
             "anna_self_edit": self_edit_server,
             "anna_slack_alerts": slack_alerts_server,
         }
+        if self._config.memory.enabled:  # kill switch: no server, no tools, no DB open
+            mcp_servers["anna_memory"] = build_memory_server(
+                tools=MemoryTools(
+                    self._memory_store,
+                    owner_id=owner_id,
+                    scope=memory_scope,
+                    source_event_id=lambda: self._active_memory_source_id,
+                    writable=self._memory_writable(),
+                )
+            )
         include_google = False
         if self._google_clients is not None and self._config.google.enabled:
             google_tools = GoogleTools(
@@ -1335,6 +1423,7 @@ class ConversationWorker:
             include_google=include_google,
             include_web=include_web,
             include_delegate=include_delegate,
+            include_memory=self._config.memory.enabled,
         )
         if custom_specs:
             custom_servers, custom_tool_names = build_mcp_servers(
@@ -2151,14 +2240,27 @@ class ConversationWorker:
         if not ckpt_cfg.resume_from_transcript or self._ephemeral:
             return ""
         try:
-            since_mtime = latest_checkpoint_mtime(vault_root, self.conversation_key)
+            # One snapshot per resume: the same legacy cutoff decides what the
+            # tail hides and what the closeout coverage gap treats as summarized.
+            self._resume_legacy_cutoff = legacy_checkpoint_cutoff(vault_root, self.conversation_key)
             tail = transcript_tail_since(
                 transcripts_dir=self._config.transcripts_dir,
                 conv_key=self.conversation_key,
-                since_mtime=since_mtime,
+                since_mtime=None,
                 max_turns=ckpt_cfg.tail_max_turns,
                 max_tokens=ckpt_cfg.tail_max_tokens,
+                covered_through_sequence=validated_checkpoint_coverage(
+                    vault_root, self._config.transcripts_dir, self.conversation_key
+                ),
+                covered_through_ts=self._resume_legacy_cutoff,
             )
+            shown_legacy = [obj for obj in tail if not isinstance(obj.get("sequence"), int)]
+            self._resume_legacy_shown = {legacy_line_key(obj) for obj in shown_legacy}
+            self._resume_legacy_shown_ts = latest_ts(shown_legacy)
+            # What this session is shown at resume counts as seen by its summary.
+            self._resume_tail_sequences = {
+                obj["sequence"] for obj in tail if isinstance(obj.get("sequence"), int)
+            }
             # Whatever the tail shows the session already has: lift the
             # delivered-posts mark over it so the first turn does not
             # inject a post that is sitting in the system prompt.
@@ -2339,8 +2441,26 @@ class ConversationWorker:
         # regardless of whether a periodic checkpoint just landed. The
         # dirty-flag gate lives only in ``_maybe_periodic_checkpoint``.
         summary = await self._ask_checkpoint_summary()
-        summary = self._append_unseen_delivered_posts(summary)
-        await self._write_checkpoint_now(summary, kind="closeout")
+        if summary is None:
+            self._log.warning("worker.closeout.checkpoint_summary_unavailable")
+            audit_event(
+                "audit.checkpoint.summary_unavailable",
+                audit_dir=self._config.audit_dir,
+                actor="anna",
+                conv_key=self.conversation_key,
+                fsync_on_write=self._config.logging.audit.fsync_on_write,
+                level="WARNING",
+            )
+        else:
+            summary = self._append_unseen_delivered_posts(summary)
+            coverage_sequence, coverage_event_id = self._closeout_coverage()
+            await self._write_checkpoint_now(
+                summary,
+                kind="closeout",
+                coverage_end_sequence=coverage_sequence,
+                coverage_end_event_id=coverage_event_id,
+                legacy_cutoff_ts=self._closeout_legacy_cutoff() if coverage_sequence else None,
+            )
 
         # ----- 2. Per-core-file eviction ---------------------------------
         # eviction.py drains ``receive_response()`` on the shared client
@@ -2380,7 +2500,14 @@ class ConversationWorker:
 
         self._log.info("worker.closeout.complete")
 
-    async def _write_checkpoint_now(self, summary: str, kind: str) -> Path | None:
+    async def _write_checkpoint_now(
+        self,
+        summary: str,
+        kind: str,
+        coverage_end_sequence: int | None = None,
+        coverage_end_event_id: str | None = None,
+        legacy_cutoff_ts: float | None = None,
+    ) -> Path | None:
         """Write a checkpoint under the supervisor lock and audit it.
 
         Extracted from :meth:`_closeout` so both the graceful-close path
@@ -2408,6 +2535,10 @@ class ConversationWorker:
                     summary=summary,
                     operator_short_name=self._operator_short_name,
                     kind=kind,
+                    coverage_end_sequence=coverage_end_sequence,
+                    coverage_end_event_id=coverage_end_event_id,
+                    unsummarized_events=self._coverage_unsummarized if coverage_end_sequence else 0,
+                    legacy_cutoff_ts=legacy_cutoff_ts,
                 )
             except OSError as exc:
                 self._log.error("worker.checkpoint_write_failed", error=str(exc))
@@ -2438,7 +2569,7 @@ class ConversationWorker:
         # current state. Applies to both periodic and closeout writes.
         self._dirty = False
         self._turns_since_checkpoint = 0
-        self._last_checkpoint_at = datetime.now(timezone.utc)
+        self._last_checkpoint_at = datetime.now(UTC)
         return ckpt_path
 
     async def _maybe_periodic_checkpoint(self) -> None:
@@ -2486,7 +2617,7 @@ class ConversationWorker:
         if not self._dirty:
             return
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         baseline = self._last_checkpoint_at or self._created_at
         minutes_since = (now - baseline).total_seconds() / 60.0
         due = (
@@ -2497,12 +2628,12 @@ class ConversationWorker:
             return
 
         try:
-            vault_root = self._config.vault.resolved_path
-            since_mtime = latest_checkpoint_mtime(vault_root, self.conversation_key)
             tail = transcript_tail_since(
                 transcripts_dir=self._config.transcripts_dir,
                 conv_key=self.conversation_key,
-                since_mtime=since_mtime,
+                # Legacy checkpoints and bounded excerpts have no exact
+                # event-coverage ledger.  Replay rather than hide text.
+                since_mtime=None,
                 max_turns=ckpt_cfg.tail_max_turns,
                 max_tokens=ckpt_cfg.tail_max_tokens,
             )
@@ -2546,14 +2677,14 @@ class ConversationWorker:
                 error=str(exc),
             )
 
-    async def _ask_checkpoint_summary(self) -> str:
+    async def _ask_checkpoint_summary(self) -> str | None:
         """Round-trip the SDK for a closing summary. Best-effort.
 
-        If the SDK is unavailable or errors, falls back to a minimal
-        placeholder so the checkpoint file still lands. Never raises.
+        If the SDK is unavailable or errors, returns no summary.  A failure
+        placeholder must not be persisted as if it covered the conversation.
         """
         if self._client is None:
-            return "(no SDK client available at closeout; placeholder checkpoint)"
+            return None
 
         try:
             from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
@@ -2572,7 +2703,7 @@ class ConversationWorker:
                 await self._client.query(prompt)  # type: ignore[attr-defined]
             except Exception as exc:
                 self._log.warning("worker.closeout.query_failed", error=str(exc))
-                return f"(closeout query failed: {exc})"
+                return None
 
             try:
                 async for msg in self._turn_messages(turn_queue):
@@ -2584,12 +2715,12 @@ class ConversationWorker:
                         break
             except Exception as exc:
                 self._log.warning("worker.closeout.receive_failed", error=str(exc))
-                return f"(closeout receive failed: {exc})"
+                return None
         finally:
             await self._end_turn(turn_queue)
 
         text = "\n".join(c for c in chunks if c).strip()
-        return text or "(empty closeout summary)"
+        return text or None
 
     async def _close_client(self) -> None:
         # The stream consumer reads the client's message stream; stop it
@@ -2640,22 +2771,26 @@ class ConversationWorker:
             "parent_tool_use_id": None,
         }
 
-    def _voice_only_for_transport(self) -> bool:
-        """True when this transport would send replies as voice-only.
+    def _voice_only_for_transport(self, event: InboundEvent) -> bool:
+        """True when THIS turn's reply would be sent as voice-only.
 
-        Decision F: when voice-only outbound is configured for this
-        transport, the turn stays consolidated to a single voice note at
-        turn end (same as the scheduler path), so the timed drip is not
-        started. We gate on the static config — ``voice.outbound.enabled``,
-        ``voice_only``, and this transport being in the outbound allowlist —
-        which is the condition under which an intermediate drip could be
-        fragmented into its own voice note.
+        Decision F: a voice-in turn on a voice-only transport stays
+        consolidated to a single voice note at turn end (same as the
+        scheduler path), so neither the timed drip nor the slow-turn flush
+        runs: an intermediate send would become its own voice note.  The
+        static config (``voice.outbound.enabled``, ``voice_only``, transport
+        in the allowlist) only says voice-out is *possible*; the adapters
+        synthesize only when the most recent inbound was voice ("text-in
+        still produces text-out"), which they report per turn in
+        ``event.voice_reply_expected``.  Text-in turns therefore flush and
+        drip normally under the default voice config.
         """
         voice_out = self._config.voice.outbound
         return (
-            voice_out.enabled
+            event.voice_reply_expected
+            and voice_out.enabled
             and voice_out.voice_only
-            and self.transport in voice_out.transports
+            and (event.reply_transport or event.transport) in voice_out.transports
         )
 
     def _periodic_flush_active(self, event: InboundEvent) -> bool:
@@ -2673,9 +2808,9 @@ class ConversationWorker:
             return False
         if event.completion_future is not None:
             return False
-        if self.transport not in ("slack", "telegram"):
+        if (event.reply_transport or event.transport) not in ("slack", "telegram"):
             return False
-        if self._voice_only_for_transport():
+        if self._voice_only_for_transport(event):
             return False
         return True
 
@@ -2758,13 +2893,13 @@ class ConversationWorker:
         """Whether to run the interactive-turn watchdog for this turn.
 
         Active only for an enabled, INTERACTIVE (non-scheduler) turn on a
-        buffered transport (Slack/Telegram) — the exact place the buffered
-        transport can hold the operator's channel hostage. The scheduler path
+        buffered transport (Slack/Telegram) — the exact place a long turn can
+        hold the operator's channel hostage. The scheduler path
         (``completion_future`` set) is exempt, and the CLI transport streams
-        deltas live so its channel never goes dead. Unlike the drip gate this
-        stays active under ``consolidate_interactive_turns``: a breach flush is
-        a deliberate override of consolidation because a dead channel outweighs
-        the one-message preference.
+        deltas live so its channel never goes dead. Monitoring remains active
+        even when incremental delivery is disabled so breach telemetry and the
+        next-turn reminder are not lost; the loop separately gates an
+        intermediate flush on the delivery policy.
         """
         if not self._turn_watchdog_cfg.enabled:
             return False
@@ -2804,7 +2939,16 @@ class ConversationWorker:
                     action = watchdog.poll()
                     if action is WatchdogAction.NONE:
                         continue
-                    await self._flush_buffer_now(event, buffer)
+                    # The slow-turn flush is the guard's whole point (the channel
+                    # is dead air), so it fires under every existing delivery
+                    # config - ``consolidate_interactive_turns`` and
+                    # ``periodic_flush_seconds: 0`` included, as on ``main``.
+                    # The one exception is voice-only outbound: a mid-turn flush
+                    # there would become its own voice note (a drip), so the
+                    # turn stays consolidated into the single end-of-turn note.
+                    # Breach telemetry, reminder and alert fire either way.
+                    if not self._voice_only_for_transport(event):
+                        await self._flush_buffer_now(event, buffer)
                     if action is WatchdogAction.SOFT:
                         self._pending_watchdog_reminder = soft_reminder(
                             self._turn_watchdog_cfg.soft_threshold_seconds
@@ -3551,10 +3695,28 @@ class ConversationWorker:
         # ``_end_turn`` flushes belong to a DIFFERENT turn and are judged by
         # their own ledger, never by this one.
         self._notification_turn = self._notification_turn_for(event)
+        self._active_memory_source_id = self._event_source_id(event)
+        self._sdk_turn_failed = False
+        self._sdk_result_seen = False
         turn_queue = self._begin_turn()
+        completed_normally = False
+        cancel_task: asyncio.Task[None] | None = None
+        if event.cancel is not None:
+            if event.turn_meta is not None:
+                event.turn_meta["turn_state"] = "running"
+            cancel_task = asyncio.create_task(
+                self._interrupt_on_cancel(event), name=f"worker.cancel.{self.conversation_key}"
+            )
         try:
             await self._dispatch_turn(event, turn_queue)
+            completed_normally = True
         finally:
+            if cancel_task is not None:
+                cancel_task.cancel()
+                await asyncio.gather(cancel_task, return_exceptions=True)
+            if event.turn_meta is not None and event.cancel is not None:
+                event.turn_meta["turn_state"] = "finished"
+            self._active_memory_source_id = None
             ledger = self._notification_turn
             # Cleared BEFORE anything below can send. ``_guarded_send`` consults
             # exactly this attribute, so leaving it set would re-suppress the
@@ -3595,6 +3757,158 @@ class ConversationWorker:
                     tool_used=bool(ledger.tool_boundaries),
                 )
             await self._end_turn(turn_queue)
+            # After the reply path: durable enqueue never blocks or fails a turn.
+            self._enqueue_memory_extraction(event)
+            recorder = get_recorder()
+            if recorder is not None:
+                if self._sdk_turn_failed:
+                    recorder.sdk_error("sdk turn failed")
+                elif self._sdk_result_seen:
+                    recorder.sdk_success()
+            if self._sdk_turn_failed:
+                # The model never saw (or never answered) this turn: coverage must
+                # not advance over it, now or for later turns of this worker.
+                self._coverage_frozen = True
+            if completed_normally and not self._coverage_frozen:
+                sequence = event.raw.get("anna_transcript_sequence")
+                event_id = event.raw.get("anna_transcript_event_id")
+                if isinstance(sequence, int) and sequence > 0 and isinstance(event_id, str):
+                    if self._coverage_advance_allowed is None:
+                        prior = validated_checkpoint_coverage(
+                            self._config.vault.resolved_path,
+                            self._config.transcripts_dir,
+                            self.conversation_key,
+                        )
+                        gap = uncovered_sequences_before(
+                            self._config.transcripts_dir,
+                            self.conversation_key,
+                            sequence,
+                            prior,
+                            seen_sequences=self._resume_tail_sequences,
+                            covered_through_ts=self._resume_legacy_cutoff,
+                            seen_legacy=self._resume_legacy_shown,
+                        )
+                        # Catch-up: older history this session was never shown cannot freeze coverage
+                        # forever, but it is NOT claimed as summarized - the checkpoint records how many
+                        # events were skipped and says so in its body.
+                        self._coverage_unsummarized = len(gap)
+                        self._coverage_advance_allowed = True
+                    if self._coverage_advance_allowed:
+                        self._last_processed_transcript_sequence = sequence
+                        self._last_processed_transcript_event_id = event_id
+
+    def _closeout_legacy_cutoff(self) -> float | None:
+        """Migration marker for an explicit-coverage closeout.
+
+        Carries the resume-time legacy boundary forward and advances it over the
+        unsequenced (main-era) lines this session was shown, because the summary
+        written now covers them. Lines it was not shown stay above the boundary
+        only if newer; older unshown ones are reported through the checkpoint's
+        ``unsummarized`` note, exactly like unshown sequenced history.
+        """
+        values = [v for v in (self._resume_legacy_cutoff, self._resume_legacy_shown_ts) if v is not None]
+        return max(values) if values else None
+
+    def _closeout_coverage(self) -> tuple[int | None, str | None]:
+        """Coverage for a checkpoint: the processed inbound plus the replies that followed it."""
+        sequence, event_id = self._last_processed_transcript_sequence, self._last_processed_transcript_event_id
+        if sequence is None or event_id is None:
+            return None, None
+        try:
+            extended = extend_coverage_through_outbound(
+                self._config.transcripts_dir, self.conversation_key, sequence
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._log.warning("worker.coverage.extend_failed", error=str(exc))
+            extended = None
+        return extended or (sequence, event_id)
+
+    async def _interrupt_on_cancel(self, event: InboundEvent) -> None:
+        """Propagate a scheduler cancel into the running SDK turn."""
+        assert event.cancel is not None
+        await event.cancel.wait()
+        if event.turn_meta is not None:
+            event.turn_meta["cancel_requested"] = True
+        client = self._client
+        if client is None:
+            return
+        try:
+            await client.interrupt()  # type: ignore[attr-defined]
+        except Exception as exc:
+            if event.turn_meta is not None:
+                event.turn_meta["interrupt_error"] = str(exc)[:200]
+            self._log.warning("worker.turn.interrupt_failed", error=str(exc))
+
+    @property
+    def _memory_store(self) -> MemoryStore:
+        if self._memory_store_obj is None:
+            self._memory_store_obj = MemoryStore(self._config.anna_home / "state" / "memory.sqlite3")
+        return self._memory_store_obj
+
+    def _close_memory_store(self) -> None:
+        store, self._memory_store_obj = self._memory_store_obj, None
+        if store is not None:
+            try:
+                store.close()
+            except Exception as exc:  # noqa: BLE001
+                self._log.warning("worker.memory.close_failed", error=str(exc))
+
+    def _memory_writable(self) -> bool:
+        """Scheduled and one-shot sessions have scopes nobody can read back."""
+        return not (self._ephemeral or self.conversation_key.startswith(("schedule:", "cli:oneshot")))
+
+    @staticmethod
+    def _event_source_id(event: InboundEvent) -> str | None:
+        """One stable id per inbound event, shared by explicit remember and extraction."""
+        value = (
+            event.raw.get("anna_transcript_event_id") or event.raw.get("event_id")
+            or event.raw.get("ts") or event.raw.get("message_id")
+        )
+        return str(value) if value is not None else None
+
+    def _memory_owner_scope(self) -> tuple[str, str]:
+        owner_id = self.conversation_key.removeprefix("user:")
+        scope = "private" if self.conversation_key.startswith("user:") else f"group:{self.conversation_key}"
+        return owner_id, scope
+
+    def _enqueue_memory_extraction(self, event: InboundEvent) -> None:
+        """Queue the user's own message for opt-in background extraction.
+
+        Only interactive, non-ephemeral turns qualify (scheduled/heartbeat turns
+        carry no user-authored statements).  Any failure is logged, audited and
+        counted but never raised: the reply has already been handled.
+        """
+        cfg = self._config.memory.extraction
+        if not self._config.memory.enabled:
+            return
+        # Trust boundary: only a direct message from an authorized human is the
+        # owner's own words. Group/channel messages can come from other
+        # participants, so they are never auto-extracted.
+        if (not cfg.enabled or not event.human_origin or event.completion_future is not None
+                or event.ephemeral or not event.is_dm or not self._memory_writable()):
+            return
+        text = (event.text or "").strip()
+        if len(text) < cfg.min_source_chars:
+            return
+        source_id = self._event_source_id(event)
+        owner_id, scope = self._memory_owner_scope()
+        try:
+            if source_id is None:
+                raise ValueError("turn has no source event id")
+            self._memory_store.enqueue_extraction(
+                owner_id=owner_id, visibility_scope=scope, conversation_key=self.conversation_key,
+                source_event_id=str(source_id), source_text=text[: cfg.max_source_chars],
+                max_pending=cfg.max_pending,
+            )
+        except Exception as exc:
+            self.memory_enqueue_failures += 1
+            self._log.warning("worker.memory.enqueue_failed", error=str(exc),
+                              failures=self.memory_enqueue_failures)
+            try:
+                audit_event("audit.memory.enqueue_failed", audit_dir=self._config.audit_dir,
+                            conv_key=self.conversation_key, error=f"{type(exc).__name__}: {exc}"[:200])
+            except Exception:
+                pass
 
     async def _dispatch_turn(
         self, event: InboundEvent, turn_queue: asyncio.Queue[Any]
@@ -3626,6 +3940,24 @@ class ConversationWorker:
         # CADENCE.md without restarting ANNA. An empty / missing file
         # degrades gracefully to the unmodified event text.
         query_text = event.text
+        # Refresh retrieval for every turn, including an already-live worker.
+        # Owner-scoped DMs use their canonical owner key; non-DM conversations
+        # remain isolated in a private group scope.
+        owner_id, scope = self._memory_owner_scope()
+        facts: list[Any] = []
+        if self._config.memory.enabled:
+            try:
+                facts = self._memory_store.search(
+                    owner_id=owner_id,
+                    visibility_scopes={scope},
+                    query=event.text,
+                    limit=6,
+                )
+            except Exception as exc:
+                self._log.warning("worker.memory.retrieve_failed", error=str(exc))
+                facts = []
+        if facts:
+            query_text = f"{render_memory_block(facts)}\n\n{query_text}"
         if (
             self.transport in ("slack", "telegram")
             and self._visibility.cadence_reminder_loader is not None
@@ -3642,7 +3974,7 @@ class ConversationWorker:
             if reminder:
                 query_text = (
                     f"<system-reminder>\n{reminder}\n</system-reminder>\n\n"
-                    f"{event.text}"
+                    f"{query_text}"
                 )
 
         # Posts delivered into this conversation from outside this worker
@@ -3789,6 +4121,7 @@ class ConversationWorker:
                 await self._client.query(prompt)  # type: ignore[attr-defined]
             except Exception as exc:
                 self._log.error("worker.sdk_query_failed", error=str(exc))
+                self._sdk_turn_failed = True
                 if event.completion_future is not None and not event.completion_future.done():
                     event.completion_future.set_exception(exc)
                     return
@@ -3987,9 +4320,11 @@ class ConversationWorker:
                                             buffer.pending.clear()
                                             buffer.last_flush = loop.time()
                     if ResultMessage is not None and isinstance(msg, ResultMessage):
+                        self._sdk_result_seen = True
                         break
             except Exception as exc:
                 self._log.error("worker.sdk_receive_failed", error=str(exc))
+                self._sdk_turn_failed = True
                 if event.completion_future is not None and not event.completion_future.done():
                     event.completion_future.set_exception(exc)
                     return

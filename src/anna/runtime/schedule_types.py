@@ -17,7 +17,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from anna.config import validate_model_string
 
@@ -88,6 +88,12 @@ class Schedule(BaseModel):
     behavior exactly: the fire runs on ``runtime.model``.
     """
 
+    # Unknown keys are kept and written back: a newer or older ANNA (or an
+    # operator hand edit) may carry fields this version does not model, and a
+    # rollback/upgrade round trip through the store must not silently erase
+    # them. Known fields are still validated.
+    model_config = ConfigDict(extra="allow")
+
     id: str
     natural_language: str | None = None
     cron: str
@@ -97,6 +103,16 @@ class Schedule(BaseModel):
     timeout_seconds: int = 300
     enabled: bool = True
     ephemeral: bool = False
+    # What the scheduler executes. Only the legacy agent prompt exists today;
+    # typed deterministic jobs (heartbeat) register further kinds.
+    job_kind: Literal["agent_prompt", "google_heartbeat"] = "agent_prompt"
+    # Crash-recovery safety. ``side_effecting`` runs interrupted mid-flight are
+    # recorded as unknown and never re-run; ``read_only`` runs may be retried.
+    run_safety: Literal["side_effecting", "read_only"] = "side_effecting"
+    # None inherits scheduler.default_* from config.
+    overlap_policy: Literal["skip", "queue"] | None = None
+    misfire_policy: Literal["run_latest", "skip_late"] | None = None
+    misfire_grace_seconds: int | None = None
     gate_command: list[str] | None = None
     model: str | None = None
     created_at: datetime
@@ -106,3 +122,10 @@ class Schedule(BaseModel):
     @classmethod
     def _validate_model(cls, v: str | None) -> str | None:
         return validate_model_string(v)
+
+    @model_validator(mode="after")
+    def _heartbeat_is_read_only(self) -> "Schedule":
+        # The built-in heartbeat only reads; an interrupted run is safe to repeat.
+        if self.job_kind == "google_heartbeat" and self.run_safety != "read_only":
+            self.run_safety = "read_only"
+        return self

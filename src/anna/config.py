@@ -118,6 +118,57 @@ def _resolve_anna_home() -> Path:
     return Path(os.path.expanduser(os.environ.get("ANNA_HOME", "~/anna")))
 
 
+def _home_path(name: str) -> str:
+    """Default path ``<ANNA_HOME>/<name>`` as a string (evaluated per instance)."""
+    return str(_resolve_anna_home() / name)
+
+
+def real_default_home() -> Path:
+    """The account's real ``~/anna``, resolved from the passwd entry.
+
+    Deliberately NOT ``expanduser("~/anna")``: a trial run overrides ``$HOME``,
+    and the point of this helper is to recognise the production home no matter
+    what the environment says.
+    """
+    try:
+        import pwd
+
+        base = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    except (ImportError, KeyError):  # non-POSIX / no passwd entry
+        base = Path(os.path.expanduser("~"))
+    return base / "anna"
+
+
+def _same_path(a: Path, b: Path) -> bool:
+    return os.path.realpath(a) == os.path.realpath(b)
+
+
+def is_isolated_home(anna_home: Path) -> bool:
+    """True when ``anna_home`` is not the account's real ``~/anna`` (a trial/test home)."""
+    return not _same_path(anna_home, real_default_home())
+
+
+DEFAULT_RESTART_UNIT = "anna.service"
+# Units that belong to the live installation. An isolated (trial) home may never restart them,
+# however the operator spells the name.
+LIVE_UNITS = frozenset({"anna.service", "anna-web.service"})
+_UNIT_SUFFIXES = (".service", ".socket", ".target", ".timer", ".path", ".mount", ".scope", ".slice")
+
+
+def normalize_unit_name(unit: str | None) -> str | None:
+    """systemd's canonical spelling of a unit name: ``anna`` == ``anna.service``.
+
+    Returns ``None`` for an empty or unusable name (path separators, whitespace, control characters),
+    which callers treat as "restart disabled".
+    """
+    name = (unit or "").strip()
+    if not name or any(c in name for c in "/\\") or any(c.isspace() or ord(c) < 32 for c in name):
+        return None
+    if not name.lower().endswith(_UNIT_SUFFIXES):
+        name += ".service"
+    return name
+
+
 # ---------------------------------------------------------------------------
 # Sub-models
 # ---------------------------------------------------------------------------
@@ -476,7 +527,7 @@ class CLITransportConfig(BaseModel):
     # Owner-only Unix-domain socket the daemon binds and `anna chat` /
     # `anna ask` connect to. Resolved against the operator's home via
     # os.path.expanduser when consumed.
-    socket_path: str = "~/anna/anna.sock"
+    socket_path: str = Field(default_factory=lambda: _home_path("anna.sock"))
     # Per-CLI idle close, distinct from sessions.dm_gap_hours (8h) and
     # sessions.thread_gap_hours (1h). 30m lands between the two existing
     # gaps — long enough that stepping away for coffee doesn't tear the
@@ -506,7 +557,8 @@ class TransportsConfig(BaseModel):
 
 
 class VaultConfig(BaseModel):
-    path: str = "~/anna/vault"
+    # Defaults follow $ANNA_HOME so a temp-home trial never touches ~/anna/vault.
+    path: str = Field(default_factory=lambda: _home_path("vault"))
 
     @property
     def resolved_path(self) -> Path:
@@ -620,6 +672,157 @@ class CheckpointConfig(BaseModel):
         return v
 
 
+class MemoryExtractionConfig(BaseModel):
+    """Opt-in background memory extraction after interactive turns.
+
+    OFF by default: each extracted turn is a model call. In ``auth.mode:
+    api_key`` extraction additionally requires ``allow_api_key_billing`` so a
+    metered key is never spent silently. No ``fallback_model`` is ever passed
+    to the extractor. Restart-gated like the rest of anna.yaml.
+    """
+
+    enabled: bool = False
+    allow_api_key_billing: bool = False
+    model: str | None = "haiku"
+    max_budget_usd_per_job: float = 0.02
+    max_jobs_per_day: int = 200
+    concurrency: int = 1
+    poll_interval_seconds: float = 15.0
+    job_timeout_seconds: float = 60.0
+    max_attempts: int = 3
+    backoff_base_seconds: float = 30.0
+    backoff_max_seconds: float = 900.0
+    lease_seconds: float = 300.0
+    max_pending: int = 500
+    max_source_chars: int = 4000
+    min_source_chars: int = 12
+    max_candidates_per_job: int = 5
+    min_confidence: float = 0.8
+    # Queued jobs older than this are discarded (source text wiped) instead of extracted. Bounds how
+    # much pre-existing text is processed after memory.enabled/extraction.enabled is switched back on.
+    max_job_age_hours: float = 72.0
+
+    @field_validator("model")
+    @classmethod
+    def _validate_model(cls, v: str | None) -> str | None:
+        return validate_model_string(v)
+
+    @field_validator(
+        "max_budget_usd_per_job", "max_jobs_per_day", "concurrency",
+        "poll_interval_seconds", "job_timeout_seconds", "max_attempts",
+        "backoff_base_seconds", "backoff_max_seconds", "lease_seconds",
+        "max_pending", "max_source_chars", "min_source_chars",
+        "max_candidates_per_job", "max_job_age_hours",
+    )
+    @classmethod
+    def _positive(cls, v: float, info: Any) -> float:
+        if v <= 0:
+            raise ValueError(f"memory.extraction.{info.field_name} must be positive")
+        return v
+
+    @field_validator("min_confidence")
+    @classmethod
+    def _unit_interval(cls, v: float) -> float:
+        if not 0.0 <= v <= 1.0:
+            raise ValueError("memory.extraction.min_confidence must be within [0, 1]")
+        return v
+
+
+class QuietHoursConfig(BaseModel):
+    """Local-time window (in the schedule's timezone) when non-urgent notices are held."""
+
+    enabled: bool = True
+    start: str = "22:00"
+    end: str = "07:00"
+
+    @field_validator("start", "end")
+    @classmethod
+    def _hhmm(cls, v: str) -> str:
+        try:
+            hh, mm = v.split(":")
+            if not (0 <= int(hh) <= 23 and 0 <= int(mm) <= 59):
+                raise ValueError
+        except ValueError:
+            raise ValueError("quiet hours must be HH:MM (24h)") from None
+        return v
+
+
+class HeartbeatConfig(BaseModel):
+    """Built-in read-only Gmail + Calendar heartbeat (job_kind ``google_heartbeat``).
+
+    OPT-IN: off by default. No LLM is used for collection, empty checks, or
+    reminders. Collectors only read through the serialized ``GoogleClients``
+    lanes; nothing is ever written or sent through Google.
+    """
+
+    enabled: bool = False
+    accounts: list[str] = Field(default_factory=list)  # empty = every configured account
+    # Operator-set allowlist of "transport:channel" destinations that may receive
+    # heartbeat output (mail subjects/senders, calendar titles). Default: none.
+    # Enforced when a heartbeat schedule is created/updated AND on every run, so
+    # an agent tool (or a prompt-injected agent) cannot redirect mail summaries.
+    allowed_destinations: list[str] = Field(default_factory=list)
+    services: list[Literal["gmail", "calendar"]] = Field(default_factory=lambda: ["gmail", "calendar"])
+    check_timeout_seconds: float = 90.0
+    gmail_page_size: int = 50
+    gmail_max_pages: int = 3
+    gmail_bootstrap_hours: int = 24
+    calendar_lookahead_hours: int = 24
+    calendar_page_size: int = 50
+    calendar_max_pages: int = 2
+    reminder_minutes: int = 30
+    urgent_minutes: int = 15
+    max_listed_items: int = 8
+    quiet_hours: QuietHoursConfig = Field(default_factory=QuietHoursConfig)
+    transient_failures_before_alert: int = 3
+    reminder_interval_hours: float = 24.0
+    max_reminders: int = 3
+    max_pending_notifications: int = 20
+    max_deferred_notifications: int = 50
+    gmail_max_empty_pages: int = 20
+    gmail_time_budget_seconds: float = 60.0
+    notified_retention_days: int = 30
+
+    @field_validator(
+        "check_timeout_seconds", "gmail_page_size", "gmail_max_pages", "gmail_bootstrap_hours",
+        "calendar_lookahead_hours", "calendar_page_size", "calendar_max_pages", "reminder_minutes",
+        "urgent_minutes", "max_listed_items", "transient_failures_before_alert",
+        "reminder_interval_hours", "max_pending_notifications", "notified_retention_days",
+        "max_deferred_notifications", "gmail_max_empty_pages", "gmail_time_budget_seconds",
+    )
+    @classmethod
+    def _positive(cls, v: float, info: Any) -> float:
+        if v <= 0:
+            raise ValueError(f"heartbeat.{info.field_name} must be positive")
+        return v
+
+    @field_validator("gmail_page_size", "calendar_page_size")
+    @classmethod
+    def _page(cls, v: int) -> int:
+        if v > 500:
+            raise ValueError("page size must be <= 500")
+        return v
+
+
+class MemoryConfig(BaseModel):
+    """Durable memory (facts DB, ``anna_memory`` tools, per-turn retrieval).
+
+    ``enabled`` is the master switch and is OPT-IN (default ``false``): a
+    deployment whose ``anna.yaml`` predates this store keeps the file-based
+    ``core/MEMORY.md`` flow it had on ``main`` and gets no second memory store,
+    no ``anna_memory`` tools competing for "remember this" requests, and no
+    retrieval/extraction. Set ``memory.enabled: true`` to turn the durable
+    store on. When false: no memory DB is created or opened (daemon, workers,
+    dashboard write paths), the ``anna_memory`` MCP server and its tools are not
+    offered to the model, no retrieved facts are injected into turns, and no
+    extraction is enqueued or run (``extraction.enabled`` is ignored). Existing
+    databases are left untouched. Restart-gated like the rest of anna.yaml.
+    """
+
+    enabled: bool = False
+    extraction: MemoryExtractionConfig = Field(default_factory=MemoryExtractionConfig)
+
+
 class AdminConfig(BaseModel):
     """Operator-side destinations for out-of-band alerts.
 
@@ -684,7 +887,19 @@ class GoogleAccountConfig(BaseModel):
     slug: str
     email: str
     auth_type: Literal["oauth", "service_account"]
-    credentials_file: str
+    # Per-account client/key file. For OAuth accounts it may be left empty (or point at a
+    # missing file) to use the ONE shared desktop OAuth client at ``google.oauth_client_file``.
+    credentials_file: str = ""
+    # Which Google services this account is authorized for; decides the OAuth scopes requested
+    # and which tools/collectors may use the account.  Default keeps the historic gmail+calendar.
+    services: list[Literal["gmail", "calendar"]] = Field(default_factory=lambda: ["gmail", "calendar"])
+
+    @field_validator("services")
+    @classmethod
+    def _services_nonempty(cls, v: list[str]) -> list[str]:
+        if not v or len(set(v)) != len(v):
+            raise ValueError("google account services must be a non-empty list without duplicates")
+        return v
 
     @field_validator("slug")
     @classmethod
@@ -715,6 +930,19 @@ class GoogleConfig(BaseModel):
     enabled: bool = False
     accounts: list[GoogleAccountConfig] = Field(default_factory=list)
     write_enabled: bool = False
+    # ONE reusable Desktop-app OAuth client registered once in YOUR Google Cloud project and shared by
+    # every mailbox (not one app per mailbox).  Imported once through the dashboard or CLI.
+    oauth_client_file: str = "state/google/oauth_client.json"
+    # Loopback port for the consent callback. 0 = a random free port (browser must be on this host).
+    # Set a fixed port to make the flow usable through an SSH port forward.
+    oauth_callback_port: int = 0
+
+    @field_validator("oauth_callback_port")
+    @classmethod
+    def _callback_port(cls, v: int) -> int:
+        if v != 0 and not 1024 <= v <= 65535:
+            raise ValueError("google.oauth_callback_port must be 0 or between 1024 and 65535")
+        return v
 
     @model_validator(mode="after")
     def _check_unique_slugs(self) -> "GoogleConfig":
@@ -1099,11 +1327,65 @@ class SchedulerConfig(BaseModel):
     """
 
     enabled: bool = True
-    state_path: str = "~/anna/schedules.yaml"
+    # Defaults follow $ANNA_HOME so a temp-home trial never opens ~/anna/schedules.yaml.
+    state_path: str = Field(default_factory=lambda: _home_path("schedules.yaml"))
     default_timeout_seconds: int = 300
     max_concurrent: int = 3
     poll_interval_seconds: int = 30
     failure_threshold: int = 3
+    # Restart/crash interruptions are infrastructure, not job failures, and do
+    # NOT count toward ``failure_threshold``. A job whose runs are interrupted
+    # ``interruption_threshold`` times IN A ROW (no completed or timed-out run
+    # between; a poison job that keeps taking the daemon down) has its Nth and every
+    # later consecutive interruption counted as ONE failure each, so the breaker
+    # still trips: disable happens at the (interruption_threshold + failure_threshold - 1)th
+    # consecutive interruption (default 5 + 3 - 1 = 7). Default 5: a few restarts
+    # (deploys, OOM, a bad night) must never disable a healthy job, while a run that
+    # dies five times with nothing finishing in between is the job, not the host.
+    # Timeouts are not interruptions (they already count as failures).
+    interruption_threshold: int = 5
+
+    @field_validator("interruption_threshold", "failure_threshold")
+    @classmethod
+    def _at_least_one(cls, v: int, info: Any) -> int:
+        if v < 1:
+            raise ValueError(f"scheduler.{info.field_name} must be at least 1")
+        return v
+
+    # Durable runtime ledger (state/runtime.sqlite3): occurrences, runs, outbox.
+    # Defaults preserve legacy behavior: one catch-up run after downtime,
+    # no overlapping runs of one schedule.
+    default_overlap_policy: Literal["skip", "queue"] = "skip"
+    default_misfire_policy: Literal["run_latest", "skip_late"] = "run_latest"
+    misfire_grace_seconds: int = 3600
+    lease_grace_seconds: int = 60
+    max_run_attempts: int = 3
+    cancel_grace_seconds: float = 5.0
+    delivery_max_attempts: int = 5
+    delivery_backoff_base_seconds: float = 30.0
+    delivery_backoff_max_seconds: float = 900.0
+    # None (default): split only at the destination transport's own limit
+    # (Slack 3900, Telegram 4096), exactly where ``main``'s adapters split, so
+    # a 3500-3900 char post arrives whole. An int is an explicit cap for every
+    # transport.
+    delivery_chunk_chars: int | None = None
+    retention_days: float = 30.0
+    text_retention_days: float = 7.0
+    prune_interval_hours: float = 6.0
+    send_timeout_seconds: float = 30.0
+    # Retry sends whose failure cannot prove "not delivered" (default: no;
+    # they are recorded as uncertain and never auto-resent).
+    retry_unknown_send_errors: bool = False
+
+    @field_validator("delivery_chunk_chars")
+    @classmethod
+    def _chunk_chars_positive(cls, v: int | None) -> int | None:
+        if v is not None and v <= 0:
+            raise ValueError(
+                "scheduler.delivery_chunk_chars must be a positive integer "
+                "(omit it / use null for the per-transport default)"
+            )
+        return v
 
     @property
     def resolved_state_path(self) -> Path:
@@ -1138,7 +1420,11 @@ class WebDashboardConfig(BaseModel):
     * ``target_unit`` — the systemd user unit the Restart button
       acts on. Pinned at config time, never accepted from a request
       body, so there is no path for a crafted POST to restart an
-      arbitrary unit.
+      arbitrary unit. The default ``anna.service`` is the LIVE service:
+      when ``$ANNA_HOME`` is not the real ``~/anna`` (a trial home) the
+      Restart button is disabled unless ``target_unit`` names a different,
+      explicitly configured unit (see :func:`effective_restart_unit`).
+      An empty string disables the button outright.
 
     See Inbox/2026-06-02-ANNA-Web-Dashboard-Plan.md for the full
     design.
@@ -1159,7 +1445,7 @@ class WebDashboardConfig(BaseModel):
         json_schema_extra={"warn_if_non_loopback": True},
     )
     port: int = 8765
-    target_unit: str = "anna.service"
+    target_unit: str = DEFAULT_RESTART_UNIT
 
     @field_validator("port")
     @classmethod
@@ -1514,6 +1800,8 @@ class AnnaConfig(BaseModel):
     sessions: SessionsConfig = Field(default_factory=SessionsConfig)
     checkpoint: CheckpointConfig = Field(default_factory=CheckpointConfig)
     admin: AdminConfig = Field(default_factory=AdminConfig)
+    memory: MemoryConfig = Field(default_factory=MemoryConfig)
+    heartbeat: HeartbeatConfig = Field(default_factory=HeartbeatConfig)
     reports: ReportsConfig = Field(default_factory=ReportsConfig)
     scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
     google: GoogleConfig = Field(default_factory=GoogleConfig)
@@ -1619,10 +1907,19 @@ class AnnaConfig(BaseModel):
 
     def resolve_google_credentials_path(self, account: "GoogleAccountConfig") -> Path:
         """Resolve a per-account credentials_file against anna_home if relative."""
-        raw = Path(os.path.expanduser(account.credentials_file))
-        if raw.is_absolute():
-            return raw
-        return self.anna_home / raw
+        raw = Path(os.path.expanduser(account.credentials_file)) if account.credentials_file else None
+        own = None if raw is None else (raw if raw.is_absolute() else self.anna_home / raw)
+        if account.auth_type != "oauth":
+            return own if own is not None else self.anna_home / "state" / "google" / f"sa_{account.slug}.json"
+        # OAuth: a per-account client file keeps working; otherwise the shared desktop client is used.
+        if own is not None and own.is_file():
+            return own
+        shared = self.google_oauth_client_path()
+        return shared if shared.is_file() or own is None else own
+
+    def google_oauth_client_path(self) -> Path:
+        raw = Path(os.path.expanduser(self.google.oauth_client_file))
+        return raw if raw.is_absolute() else self.anna_home / raw
 
     def google_token_path(self, account: "GoogleAccountConfig") -> Path:
         """Per-OAuth-account refresh-token cache path."""
@@ -1714,6 +2011,68 @@ def _apply_env_overrides(data: dict[str, Any]) -> dict[str, Any]:
             visibility.setdefault("consolidate_scheduled_turns", bool_val)
 
     return data
+
+
+def effective_restart_unit(config: "AnnaConfig") -> str | None:
+    """The unit the dashboard may restart, or ``None`` when restart is disabled.
+
+    * ``web.target_unit: ""`` (or an unusable name) -> disabled.
+    * the name is normalised first (``anna`` == ``anna.service``), so an alias cannot slip past.
+    * an isolated ``ANNA_HOME`` may not restart the live ``anna.service`` / ``anna-web.service``
+      under any spelling; it must name its own dedicated unit.
+    """
+    unit = normalize_unit_name(config.web.target_unit)
+    if unit is None:
+        return None
+    if unit.lower() in LIVE_UNITS and is_isolated_home(config.anna_home):
+        return None
+    return unit
+
+
+def _inside(path: Path, root: Path) -> bool:
+    resolved = Path(os.path.realpath(path))
+    return resolved == root or root in resolved.parents
+
+
+def foreign_home_paths(config: "AnnaConfig") -> list[tuple[str, Path]]:
+    """Paths of an isolated home that point into the real ``~/anna``.
+
+    A trial with ``ANNA_HOME`` elsewhere must not open the production schedules file, vault, socket,
+    Google credentials, Obsidian paths or config (e.g. through an absolute or ``~/anna`` value copied
+    into its ``anna.yaml``, ``$ANNA_CONFIG_PATH`` or the ``./anna.yaml`` development fallback).
+    """
+    if not is_isolated_home(config.anna_home):
+        return []
+    real = Path(os.path.realpath(real_default_home()))
+    candidates: list[tuple[str, Path | None]] = [
+        ("scheduler.state_path", config.scheduler.resolved_state_path),
+        ("vault.path", config.vault.resolved_path),
+        ("transports.cli.socket_path", config.transports.cli.resolved_socket_path),
+        ("integrations.obsidian.vault_path", config.integrations.obsidian.resolved_vault_path),
+        ("integrations.obsidian.tasknotes_path", config.integrations.obsidian.resolved_tasknotes_path),
+        ("google.oauth_client_file", config.google_oauth_client_path()),
+        ("config file", _resolve_config_path()),
+    ]
+    for account in config.google.accounts:
+        if account.credentials_file:
+            candidates.append((f"google.accounts[{account.slug}].credentials_file",
+                               config.resolve_google_credentials_path(account)))
+    return [(label, path) for label, path in candidates if path is not None and _inside(path, real)]
+
+
+def refuse_foreign_home(config: "AnnaConfig", prog: str, verb: str = "run") -> bool:
+    """Print a refusal and return True when an isolated home reaches into the real ``~/anna``."""
+    import sys
+
+    foreign = foreign_home_paths(config)
+    if not foreign:
+        return False
+    listing = ", ".join(f"{label}={path}" for label, path in foreign)
+    sys.stderr.write(
+        f"{prog}: refusing to {verb}: ANNA_HOME={config.anna_home} is not the real ~/anna "
+        f"but these settings point into it: {listing}. Set them to paths under ANNA_HOME.\n"
+    )
+    return True
 
 
 def load_config(path: Path | None = None) -> AnnaConfig:

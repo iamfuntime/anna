@@ -45,6 +45,9 @@ class _FakeVoice:
         self.transcribe_calls.append(kwargs)
         return self._transcript
 
+    def voice_inbound_active(self, conv_key: str) -> bool:
+        return conv_key in self.mark_calls and conv_key not in self.clear_calls
+
     def mark_voice_inbound(self, *, conv_key: str) -> None:
         self.mark_calls.append(conv_key)
 

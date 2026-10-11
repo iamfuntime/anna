@@ -25,7 +25,7 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from anna.config import AnnaConfig, load_config
+from anna.config import AnnaConfig, effective_restart_unit, load_config
 from anna.log import get_logger
 from anna_web import audit as web_audit
 from anna_web import integrations as web_integrations
@@ -40,7 +40,9 @@ from anna_web.routes import (
     dashboard_routes,
     delegation_routes,
     env_routes,
+    google_routes,
     healthz_routes,
+    ops_routes,
     restart_routes,
     schedule_routes,
     settings_routes,
@@ -95,7 +97,7 @@ def create_app(cfg: AnnaConfig) -> FastAPI:
     app.state.env_store = env_store
     schedule_store = ScheduleStoreAdapter(anna_home=cfg.anna_home, config=cfg)
     app.state.schedule_store = schedule_store
-    restart_manager = RestartManager(target_unit=cfg.web.target_unit)
+    restart_manager = RestartManager(target_unit=effective_restart_unit(cfg))
     app.state.restart_manager = restart_manager
     # One AuditReader per process (MC-02): its (mtime, size)-keyed parse
     # cache lives on app.state so an unchanged audit file costs one
@@ -116,7 +118,8 @@ def create_app(cfg: AnnaConfig) -> FastAPI:
     # from any page (Home + Config) without each route threading the unit name
     # through its context, and so the config editor can flag a non-loopback
     # web.host bind inline. Both reuse cfg/metadata already on hand here.
-    templates.env.globals["restart_unit"] = cfg.web.target_unit
+    templates.env.globals["restart_unit"] = restart_manager.target_unit or "(restart disabled)"
+    templates.env.globals["restart_disabled"] = restart_manager.disabled
     templates.env.globals["is_non_loopback_host"] = config_routes.is_non_loopback_host
     # Optional-integration nav gating (mission-control subtask 8):
     # base.html renders one nav <li> per entry, so a disabled
@@ -124,6 +127,9 @@ def create_app(cfg: AnnaConfig) -> FastAPI:
     # construction — gates are restart-applied like all anna.yaml
     # config, so per-request recomputation would buy nothing.
     templates.env.globals["integration_nav"] = web_integrations.nav_entries(cfg)
+    # Memory nav hidden when the dashboard STARTED with memory.enabled=false; the /memory routes
+    # additionally re-read the flag on every request (see ops_routes._memory_enabled_now).
+    templates.env.globals["memory_nav"] = cfg.memory.enabled
     app.state.templates = templates
 
     # Vendored frontend assets (htmx.min.js + anna.css + app.js).
@@ -145,6 +151,8 @@ def create_app(cfg: AnnaConfig) -> FastAPI:
     app.include_router(env_routes.router)
     app.include_router(schedule_routes.router)
     app.include_router(healthz_routes.router)
+    app.include_router(ops_routes.router)
+    app.include_router(google_routes.router)
     app.include_router(restart_routes.router)
     app.include_router(settings_routes.router)
 

@@ -123,14 +123,21 @@ class RestartManager:
     influence which unit gets restarted.
     """
 
-    def __init__(self, *, target_unit: str) -> None:
+    def __init__(self, *, target_unit: str | None) -> None:
         # Pin the unit at construction. No setter, no kwarg on restart().
-        self._unit = target_unit
+        # ``None`` = restart disabled (e.g. an isolated trial home must not
+        # be able to restart the live anna.service): no dbus/systemctl call
+        # is ever made.
+        self._unit = target_unit or None
+
+    @property
+    def disabled(self) -> bool:
+        return self._unit is None
 
     @property
     def target_unit(self) -> str:
-        """The systemd user unit name this manager will restart."""
-        return self._unit
+        """The systemd user unit name this manager will restart ("" when disabled)."""
+        return self._unit or ""
 
     # ------------------------------------------------------------------
     # restart()
@@ -150,6 +157,11 @@ class RestartManager:
         ``error`` field so the route can render a toast instead of
         bubbling a 500 traceback into the operator's browser.
         """
+        if self._unit is None:
+            return RestartResult(
+                method="subprocess", job_id=None,
+                error="restart is disabled for this ANNA_HOME (set web.target_unit to a dedicated trial unit)",
+            )
         dbus_error: str | None = None
         try:
             job_id = await self._restart_via_dbus()
@@ -234,6 +246,8 @@ class RestartManager:
         ``timeout`` caps each path's wait so a wedged dbus call or a
         runaway ``systemctl`` doesn't pin the /healthz handler.
         """
+        if self._unit is None:
+            return {"active_state": "unknown", "method": "subprocess"}
         try:
             state = await asyncio.wait_for(self._active_state_via_dbus(), timeout=timeout)
             return {"active_state": state, "method": "dbus"}

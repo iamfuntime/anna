@@ -154,6 +154,19 @@ class TelegramAdapter(ChannelAdapter):
             self._application.updater.start_polling(),
             name="telegram.polling",
         )
+        # PTB's ``Updater.start_polling()`` is a *setup* coroutine: it returns
+        # once polling is established (the update fetch loop lives in
+        # internal tasks), so a finished ``_updater_task`` is the normal
+        # healthy state. Readiness is ``Updater.running``. Give setup a brief
+        # window to fail fast; a startup exception must reach the caller.
+        await asyncio.wait({self._updater_task}, timeout=0.05)
+        if self._updater_task.done():
+            task, self._updater_task = self._updater_task, None
+            exc = None if task.cancelled() else task.exception()
+            if exc is not None:
+                raise RuntimeError("telegram polling failed during startup") from exc
+            if not self._updater_running():
+                raise RuntimeError("telegram polling stopped during startup")
         self._connect_attempt += 1
         bot_username = ""
         try:
@@ -448,6 +461,10 @@ class TelegramAdapter(ChannelAdapter):
             is_dm=is_dm,
             is_thread=False,
             raw=raw,
+            human_origin=True,
+            voice_reply_expected=(
+                self._voice is not None and self._voice.voice_inbound_active(conv_key)
+            ),
         )
 
     # ------------------------------------------------------------------
@@ -607,8 +624,35 @@ class TelegramAdapter(ChannelAdapter):
     # Health
     # ------------------------------------------------------------------
 
+    def _updater_running(self) -> bool:
+        """True when PTB's updater reports it is polling (``Updater.running``)."""
+        updater = getattr(self._application, "updater", None)
+        return getattr(updater, "running", False) is True
+
+    def _receiver_alive(self) -> bool:
+        task = self._updater_task
+        if task is not None and task.done() and not task.cancelled():
+            if task.exception() is not None:
+                return False  # setup crashed
+        return self._updater_running()
+
+    async def health_detail(self) -> dict[str, Any]:
+        receiver = self._receiver_alive()
+        api_ok: bool | None = None
+        error = None
+        if self._application is not None:
+            try:
+                await self._application.bot.get_me()
+                api_ok = True
+            except Exception as exc:  # noqa: BLE001
+                api_ok, error = False, type(exc).__name__
+        return {"receiver_alive": receiver, "api_ok": api_ok, "error": error}
+
     async def health_check(self) -> bool:
         if self._application is None:
+            return False
+        if not self._receiver_alive():
+            self._log.warning("channel.receiver_stopped", channel="telegram")
             return False
         try:
             await self._application.bot.get_me()

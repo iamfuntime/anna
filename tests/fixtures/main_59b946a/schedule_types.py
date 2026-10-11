@@ -1,0 +1,111 @@
+# GOLDEN SNAPSHOT of origin/main 59b946a src/anna/runtime/schedule_types.py (only the validate_model_string import is stubbed).
+# It is the schedules.yaml data model of the build you roll back to. Do not "fix" it: update it only by re-snapshotting.
+"""Pydantic models for the Phase 2 scheduler.
+
+These types describe the on-disk shape of ``schedules.yaml`` and the
+in-memory shape the scheduler and the MCP tools pass around. ``Schedule``
+round-trips cleanly through ``model_dump`` / ``model_validate`` so the
+store can serialize directly to YAML.
+
+A ``Schedule`` always carries a resolved 5-field ``cron`` expression
+(croniter operates on it). ``natural_language`` is the human-typed
+string the operator passed at create time, preserved alongside the
+resolved cron for round-trip readability. If the operator passes
+``cron:`` directly, ``natural_language`` stays None.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Literal
+
+from pydantic import BaseModel, Field, field_validator
+
+def validate_model_string(v):  # stand-in for anna.config.validate_model_string (grammar not under test)
+    return v
+
+
+class ScheduleDestination(BaseModel):
+    """Where a scheduled task's output goes.
+
+    ``transport`` is the adapter name (``slack`` or ``telegram`` in
+    Phase 2). ``channel`` is the channel ID (Slack) or chat ID
+    (Telegram) the output posts to. Reserved-destination validation
+    (forbidding the admin channel) lives in the ScheduleStore, not on
+    this model, because it needs the AdminConfig to compare against.
+    """
+
+    transport: Literal["slack", "telegram"]
+    channel: str
+
+
+class ScheduleState(BaseModel):
+    """Mutable per-schedule state, updated by the scheduler at runtime.
+
+    ``consecutive_failures`` resets to zero on every success and
+    increments on every failure. At ``config.scheduler.failure_threshold``
+    the schedule auto-disables.
+    """
+
+    last_fired_at: datetime | None = None
+    last_status: Literal["complete", "fail", "timeout"] | None = None
+    consecutive_failures: int = 0
+
+
+class Schedule(BaseModel):
+    """A persistent scheduled task.
+
+    The runtime polls the schedule store, identifies schedules whose
+    next-fire time has passed (per ``cron`` plus ``timezone`` against
+    ``state.last_fired_at`` or ``created_at`` for first fires), and
+    dispatches each as a synthetic ``InboundEvent`` through the
+    conversation router. The worker's final reply routes to
+    ``destination`` via the corresponding ChannelAdapter.
+
+    ``ephemeral`` (default False) opts the schedule into ephemeral
+    fires: the dispatched event sets ``InboundEvent.ephemeral`` so the
+    worker skips the resume-context injection (recent-checkpoints block
+    and unsaved conversation tail) that otherwise accumulates across the
+    per-day conv_key of a frequent heartbeat schedule. Omitted in legacy
+    ``schedules.yaml`` entries, where it defaults to False — preserving
+    the existing non-ephemeral behavior for every schedule that does not
+    opt in.
+
+    ``gate_command`` (default None) is an optional argv the scheduler runs
+    as a cheap pre-flight before each fire. Exit code 0 means "nothing to
+    do, skip this tick"; ANY other outcome — nonzero exit, timeout, crash,
+    missing binary — fires the schedule normally. None (the default, and
+    the value for every legacy ``schedules.yaml`` entry) means no gate and
+    no subprocess: the fire proceeds exactly as it does today. It is an
+    argv list rather than a shell string so no shell ever interprets it.
+    See :meth:`anna.runtime.scheduler.Scheduler._consult_gate`.
+
+    ``model`` (default None) pins the Claude model this schedule's fires
+    run on, in place of the global ``runtime.model``. Same grammar as
+    ``runtime.model`` (a tier alias such as ``sonnet`` or a full model ID),
+    validated by the same :func:`anna.config.validate_model_string`. It is
+    carried on the dispatched ``InboundEvent`` and bound to the fire's own
+    worker (conv_key ``schedule:<id>:<date>``) at spawn, so it never touches
+    the persistent DM / conversation sessions or the global config. None
+    (the default, and the value for every legacy entry) keeps today's
+    behavior exactly: the fire runs on ``runtime.model``.
+    """
+
+    id: str
+    natural_language: str | None = None
+    cron: str
+    timezone: str = "America/New_York"
+    prompt: str
+    destination: ScheduleDestination
+    timeout_seconds: int = 300
+    enabled: bool = True
+    ephemeral: bool = False
+    gate_command: list[str] | None = None
+    model: str | None = None
+    created_at: datetime
+    state: ScheduleState = Field(default_factory=ScheduleState)
+
+    @field_validator("model")
+    @classmethod
+    def _validate_model(cls, v: str | None) -> str | None:
+        return validate_model_string(v)

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 from pathlib import Path
 
 from anna.vault.transcript_resume import (
@@ -158,8 +158,9 @@ def test_multi_day_reads_two_files(tmp_path: Path) -> None:
     )
     result = transcript_tail_since(tmp_path, CONV_KEY, None, 8, 1500)
     texts = [o["text"] for o in result]
-    # Only the two newest daily files are read; day1 is excluded.
-    assert texts == ["day2 q", "day2 a", "day3 q"]
+    # Uncovered history remains retrievable across rotation; bounded trimming,
+    # not filename age, decides what is injected.
+    assert texts == ["very old day1", "day2 q", "day2 a", "day3 q"]
 
 
 def test_multi_day_chronological_order(tmp_path: Path) -> None:
@@ -370,3 +371,100 @@ def test_render_delivered_posts_caps_characters() -> None:
     assert omitted == 2
     assert lines[0] == "(2 earlier posts omitted)"
     assert lines[1].endswith(": " + "c" * 20 + "...")
+
+
+# ---------------------------------------------------------------------------
+# Legacy (main-build) checkpoint cutoff
+# ---------------------------------------------------------------------------
+
+import os  # noqa: E402
+
+from anna.vault.checkpoint import write_checkpoint  # noqa: E402
+from anna.vault.transcript_resume import (  # noqa: E402
+    legacy_checkpoint_cutoff,
+    uncovered_sequences_before,
+)
+
+_MAIN_FRONTMATTER = (
+    "---\ncreated: 2026-09-01\ntags:\n  - domain/anna\n  - type/checkpoint\n"
+    "transport: slack\nconversation_key: slack:dm:USP2QLB41\ncheckpoint_kind: {kind}\n---\n\n"
+    "# Checkpoint\n\nsummary\n"
+)
+_STAMP = datetime(2026, 9, 1, 12, 0, 0, tzinfo=UTC).timestamp()
+
+
+def _plant(vault: Path, name: str, text: str | None = None, kind: str = "closeout") -> Path:
+    d = vault / "Conversations" / SAFE_KEY
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / name
+    p.write_text(text if text is not None else _MAIN_FRONTMATTER.format(kind=kind), encoding="utf-8")
+    return p
+
+
+def test_main_second_granular_closeout_and_periodic_stamps(tmp_path: Path) -> None:
+    _plant(tmp_path, "2026-09-01-120000.md")
+    assert legacy_checkpoint_cutoff(tmp_path, CONV_KEY, now=_STAMP + 60) == _STAMP
+    _plant(tmp_path, "2026-09-01-120500.md", kind="periodic")
+    assert legacy_checkpoint_cutoff(tmp_path, CONV_KEY, now=_STAMP + 600) == _STAMP + 300
+
+
+def test_older_minute_only_stamp(tmp_path: Path) -> None:
+    _plant(tmp_path, "2026-09-01-1200.md")
+    assert legacy_checkpoint_cutoff(tmp_path, CONV_KEY, now=_STAMP + 60) == _STAMP
+
+
+def test_mtime_caps_cutoff_and_future_stamp_ignored(tmp_path: Path) -> None:
+    p = _plant(tmp_path, "2026-09-01-120000.md")
+    os.utime(p, (_STAMP - 500, _STAMP - 500))  # stamp ahead of its own mtime: tampered/odd, not coverage
+    assert legacy_checkpoint_cutoff(tmp_path, CONV_KEY, now=_STAMP + 60) is None
+    os.utime(p, (_STAMP + 9999, _STAMP + 9999))  # restored/copied later mtime ignored
+    assert legacy_checkpoint_cutoff(tmp_path, CONV_KEY, now=_STAMP + 60) == _STAMP
+    assert legacy_checkpoint_cutoff(tmp_path, CONV_KEY, now=_STAMP - 3600) is None  # stamp in the future
+
+
+def test_no_cutoff_for_new_style_malformed_missing_or_odd_names(tmp_path: Path) -> None:
+    assert legacy_checkpoint_cutoff(tmp_path, CONV_KEY, now=_STAMP) is None  # no checkpoint
+    _plant(tmp_path, "2026-09-01-120000-" + "a" * 32 + ".md",
+           "---\ncoverage_end_sequence: nope\n---\n# Checkpoint\n")
+    assert legacy_checkpoint_cutoff(tmp_path, CONV_KEY, now=_STAMP + 60) is None  # malformed new-style
+    _plant(tmp_path, "2026-09-01-120100.md", "")  # empty legacy-looking file is not main format
+    assert legacy_checkpoint_cutoff(tmp_path, CONV_KEY, now=_STAMP + 120) is None
+    _plant(tmp_path, "2026-09-01-120200.md", "# Checkpoint\n\nhand-made note\n")  # arbitrary markdown
+    assert legacy_checkpoint_cutoff(tmp_path, CONV_KEY, now=_STAMP + 180) is None
+    _plant(tmp_path, "2026-09-01-999999x.md")
+    assert legacy_checkpoint_cutoff(tmp_path, CONV_KEY, now=_STAMP + 120) is None  # unparseable name
+    _plant(tmp_path, "2026-13-45-250000.md")
+    assert legacy_checkpoint_cutoff(tmp_path, CONV_KEY, now=_STAMP + 120) is None  # invalid date
+
+
+def test_new_build_checkpoint_never_gets_time_cutoff(tmp_path: Path) -> None:
+    p = write_checkpoint(vault_root=tmp_path, transport="slack", conversation_key=CONV_KEY,
+                         summary="s", coverage_end_sequence=3, coverage_end_event_id="b" * 32)
+    assert p.exists()
+    assert legacy_checkpoint_cutoff(tmp_path, CONV_KEY) is None
+
+
+def test_tail_drops_legacy_covered_keeps_uncovered_and_tsless(tmp_path: Path) -> None:
+    objs = []
+    for i in range(10):  # ten already-checkpointed legacy exchanges (no sequence)
+        objs += [_line(_STAMP - 1000 + i * 10, "inbound", f"q{i}"),
+                 _line(_STAMP - 1000 + i * 10 + 1, "outbound", f"a{i}")]
+    objs.append(_line(_STAMP + 5, "inbound", "after"))
+    objs.append({"direction": "outbound", "text": "no timestamp"})
+    _write_day(tmp_path, "2026-09-01", objs)
+    out = transcript_tail_since(tmp_path, CONV_KEY, None, 8, 1500, covered_through_ts=_STAMP)
+    assert [o["text"] for o in out] == ["after", "no timestamp"]
+    # without the cutoff the legacy exchanges are replayed (the reported bug)
+    assert len(transcript_tail_since(tmp_path, CONV_KEY, None, 8, 1500)) > 4
+
+
+def test_sequenced_events_after_legacy_cutoff_retained_and_gap_ignores_covered(tmp_path: Path) -> None:
+    objs = [_line(_STAMP - 10, "inbound", "old legacy"),
+            {**_line(_STAMP - 5, "inbound", "old sequenced"), "sequence": 1, "event_id": "a" * 32},
+            {**_line(_STAMP + 5, "inbound", "new sequenced"), "sequence": 2, "event_id": "b" * 32}]
+    _write_day(tmp_path, "2026-09-01", objs)
+    out = transcript_tail_since(tmp_path, CONV_KEY, None, 8, 1500, covered_through_ts=_STAMP)
+    # Time only ever hides UNSEQUENCED lines: sequenced events need explicit coverage.
+    assert [o["text"] for o in out] == ["old sequenced", "new sequenced"]
+    assert uncovered_sequences_before(tmp_path, CONV_KEY, 3, None) == [-1, 1, 2]
+    assert uncovered_sequences_before(tmp_path, CONV_KEY, 3, None, covered_through_ts=_STAMP) == [1, 2]

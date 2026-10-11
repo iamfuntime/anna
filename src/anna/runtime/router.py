@@ -160,6 +160,15 @@ class ConversationRouter:
 
     async def dispatch(self, event: InboundEvent) -> None:
         """Subscribe target. Called by every ChannelAdapter for inbound events."""
+        # Preserve the concrete inbound address before identity aliasing turns
+        # the worker key into ``user:<canonical>``.  A shared owner worker is
+        # state, not a channel-bound reply endpoint.
+        if event.reply_transport is None:
+            event = dataclasses.replace(
+                event,
+                reply_transport=event.transport,
+                reply_conversation_key=event.conversation_key,
+            )
         # Phase 2 §5 identity aliasing: rewrite the conv_key before any
         # downstream consumer (transcript writer, worker registry) sees
         # it. Non-matched events flow through unchanged.
@@ -175,7 +184,7 @@ class ConversationRouter:
             event = dataclasses.replace(event, conversation_key=new_key)
 
         # Transcript: inbound line.
-        transcript_event(
+        persisted = transcript_event(
             channel=event.transport,
             conv_key=event.conversation_key,
             transcripts_dir=self._config.transcripts_dir,
@@ -186,6 +195,11 @@ class ConversationRouter:
             is_dm=event.is_dm,
             is_thread=event.is_thread,
         )
+        if persisted is not None:
+            raw = dict(event.raw)
+            raw["anna_transcript_sequence"] = persisted["sequence"]
+            raw["anna_transcript_event_id"] = persisted["event_id"]
+            event = dataclasses.replace(event, raw=raw)
 
         worker = await self._get_or_spawn_worker(event)
         self._log.debug(
@@ -294,7 +308,7 @@ class ConversationRouter:
                 transport=event.transport,
                 config=self._config,
                 supervisor=self._supervisor,
-                send=self._send_factory(event.transport),
+                send=self._send_factory(),
                 on_idle_close=self._idle_close_callback,
                 adapters=self._adapters,
                 schedule_store=self._schedule_store,
@@ -338,15 +352,18 @@ class ConversationRouter:
             reason="idle",
         )
 
-    def _send_factory(self, transport: str) -> SendCallback:
-        """Build a per-transport send callback the worker can invoke."""
-        adapter = self._adapters[transport]
+    def _send_factory(self) -> SendCallback:
+        """Build a reply-address-aware callback for a shared worker."""
 
         async def _send(message: OutboundMessage) -> None:
+            transport = message.transport
+            if transport is None:
+                raise RuntimeError("outbound message has no reply transport")
+            adapter = self._adapters[transport]
             await adapter.send(message)
             transcript_event(
                 channel=transport,
-                conv_key=message.conversation_key,
+                conv_key=message.transcript_conversation_key or message.conversation_key,
                 transcripts_dir=self._config.transcripts_dir,
                 direction="outbound",
                 text=message.text,

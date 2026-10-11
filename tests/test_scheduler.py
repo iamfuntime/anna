@@ -635,9 +635,13 @@ async def test_scheduled_post_to_dm_recorded_in_dm_transcript(tmp_path: Path) ->
     assert rows[0]["text"] == alert
     assert rows[0]["source"] == "schedule:heartbeat"
 
-    complete = _events(_read_audit_records(cfg.audit_dir), "audit.schedule.complete")
+    audits = _read_audit_records(cfg.audit_dir)
+    complete = _events(audits, "audit.schedule.complete")
     assert complete[0]["suppressed"] is False
-    assert complete[0]["recorded_conv_key"] == f"slack:dm:{DM_USER}"
+    # Execution is recorded before delivery in the ledger design, so the
+    # recording is its own audit row rather than a field on ``complete``.
+    recorded = _events(audits, "audit.schedule.delivered_post_recorded")
+    assert recorded[0]["recorded_conv_key"] == f"slack:dm:{DM_USER}"
 
 
 @pytest.mark.parametrize(
@@ -687,7 +691,7 @@ async def test_failed_send_to_dm_not_recorded(tmp_path: Path) -> None:
     assert _dm_transcript_rows(cfg) == []
     audits = _read_audit_records(cfg.audit_dir)
     assert _events(audits, "audit.schedule.fail")
-    assert not _events(audits, "audit.schedule.complete")
+    assert not _events(audits, "audit.schedule.delivered_post_recorded")
 
 
 @pytest.mark.asyncio

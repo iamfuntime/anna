@@ -1,0 +1,72 @@
+{% extends "base.html" %}
+{% block title %}Google — ANNA Dashboard{% endblock %}
+{% block content %}
+  <h1>Google accounts</h1>
+  <p><small>Connect Gmail and Calendar (read-only) through Google's own consent screen. This page runs on this
+    machine only. <strong>What this does not do:</strong> it does not register an app for you (you create one Desktop
+    OAuth client in your own Google Cloud project, once, and every mailbox shares it) and it does not make your app
+    "verified" by Google — an unverified External app shows a warning at consent and, while in Testing, refresh tokens
+    expire after 7 days. Workspace accounts work as user OAuth if your admin allows the app.</small></p>
+  {% if msg %}<p role="status"><strong>{{ msg }}</strong></p>{% endif %}
+  {% if error %}<p role="alert"><strong>{{ error }}</strong></p>{% endif %}
+  {% if not enabled %}<p role="alert">google.enabled is false in anna.yaml: the daemon does not use these accounts until you enable it in Config and restart the daemon.</p>{% endif %}
+  {% if not daemon_seen %}<p role="alert">The daemon has not reported in: connects still save a token, but verification and cache refresh wait until it runs.</p>{% endif %}
+  {% if remote_hint %}<p role="alert">You are not browsing from this machine, so the Connect button is disabled: the consent callback only listens on this computer.</p>{% endif %}
+
+  <article class="panel"><header><strong>Shared OAuth client</strong></header>
+    {% if client.present %}
+      <p>Imported{% if client.client_id_suffix %} (…{{ client.client_id_suffix }}){% endif %}{% if client.private == false %} — <strong>permissions are too open, run chmod 600</strong>{% endif %}. All accounts use it.</p>
+    {% else %}
+      <p>None yet. Download a <strong>Desktop app</strong> OAuth client JSON from Google Cloud (APIs &amp; Services → Credentials), then import it once by path (it must be inside your home folder).</p>
+    {% endif %}
+    <form method="post" action="/google/client">
+      <label>Path to client JSON <input name="path" placeholder="/home/you/Downloads/client_secret_….json" required></label>
+      {% if client.present %}<label><input type="checkbox" name="replace" value="yes"> replace the existing client</label>{% endif %}
+      <button type="submit">Import</button></form>
+  </article>
+
+  {% if active %}<p role="status">A connection for <code>{{ active.slug }}</code> is in progress: <a href="/google/connect/{{ active.id }}">continue</a>.</p>{% endif %}
+
+  {% for r in rows %}
+  <article class="panel" id="acct-{{ r.acct.slug }}">
+    <header><strong>{{ r.acct.slug }}</strong> · {{ r.acct.email }} · {{ r.acct.auth_type }} · services: {{ r.acct.services | join(', ') }}</header>
+    {% if r.acct.auth_type == 'oauth' %}
+      <p>Token: {% if r.token.present %}saved{% if r.token.private == false %} (<strong>file permissions too open</strong>){% endif %}{% else %}not connected{% endif %}
+        {% if r.token.present and r.token.missing_scopes %} — missing permissions for: reconnect required{% endif %}
+        {% if not r.client_ok %} · no OAuth client available{% endif %}</p>
+      <p>Last daemon verification:
+        {% if r.verify %}{{ r.verify.status }}{% if r.verify_parsed %} — identity <strong>{{ r.verify_parsed.identity }}</strong>; {% for k, v in r.verify_parsed.services.items() %}{{ k }}: {{ v }} {% endfor %}{% elif r.verify.result %} — {{ r.verify.result }}{% endif %}
+        {% else %}never{% endif %}</p>
+      <form method="post" action="/google/accounts/{{ r.acct.slug }}/connect" style="display:inline">
+        <button type="submit"{% if remote_hint %} disabled{% endif %}>{{ 'Reconnect' if r.token.present else 'Connect' }}</button></form>
+      <form method="post" action="/google/accounts/{{ r.acct.slug }}/verify" style="display:inline"><button type="submit">Verify (daemon, live)</button></form>
+      <details><summary>Services</summary>
+        <form method="post" action="/google/accounts/{{ r.acct.slug }}/services">
+          {% for s in ['gmail', 'calendar'] %}<label><input type="checkbox" name="services" value="{{ s }}"{% if s in r.acct.services %} checked{% endif %}> {{ s }} (read-only)</label> {% endfor %}
+          <button type="submit">Save to anna.yaml</button> <small>Changes nothing until you reconnect and restart the daemon.</small></form></details>
+      <details><summary>Remove / revoke</summary>
+        <p><small><strong>Remove locally</strong> deletes the token file here; Google still considers the app authorized until you revoke it.
+          <strong>Revoke</strong> asks Google to cancel the grant (this contacts Google), then deletes the local token.</small></p>
+        <form method="post" action="/google/accounts/{{ r.acct.slug }}/remove">
+          <select name="mode"><option value="token">remove token only</option><option value="token_and_config">remove token and anna.yaml entry</option></select>
+          <label>type <code>REMOVE {{ r.acct.slug }}</code> <input name="confirm" autocomplete="off"></label><button type="submit">Remove locally</button></form>
+        <form method="post" action="/google/accounts/{{ r.acct.slug }}/revoke">
+          <label>type <code>REVOKE {{ r.acct.slug }}</code> <input name="confirm" autocomplete="off"></label><button type="submit">Revoke at Google</button></form></details>
+    {% else %}<p>Service-account (Workspace delegation) accounts are managed in anna.yaml; no browser flow applies.</p>{% endif %}
+  </article>
+  {% else %}<p>No Google accounts configured yet.</p>{% endfor %}
+
+  <article class="panel"><header><strong>Add an account</strong></header>
+    <p><small>Edits anna.yaml (a restart of the daemon is required before it is used; this page never restarts anything). Permissions are only the services you tick, read-only.</small></p>
+    <form method="post" action="/google/accounts">
+      <label>Slug (a-z, 0-9, _) <input name="slug" pattern="[a-z0-9_]{1,32}" required></label>
+      <label>Email <input name="email" type="email" required></label>
+      <label><input type="checkbox" name="services" value="gmail" checked> Gmail (read-only)</label>
+      <label><input type="checkbox" name="services" value="calendar" checked> Calendar (read-only)</label>
+      <button type="submit">Add</button></form>
+  </article>
+  <p><small>Browsing this dashboard from another computer (for example over an SSH tunnel)? The Connect button needs the
+    consent callback port too. Set <code>google.oauth_callback_port</code> (currently {{ callback_port or 'random — not tunnel-able' }}) and forward both ports:
+    <code>ssh -L {{ web_port }}:127.0.0.1:{{ web_port }}{% if callback_port %} -L {{ callback_port }}:127.0.0.1:{{ callback_port }}{% endif %} you@host</code>.
+    With a random callback port, run the consent on the machine itself.</small></p>
+{% endblock %}

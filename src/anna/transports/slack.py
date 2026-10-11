@@ -136,6 +136,14 @@ class SlackAdapter(ChannelAdapter):
             self._handler.start_async(),
             name="slack.socket_mode",
         )
+        await asyncio.sleep(0)
+        if self._handler_task.done():
+            exc = self._handler_task.exception()
+            if exc is not None:
+                self._handler_task = None
+                raise RuntimeError("slack socket receiver failed during startup") from exc
+            self._handler_task = None
+            raise RuntimeError("slack socket receiver stopped during startup")
         # COUPLING: scripts/migrate-to-uv-tool.sh greps journalctl for this
         # exact "channel.connected" event (with channel="slack") as its
         # post-migration transport gate, and the setup wizard's readiness
@@ -244,7 +252,7 @@ class SlackAdapter(ChannelAdapter):
                 # pass through untouched. This is the single shared send path
                 # the slack_post MCP tool also routes through, so report cards
                 # and skill posts are normalized here too.
-                mrkdwn_text = normalize_to_slack_mrkdwn(message.text)
+                mrkdwn_text = message.text if message.plain else normalize_to_slack_mrkdwn(message.text)
                 # Length splitting (Inbox/2026-06-04 plan, decision C): a
                 # single oversized reply is posted as a sequence of messages
                 # under Slack's practical cap instead of being degraded. Most
@@ -554,6 +562,10 @@ class SlackAdapter(ChannelAdapter):
             is_thread=is_thread,
             raw=event,
             images=images,
+            human_origin=True,
+            voice_reply_expected=(
+                self._voice is not None and self._voice.voice_inbound_active(conv_key)
+            ),
         )
 
     # ------------------------------------------------------------------
@@ -1281,8 +1293,27 @@ class SlackAdapter(ChannelAdapter):
     # Health
     # ------------------------------------------------------------------
 
+    async def health_detail(self) -> dict[str, Any]:
+        receiver = self._handler_task is not None and not self._handler_task.done()
+        api_ok: bool | None = None
+        error = None
+        if self._client is not None:
+            try:
+                api_ok = bool((await self._client.auth_test()).get("ok", False))
+            except Exception as exc:  # noqa: BLE001
+                api_ok, error = False, type(exc).__name__
+        return {"receiver_alive": receiver, "api_ok": api_ok, "error": error}
+
     async def health_check(self) -> bool:
         if self._client is None:
+            return False
+        if self._handler_task is None or self._handler_task.done():
+            if self._handler_task is not None and not self._handler_task.cancelled():
+                self._log.warning(
+                    "channel.receiver_stopped",
+                    channel="slack",
+                    error=str(self._handler_task.exception()),
+                )
             return False
         try:
             response = await self._client.auth_test()

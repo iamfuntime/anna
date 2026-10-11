@@ -52,7 +52,7 @@ from prompt_toolkit.history import FileHistory
 from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.shortcuts import print_formatted_text
 
-from anna.config import load_config
+from anna.config import load_config, refuse_foreign_home
 
 # Protocol version this client speaks. Mirrored in the ``hello`` frame and
 # checked against the daemon's ``ack.protocol_version`` reply.
@@ -504,6 +504,8 @@ def main() -> int:
         config = load_config()
     except Exception as exc:
         sys.stderr.write(f"anna chat: failed to load config: {exc}\n")
+        return 2
+    if refuse_foreign_home(config, "anna chat"):
         return 2
 
     socket_path = config.transports.cli.resolved_socket_path

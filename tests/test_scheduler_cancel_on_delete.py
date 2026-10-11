@@ -92,6 +92,7 @@ def _make_config(tmp_path: Path) -> AnnaConfig:
     cfg.scheduler.state_path = str(tmp_path / "schedules.yaml")
     cfg.scheduler.poll_interval_seconds = 0
     cfg.scheduler.failure_threshold = 3
+    cfg.scheduler.cancel_grace_seconds = 0.05
     cfg.logging.audit.fsync_on_write = False
     return cfg
 
@@ -216,8 +217,8 @@ async def test_delete_cancels_all_queued_tasks(tmp_path: Path) -> None:
     for _ in range(2):
         schedule = store.get("victim")
         assert schedule is not None
-        schedule.state = ScheduleState()
-        await sched._poll_once()
+        sched._spawn(schedule, sched._ledger.create_manual(
+            schedule_id="victim", job_kind="agent_prompt", run_safety="side_effecting"))
     await asyncio.sleep(0.02)  # let queued tasks start and park on the semaphore
 
     tasks = list(sched._tasks_by_schedule["victim"])

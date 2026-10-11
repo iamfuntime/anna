@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}Health — ANNA Dashboard{% endblock %}
+{% block content %}
+  <h1>Health</h1>
+  <p><small>The same offline, read-only report as <code>anna doctor</code> ({{ report.generated_at }}).
+    Nothing here calls Google, Slack, Telegram or a model. <strong>"not verified" is never shown as healthy</strong>:
+    a subsystem is green only when the running daemon actually observed it working. Overall:
+    <span class="status-badge" data-state="{{ 'up' if report.overall == 'ok' else 'down' }}">{{ report.overall }}</span>
+    · <a href="/health.json">JSON</a></small></p>
+  <section class="dashboard-grid">
+    {% for c in report.checks %}
+    <article class="panel" id="check-{{ c.id }}">
+      <header><strong>{{ c.title }}</strong></header>
+      <p><span class="status-badge" data-state="{{ 'up' if c.status in ('ok', 'disabled') else 'down' }}">{{ c.status }}</span>
+        {{ c.summary }}</p>
+      {% if c.action %}<p><small>Next step: {{ c.action }}</small></p>{% endif %}
+      {% if c.id in ('runs', 'outbox') and c.status != 'ok' %}<a href="/repairs" class="button" role="button">Open repairs</a>{% endif %}
+      {% if c.id == 'memory' %}<a href="/memory" class="button" role="button">Manage memory</a>{% endif %}
+    </article>
+    {% endfor %}
+  </section>
+{% endblock %}

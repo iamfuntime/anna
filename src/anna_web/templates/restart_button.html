@@ -105,6 +105,12 @@
     })();
   </script>
 </div>
+{% elif (disabled is defined and disabled) or (disabled is not defined and restart_disabled) %}
+<div class="restart-form" data-restart-partial="disabled">
+  <button type="button" class="restart-button contrast" disabled>Restart disabled</button>
+  <small class="restart-error" role="note">Restart is disabled for this ANNA_HOME so a trial can never restart the live
+    anna.service. Set <code>web.target_unit</code> to a dedicated unit to enable it, or restart your trial daemon by hand.</small>
+</div>
 {% else %}
 <form class="restart-form"
       data-restart-partial="idle"

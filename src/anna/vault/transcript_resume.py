@@ -24,7 +24,8 @@ a bounded listing the worker prepends to the next operator turn.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+import re
+from datetime import UTC, datetime
 from pathlib import Path
 
 from anna.core.identity import count_tokens
@@ -50,6 +51,329 @@ def latest_checkpoint_mtime(vault_root: Path, conv_key: str) -> float | None:
     return recent[0].stat().st_mtime
 
 
+_COVERAGE_SEQUENCE_RE = re.compile(r"^coverage_end_sequence:\s*(\d+)\s*$", re.MULTILINE)
+_COVERAGE_EVENT_RE = re.compile(r"^coverage_end_event_id:\s*([0-9a-f]{32})\s*$", re.MULTILINE)
+
+
+def _frontmatter(text: str) -> str:
+    """The leading ``---`` frontmatter block only; "" when absent.
+
+    Checkpoint bodies are LLM-written and may quote untrusted text, so no
+    coverage / provenance key is ever read from outside the frontmatter.
+    """
+    if not text.startswith("---\n"):
+        return ""
+    end = text.find("\n---\n", 4)
+    return text[4:end] if end >= 0 else ""
+
+
+def latest_checkpoint_coverage(vault_root: Path, conv_key: str) -> int | None:
+    """Return validated explicit checkpoint coverage, never a file timestamp.
+
+    Checkpoints predating coverage metadata remain useful prompt context but
+    are deliberately treated as covering nothing.  This also makes copied or
+    restored file mtimes irrelevant to transcript recovery.
+    """
+    for path in list_recent_checkpoints(vault_root=vault_root, conversation_key=conv_key, limit=1000):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        front = _frontmatter(text)
+        sequence = _COVERAGE_SEQUENCE_RE.search(front)
+        event_id = _COVERAGE_EVENT_RE.search(front)
+        if sequence is not None and event_id is not None:
+            value = int(sequence.group(1))
+            if value > 0:
+                return value
+    return None
+
+
+# Exact filenames of the supported ``main`` checkpoint writer: second-granular
+# ``YYYY-MM-DD-HHMMSS.md`` (or the older minute-only ``HHMM``), with NO uuid
+# suffix.  The coverage-aware build always appends ``-<uuid>``, so a uuid name
+# is new-build provenance and is never a legacy time boundary.
+_LEGACY_STAMP_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})-(\d{2})(\d{2})(\d{2})?\.md$")
+_NEW_STAMP_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})-(\d{2})(\d{2})(\d{2})-[0-9a-f]{32}\.md$")
+_COVERAGE_KEY_RE = re.compile(r"^(?:coverage_[a-z_]+|checkpoint_schema):", re.MULTILINE)
+_LEGACY_MARKER_RE = re.compile(r"^coverage_legacy_cutoff_ts:\s*(\d{1,12}(?:\.\d{1,6})?)\s*$", re.MULTILINE)
+_FRONTMATTER_CREATED_RE = re.compile(r"^created:\s*(\d{4}-\d{2}-\d{2})\s*$", re.MULTILINE)
+# Tolerance for filesystem timestamp rounding only; a stamp ahead of the file's
+# own mtime (or of now) by more than this is a tampered/odd file, not coverage.
+_FUTURE_SKEW_SECONDS = 2.0
+
+
+def _stamp_epoch(match: re.Match[str]) -> float | None:
+    year, month, day, hour, minute, second = match.groups()
+    try:
+        return datetime(
+            int(year), int(month), int(day), int(hour), int(minute), int(second or 0), tzinfo=UTC
+        ).timestamp()
+    except ValueError:
+        return None
+
+
+def _is_main_format(path: Path, text: str, match: re.Match[str]) -> bool:
+    """True only for a checkpoint shaped like the supported ``main`` writer's output."""
+    if not text.startswith("---\n"):
+        return False
+    end = text.find("\n---\n", 4)
+    if end < 0:
+        return False
+    front = text[4:end]
+    if _COVERAGE_KEY_RE.search(front):
+        return False
+    if "\n  - type/checkpoint\n" not in "\n" + front + "\n":
+        return False
+    created = _FRONTMATTER_CREATED_RE.search(front)
+    return created is not None and created.group(1) == "-".join(match.groups()[:3])
+
+
+def _legacy_file_cutoff(path: Path, now: float) -> float | None:
+    match = _LEGACY_STAMP_RE.match(path.name)
+    if match is None:
+        return None
+    stamp = _stamp_epoch(match)
+    if stamp is None:
+        return None
+    try:
+        text = path.read_text(encoding="utf-8")
+        mtime = path.stat().st_mtime
+    except (OSError, UnicodeDecodeError):
+        return None
+    if stamp > now + _FUTURE_SKEW_SECONDS or stamp > mtime + _FUTURE_SKEW_SECONDS:
+        return None
+    if not _is_main_format(path, text, match):
+        return None
+    return min(stamp, mtime)
+
+
+def _marker_cutoff(path: Path, text: str, now: float) -> float | None:
+    """The migration marker a coverage-bearing new-build checkpoint carries forward."""
+    match = _NEW_STAMP_RE.match(path.name)
+    marker = _LEGACY_MARKER_RE.search(_frontmatter(text))
+    if match is None or marker is None:
+        return None
+    stamp = _stamp_epoch(match)
+    if stamp is None:
+        return None
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return None
+    value = float(marker.group(1))
+    # A marker can only claim time that had already passed when the file was written.
+    if value > stamp + 1.0 + _FUTURE_SKEW_SECONDS or value > mtime + _FUTURE_SKEW_SECONDS:
+        return None
+    if value > now + _FUTURE_SKEW_SECONDS:
+        return None
+    return value
+
+
+def legacy_checkpoint_cutoff(vault_root: Path, conv_key: str, *, now: float | None = None) -> float | None:
+    """Epoch boundary below which UNSEQUENCED (``main``-era) transcript lines are summarized.
+
+    Builds before the explicit-coverage ledger (``main``) wrote checkpoints
+    with no ``coverage_*`` keys and transcript lines with no ``sequence``, and
+    resumed by "events newer than the checkpoint". Without a boundary every
+    new session replays up to ``tail_max_turns`` exchanges those checkpoints
+    already summarized.
+
+    The boundary is the maximum of two independently trusted sources:
+
+    * the newest checkpoint of EXACT supported ``main`` format - an
+      uuid-less ``YYYY-MM-DD-HHMMSS.md`` name whose frontmatter is the main
+      writer's and carries no ``coverage_*`` / ``checkpoint_schema`` key. The
+      coverage-aware build always writes a uuid name and ``checkpoint_schema``,
+      so its periodic and coverage-less closeout checkpoints are never legacy
+      provenance. A stamp ahead of the file's mtime or of now (tampered, stray
+      or future-dated) disqualifies that file (the next older one is tried);
+    * the ``coverage_legacy_cutoff_ts`` migration marker of the newest
+      new-build checkpoint that carries explicit coverage. The closeout that
+      summarized legacy lines it was shown advances and carries this forward,
+      so the boundary survives any number of later resumes without leaning on
+      a single newest file.
+
+    The boundary only ever hides lines that have no ``sequence`` and a
+    parseable ``ts`` (see :func:`transcript_tail_since`); sequenced events are
+    governed by explicit coverage alone. Anything unreadable, unparseable or
+    unrecognised yields no boundary (replay, never hide).
+    """
+    current = datetime.now(UTC).timestamp() if now is None else now
+    files = list_recent_checkpoints(vault_root=vault_root, conversation_key=conv_key, limit=1000)
+    cutoffs: list[float] = []
+    for path in files:
+        if _LEGACY_STAMP_RE.match(path.name):
+            value = _legacy_file_cutoff(path, current)
+            if value is not None:
+                cutoffs.append(value)
+                break
+    for path in files:
+        if not _NEW_STAMP_RE.match(path.name):
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        front = _frontmatter(text)
+        if _COVERAGE_SEQUENCE_RE.search(front) is None or _COVERAGE_EVENT_RE.search(front) is None:
+            continue
+        marker = _marker_cutoff(path, text, current)
+        if marker is not None:
+            cutoffs.append(marker)
+        break  # newest coverage-bearing checkpoint; it carries the marker forward
+    return max(cutoffs) if cutoffs else None
+
+
+def legacy_line_key(obj: dict) -> tuple[str, str, str]:
+    """Identity of an unsequenced transcript line (no ``event_id`` to key on)."""
+    return (str(obj.get("ts") or ""), str(obj.get("direction") or ""), str(obj.get("text") or ""))
+
+
+def validated_checkpoint_coverage(
+    vault_root: Path,
+    transcripts_dir: Path,
+    conv_key: str,
+) -> int | None:
+    """Return coverage only when its checkpoint event still exists in JSONL."""
+    base_dir = transcripts_dir / _safe_key(conv_key)
+    for path in list_recent_checkpoints(vault_root=vault_root, conversation_key=conv_key, limit=1000):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        front = _frontmatter(text)
+        sequence = _COVERAGE_SEQUENCE_RE.search(front)
+        event_id = _COVERAGE_EVENT_RE.search(front)
+        if sequence is None or event_id is None:
+            continue
+        value = int(sequence.group(1))
+        if value <= 0:
+            continue
+        for transcript in sorted(base_dir.glob("*.jsonl"), reverse=True):
+            try:
+                raw_lines = transcript.read_text(encoding="utf-8").splitlines()
+            except OSError:
+                continue
+            for raw in raw_lines:
+                try:
+                    obj = json.loads(raw)
+                except (ValueError, TypeError):
+                    continue
+                if (
+                    isinstance(obj, dict)
+                    and obj.get("sequence") == value
+                    and obj.get("event_id") == event_id.group(1)
+                ):
+                    return value
+    return None
+
+
+def has_uncovered_event_before(
+    transcripts_dir: Path,
+    conv_key: str,
+    sequence: int,
+    covered_through_sequence: int | None,
+    *,
+    seen_sequences: set[int] | frozenset[int] = frozenset(),
+) -> bool:
+    return bool(uncovered_sequences_before(transcripts_dir, conv_key, sequence, covered_through_sequence,
+                                           seen_sequences=seen_sequences))
+
+
+def uncovered_sequences_before(
+    transcripts_dir: Path,
+    conv_key: str,
+    sequence: int,
+    covered_through_sequence: int | None,
+    *,
+    seen_sequences: set[int] | frozenset[int] = frozenset(),
+    covered_through_ts: float | None = None,
+    seen_legacy: set[tuple[str, str, str]] | frozenset[tuple[str, str, str]] = frozenset(),
+) -> list[int]:
+    """Whether a new worker would skip durable history before ``sequence``.
+
+    Conservative: a legacy/no-sequence line or an ordered event outside
+    validated coverage blocks a new closeout summary from advancing the cursor.
+    Events the session was explicitly shown at resume (``seen_sequences``, the
+    tail injected into its prompt) count as covered, so one failed closeout does
+    not freeze coverage forever.  Files are scanned newest first and the scan
+    stops once a file lies entirely at or below the covered floor.
+    """
+    base_dir = transcripts_dir / _safe_key(conv_key)
+    floor = covered_through_sequence or 0
+    if not base_dir.is_dir():
+        return []
+    gap: list[int] = []
+    for path in sorted(base_dir.glob("*.jsonl"), reverse=True):
+        try:
+            raw_lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        file_max = 0
+        for raw in raw_lines:
+            try:
+                obj = json.loads(raw)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(obj, dict):
+                continue
+            event_sequence = obj.get("sequence")
+            if not isinstance(event_sequence, int):
+                ts = _parse_ts(obj.get("ts"))
+                if covered_through_ts is not None and ts is not None and ts <= covered_through_ts:
+                    continue  # unsequenced (main-era) line already summarized by the legacy boundary
+                if legacy_line_key(obj) in seen_legacy:
+                    continue  # shown to the session at resume
+                gap.append(-1)  # legacy line without a sequence: cannot be ordered, counts as unseen
+                continue
+            file_max = max(file_max, event_sequence)
+            if floor < event_sequence < sequence and event_sequence not in seen_sequences:
+                gap.append(event_sequence)
+        if file_max and file_max <= floor:
+            break
+    return sorted(set(gap))
+
+
+def extend_coverage_through_outbound(
+    transcripts_dir: Path, conv_key: str, sequence: int
+) -> tuple[int, str] | None:
+    """Extend a processed inbound sequence over the replies that directly follow it.
+
+    The reply to inbound N is N+1 (same directory, same counter).  A checkpoint
+    that covers the turn covers its replies; stopping at the next inbound keeps
+    unprocessed (queued) messages above coverage.  Reads only the newest files.
+    Returns ``(sequence, event_id)`` of the last covered line, or None if the
+    anchor line itself cannot be found.
+    """
+    base_dir = transcripts_dir / _safe_key(conv_key)
+    if not base_dir.is_dir():
+        return None
+    by_seq: dict[int, dict[str, object]] = {}
+    for path in sorted(base_dir.glob("*.jsonl"), reverse=True)[:2]:
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for raw in lines:
+            try:
+                obj = json.loads(raw)
+            except (ValueError, TypeError):
+                continue
+            seq = obj.get("sequence") if isinstance(obj, dict) else None
+            if isinstance(seq, int) and seq >= sequence:
+                by_seq[seq] = obj
+    anchor = by_seq.get(sequence)
+    if anchor is None or not isinstance(anchor.get("event_id"), str):
+        return None
+    end, end_id = sequence, str(anchor["event_id"])
+    while True:
+        nxt = by_seq.get(end + 1)
+        if nxt is None or nxt.get("direction") != "outbound" or not isinstance(nxt.get("event_id"), str):
+            return end, end_id
+        end, end_id = end + 1, str(nxt["event_id"])
+
+
 def _safe_key(conv_key: str) -> str:
     # Mirror the transcript writer's transform in anna.log._transcript_dir_for.
     return conv_key.replace(":", "-").replace("/", "_")
@@ -72,7 +396,7 @@ def _parse_ts(value: object) -> float | None:
     except ValueError:
         return None
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.replace(tzinfo=UTC)
     return dt.timestamp()
 
 
@@ -82,13 +406,20 @@ def transcript_tail_since(
     since_mtime: float | None,
     max_turns: int,
     max_tokens: int,
+    *,
+    covered_through_sequence: int | None = None,
+    covered_through_ts: float | None = None,
 ) -> list[dict]:
-    """Return transcript lines newer than ``since_mtime``, bounded.
+    """Return explicitly uncovered transcript lines, bounded.
 
     Reads the newest one or two daily JSONL files for ``conv_key``, parses
     each line as JSON (skipping malformed lines defensively), and keeps
-    only lines whose ``ts`` is strictly newer than ``since_mtime``. If
-    ``since_mtime`` is None the whole tail is kept.
+    only events whose stable ``sequence`` is above
+    ``covered_through_sequence``. Legacy JSONL events without a sequence are
+    never filtered, except by ``covered_through_ts`` (see
+    :func:`legacy_checkpoint_cutoff`) which drops events whose parseable ``ts``
+    is at or before a legacy checkpoint. ``since_mtime`` is retained only for callers of the old
+    standalone helper; runtime recovery must pass explicit coverage instead.
 
     The surviving lines are then trimmed from the END to at most
     ``max_turns`` inbound-anchored exchanges (an inbound line starts a new
@@ -96,39 +427,55 @@ def transcript_tail_since(
     ``max_tokens`` of accumulated text, keeping the most recent window and
     trimming oldest first. Returned in chronological order.
     """
-    lines: list[dict] = []
-    for obj in _recent_lines(transcripts_dir, conv_key):
-        if since_mtime is not None:
-            ts = _parse_ts(obj.get("ts"))
-            if ts is None or ts <= since_mtime:
-                continue
-        lines.append(obj)
-
+    lines = _recent_lines(
+        transcripts_dir,
+        conv_key,
+        covered_through_sequence=covered_through_sequence,
+        covered_through_ts=covered_through_ts,
+        since_mtime=since_mtime,
+        max_turns=max_turns,
+        max_tokens=max_tokens,
+    )
     if not lines:
         return []
 
     return _trim_tail(lines, max_turns, max_tokens)
 
 
-def _recent_lines(transcripts_dir: Path, conv_key: str) -> list[dict]:
-    """Parsed lines from the newest one or two daily files, chronological.
+def _recent_lines(
+    transcripts_dir: Path,
+    conv_key: str,
+    *,
+    covered_through_sequence: int | None = None,
+    covered_through_ts: float | None = None,
+    since_mtime: float | None = None,
+    max_turns: int | None = None,
+    max_tokens: int | None = None,
+) -> list[dict]:
+    """Parsed lines from recent daily files, chronological.
 
     Malformed lines and non-object JSON are skipped defensively; an
     unreadable file is skipped whole. Returns [] when the conversation has
     no transcript directory.
+
+    With a ``max_turns``/``max_tokens`` budget, days are collected newest
+    first until the uncovered lines fill the budget (older days could not
+    change the trimmed result). Without a budget only the newest two daily
+    files are read. Lines at or below ``covered_through_sequence`` are
+    dropped; ``since_mtime`` is a legacy timestamp filter used only when no
+    coverage cursor is supplied.
     """
     base_dir = transcripts_dir / _safe_key(conv_key)
     if not base_dir.is_dir():
         return []
 
-    # Newest one or two daily files. Names are YYYY-MM-DD.jsonl, so a
-    # reverse lexical sort is also chronological.
-    daily = sorted(base_dir.glob("*.jsonl"), reverse=True)[:2]
-    # Read oldest-of-the-two first so the combined stream is chronological.
-    daily.reverse()
-
+    budgeted = max_turns is not None and max_tokens is not None
+    paths = sorted(base_dir.glob("*.jsonl"), reverse=True)
+    if not budgeted:
+        paths = paths[:2]
     lines: list[dict] = []
-    for path in daily:
+    for path in paths:
+        day: list[dict] = []
         try:
             raw = path.read_text(encoding="utf-8")
         except OSError:
@@ -143,7 +490,26 @@ def _recent_lines(transcripts_dir: Path, conv_key: str) -> list[dict]:
                 continue
             if not isinstance(obj, dict):
                 continue
-            lines.append(obj)
+            sequence = obj.get("sequence")
+            if covered_through_ts is not None and not isinstance(sequence, int):
+                # Time never hides a sequenced event: only unsequenced (main-era)
+                # lines, which explicit coverage cannot order, are covered by it.
+                ts = _parse_ts(obj.get("ts"))
+                if ts is not None and ts <= covered_through_ts:
+                    continue
+            if covered_through_sequence is not None and isinstance(sequence, int):
+                if sequence <= covered_through_sequence:
+                    continue
+            elif covered_through_sequence is None and since_mtime is not None:
+                ts = _parse_ts(obj.get("ts"))
+                if ts is None or ts <= since_mtime:
+                    continue
+            day.append(obj)
+        lines = day + lines
+        if budgeted:
+            inbound = sum(1 for o in lines if o.get("direction") == "inbound")
+            if inbound > max_turns or sum(count_tokens(o.get("text") or "") for o in lines) > max_tokens:
+                break
     return lines
 
 
@@ -284,7 +650,7 @@ def _format_ts(value: object) -> str:
     ts = _parse_ts(value)
     if ts is None:
         return "unknown time"
-    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
+    return datetime.fromtimestamp(ts, tz=UTC).strftime("%Y-%m-%d %H:%M:%SZ")
 
 
 def render_delivered_posts(

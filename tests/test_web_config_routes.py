@@ -361,7 +361,16 @@ def test_config_write_audit_payload_never_contains_value(
 # ---------------------------------------------------------------------------
 
 
-def test_config_index_includes_restart_control(client: TestClient) -> None:
+@pytest.fixture
+def restartable_client(anna_home: Path, home_is_the_real_home, request: pytest.FixtureRequest) -> TestClient:
+    """A dashboard whose home IS the (pretend) real ~/anna, so the restart control is live."""
+    home_is_the_real_home(anna_home)
+    client: TestClient = request.getfixturevalue("client")
+    return client
+
+
+def test_config_index_includes_restart_control(restartable_client: TestClient) -> None:
+    client = restartable_client
     """The /config index ships the guarded Restart control, not the dead note."""
     response = client.get("/config")
     assert response.status_code == 200
@@ -374,7 +383,8 @@ def test_config_index_includes_restart_control(client: TestClient) -> None:
     assert "systemctl --user restart anna" not in body
 
 
-def test_config_section_includes_restart_control(client: TestClient) -> None:
+def test_config_section_includes_restart_control(restartable_client: TestClient) -> None:
+    client = restartable_client
     """The per-section editor surfaces the Restart control to apply edits."""
     response = client.get("/config/web")
     assert response.status_code == 200

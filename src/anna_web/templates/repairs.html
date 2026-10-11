@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block title %}Repairs — ANNA Dashboard{% endblock %}
+{% block content %}
+  <h1>Repairs</h1>
+  <p><small>Runs with an <strong>unknown</strong> outcome and deliveries that are <strong>uncertain</strong> or failed.
+    Nothing here re-runs a job or resends a message by itself. Choose what <em>you verified</em>, then type the
+    confirmation phrase. The dashboard only <strong>queues</strong> your decision; the running daemon applies it
+    (if the daemon is stopped the request waits). Message text is not shown here.</small></p>
+  {% if msg %}<p role="status"><strong>{{ msg }}</strong></p>{% endif %}
+  {% if err %}<p role="alert"><strong>{{ err }}</strong></p>{% endif %}
+  {% if not data.available %}
+    <p role="alert">Runtime ledger unavailable ({{ data.reason }}). Start the daemon once so it creates the ledger.</p>
+  {% else %}
+    {% if data.needs_daemon_restart %}<p role="alert">The ledger predates repair support: restart the daemon to migrate it before repairs can be queued.</p>{% endif %}
+    <h2>Runs with unknown outcome ({{ data.runs | length }})</h2>
+    {% if not data.runs %}<p>None.</p>{% endif %}
+    {% for r in data.runs %}
+    <article class="panel">
+      <header><strong>Run #{{ r.id }}</strong> · schedule <code>{{ r.schedule_id }}</code> · {{ r.exec_status }} · {{ r.age }}</header>
+      <p><small>{{ r.detail }}</small></p>
+      {% for action in r.actions %}
+      <form method="post" action="/repairs/run/{{ r.id }}">
+        <input type="hidden" name="action" value="{{ action }}">
+        <input type="hidden" name="expected_status" value="{{ r.exec_status }}">
+        <label>{{ labels[action] }} — type <code>{{ phrase('run', r.id, action) }}</code>
+          <input name="confirm" autocomplete="off" required></label>
+        <button type="submit">Queue</button>
+      </form>
+      {% endfor %}
+    </article>
+    {% endfor %}
+    <h2>Deliveries needing a decision ({{ data.outbox | length }})</h2>
+    {% if not data.outbox %}<p>None.</p>{% endif %}
+    {% for r in data.outbox %}
+    <article class="panel">
+      <header><strong>Delivery #{{ r.id }}</strong> · {{ r.transport }}:{{ r.channel }} · {{ r.status }} · {{ r.age }}
+        · part {{ r.chunk_index + 1 }}/{{ r.chunk_count }} · {{ r.chars }} chars · {{ r.attempts }} attempt(s)</header>
+      <p><small>{{ r.provider_outcome }}</small></p>
+      {% for action in r.actions %}
+      <form method="post" action="/repairs/outbox/{{ r.id }}">
+        <input type="hidden" name="action" value="{{ action }}">
+        <input type="hidden" name="expected_status" value="{{ r.status }}">
+        <label>{{ labels[action] }} — type <code>{{ phrase('outbox', r.id, action) }}</code>
+          <input name="confirm" autocomplete="off" required></label>
+        <button type="submit">Queue</button>
+      </form>
+      {% endfor %}
+    </article>
+    {% endfor %}
+    <h2>Recent requests</h2>
+    <table><thead><tr><th>#</th><th>What</th><th>Status</th><th>Result</th></tr></thead><tbody>
+    {% for q in data.requests %}<tr><td>{{ q.id }}</td><td>{{ q.kind }} {{ q.target_id }}: {{ q.action }}</td><td>{{ q.status }}</td><td>{{ q.result or 'waiting for the daemon' }}</td></tr>
+    {% else %}<tr><td colspan="4">No requests.</td></tr>{% endfor %}
+    </tbody></table>
+  {% endif %}
+{% endblock %}

@@ -105,3 +105,16 @@ def _inject_default_origin_header() -> Any:
         yield
     finally:
         httpx.Client.request = original_request  # type: ignore[method-assign]
+
+
+@pytest.fixture
+def home_is_the_real_home(monkeypatch: pytest.MonkeyPatch) -> Any:
+    """Opt-in for the few tests that exercise the dashboard's restart control: pretend the test's own
+    ``anna_home`` is the account's real ``~/anna`` (``config.real_default_home``), keeping the real
+    ``is_isolated_home`` predicate in play. Usage: ``home_is_the_real_home(cfg.anna_home)``."""
+    import anna.config as _config
+
+    def _use(home: Any) -> None:
+        monkeypatch.setattr(_config, "real_default_home", lambda: home)
+
+    return _use

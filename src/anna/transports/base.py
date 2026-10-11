@@ -102,6 +102,10 @@ class ImageAttachment:
     data: bytes
 
 
+class TurnCancelled(RuntimeError):
+    """A scheduler-cancelled turn was dropped before it started."""
+
+
 @dataclass(frozen=True)
 class InboundEvent:
     """Normalized event from any transport.
@@ -195,9 +199,30 @@ class InboundEvent:
     turn_meta: dict[str, Any] | None = field(
         default=None, compare=False, hash=False, repr=False
     )
+    # Set by the scheduler to cancel this turn: a queued event is dropped
+    # without running; a running turn is interrupted.  The worker reports what
+    # happened in ``turn_meta["turn_state"]`` (dropped | running | finished) and
+    # ``turn_meta["cancel_requested"]``.
+    cancel: asyncio.Event | None = field(default=None, compare=False, hash=False, repr=False)
+    # Set ONLY by transport adapters for a message positively identified as
+    # typed/spoken by an authorized human. Synthetic events (scheduler,
+    # background sub-agent completions, tool results) leave it False, which is
+    # the gate for memory extraction.
+    human_origin: bool = field(default=False, compare=False, hash=False)
+    # The destination that received this event.  ``conversation_key`` can be
+    # canonicalized by the router for shared worker state, so it is not by
+    # itself a safe reply address.
+    reply_transport: str | None = field(default=None, compare=False, hash=False)
+    reply_conversation_key: str | None = field(default=None, compare=False, hash=False)
     model: str | None = field(
         default=None, compare=False, hash=False, repr=False
     )
+    # Set by transport adapters when this turn's reply may go out as a voice
+    # note: the inbound was a successfully transcribed voice message, so the
+    # adapter's outbound path will synthesize. Text-in turns leave it False
+    # (text-in still produces text-out), which lets the worker flush slow-turn
+    # narration as text without it becoming a voice drip.
+    voice_reply_expected: bool = field(default=False, compare=False, hash=False, repr=False)
 
 
 @dataclass(frozen=True)
@@ -208,6 +233,17 @@ class OutboundMessage:
     structured: dict[str, Any] | None = None
     files: list[str] | None = None
     reply_to: str | None = None
+    # Set by the worker for replies to a transport event.  Kept optional so
+    # existing direct adapter callers retain their established behavior.
+    transport: str | None = None
+    # The worker's canonical conversation key, kept separate from the delivery
+    # address in ``conversation_key`` (an aliased owner replies to a channel but
+    # their transcript belongs to ``user:<canonical>``).
+    transcript_conversation_key: str | None = None
+    # Text already contains inert, untrusted provider data (mail subjects etc.):
+    # transports must NOT run Markdown->mrkdwn conversion, which would turn
+    # ``[x](url)`` in a subject into a live link.
+    plain: bool = False
 
 
 @dataclass
@@ -262,6 +298,10 @@ class ChannelAdapter(ABC):
 
     @abstractmethod
     async def health_check(self) -> bool: ...
+
+    async def health_detail(self) -> dict[str, Any]:
+        """Receiver liveness separate from API reachability (None = not applicable/unknown)."""
+        return {"receiver_alive": None, "api_ok": None, "error": None}
 
     async def restart(self) -> None:
         """Default restart: stop then start. Subclasses may override."""

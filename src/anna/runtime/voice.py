@@ -448,6 +448,15 @@ class VoiceProcessor:
         """
         self._recent_voice_inbounds.pop(conv_key, None)
 
+    def voice_inbound_active(self, conv_key: str) -> bool:
+        """Public read of the "most-recent inbound was voice" mark.
+
+        The same predicate the outbound path uses, so callers (the adapters
+        stamping ``InboundEvent.voice_reply_expected``) agree with what the
+        adapter will actually send.
+        """
+        return self._recent_voice_active(conv_key)
+
     def _recent_voice_active(self, conv_key: str) -> bool:
         """True when this conv_key has an unexpired voice-inbound mark."""
         expiry = self._recent_voice_inbounds.get(conv_key)
