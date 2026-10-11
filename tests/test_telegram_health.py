@@ -151,6 +151,7 @@ async def test_watchdog_no_restart_or_alert_for_healthy_telegram(
     cfg = _make_config(tmp_path)
     wd = Watchdog(config=cfg, adapters={"telegram": adapter}, router=SimpleNamespace(), alerter=alerter)
     try:
+        await asyncio.sleep(0.1)  # let the real-PTB-style setup task finish
         for _ in range(8):  # > 3 consecutive cycles
             await wd._check_transports()
         assert restarts == []
