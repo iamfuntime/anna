@@ -6,7 +6,9 @@ Polls :class:`ScheduleStore` for due schedules at every
 carries a ``completion_future`` so the worker resolves it with the
 final assistant message instead of calling its normal outbound send
 path. The scheduler then routes the message to the schedule's declared
-destination via the appropriate :class:`ChannelAdapter` directly.
+destination via the appropriate :class:`ChannelAdapter` directly, and
+records the delivered post in the destination conversation's transcript
+(:mod:`anna.runtime.delivered_posts`) so a reply there has a referent.
 
 Failure handling is three-strikes-then-disable per
 ``config.scheduler.failure_threshold``. Each fire is timeboxed by
@@ -22,14 +24,18 @@ the full design.
 from __future__ import annotations
 
 import asyncio
+import json
 import shutil
-from datetime import UTC, date, datetime
+import subprocess
+import time
+from datetime import UTC, date, datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 from zoneinfo import ZoneInfo
 
 from anna.config import AnnaConfig
 from anna.log import audit_event, get_logger
+from anna.runtime.delivered_posts import record_delivered_post
 from anna.runtime.heartbeat import Classifier, HeartbeatJob, heartbeat_min_timeout
 from anna.runtime.ledger import (
     OutboxItem,
@@ -43,6 +49,9 @@ from anna.runtime.schedule_jobs import JobResult, Outcome
 from anna.runtime.schedule_store import ScheduleStore
 from anna.runtime.schedule_types import Schedule
 from anna.runtime.worker import (
+    TURN_COST_FIELD,
+    TURN_SPEND_FIELDS,
+    TURN_USAGE_FIELDS,
     _contains_unparsed_toolcall_markup,
     _matched_markers,
 )
@@ -63,7 +72,113 @@ if TYPE_CHECKING:
 # the skill returns exactly.
 QUIET_SENTINEL = "[[ANNA_NO_OUTPUT]]"
 
-__all__ = ["QUIET_SENTINEL", "Scheduler"]
+# Wall-clock cap on a schedule's optional ``gate_command`` pre-flight. A gate
+# exists to be cheaper than the fire it guards, so it gets a hard, short
+# budget; overrunning it is a fail-open (the fire proceeds), never a skip.
+GATE_TIMEOUT_SECONDS = 15.0
+
+# The ONLY exit code that suppresses a fire. Derived from
+# ``scripts/heartbeat_gate.py``: 0 = "nothing present, safe to skip", 10 =
+# "something present or a check was inconclusive, run", 1 = "the gate itself
+# malfunctioned, run". Its docstring states the caller contract directly —
+# "The caller must treat ANY non-zero exit as 'run'. Only 0 is a skip."
+GATE_SKIP_EXIT_CODE = 0
+
+# Bound on the gate stdout we copy into the audit row and on the reason we
+# derive from it. Mirrors the 280-char previews the no-tool-call guard emits.
+GATE_REASON_MAX_CHARS = 280
+GATE_OUTPUT_MAX_CHARS = 2000
+
+__all__ = ["GATE_TIMEOUT_SECONDS", "QUIET_SENTINEL", "Scheduler"]
+
+
+class GateOutcome(NamedTuple):
+    """What a ``gate_command`` pre-flight decided, plus telemetry.
+
+    ``skip`` is the only field that changes behavior and it is true ONLY on
+    an unambiguous skip signal (a clean exit with
+    :data:`GATE_SKIP_EXIT_CODE`). Every other field is audit payload.
+    """
+
+    skip: bool
+    exit_code: int | None
+    reason: str
+    output: str
+    duration_seconds: float
+
+    @classmethod
+    def fire(
+        cls,
+        *,
+        exit_code: int | None = None,
+        reason: str = "",
+        output: str = "",
+        duration_seconds: float = 0.0,
+    ) -> "GateOutcome":
+        """A fail-open outcome: whatever happened, the schedule fires."""
+        return cls(
+            skip=False,
+            exit_code=exit_code,
+            reason=reason,
+            output=output,
+            duration_seconds=duration_seconds,
+        )
+
+
+def _gate_reason(stdout: str) -> str:
+    """Best-effort human reason for a suppression, read from gate stdout.
+
+    Purely cosmetic: this NEVER influences the decision. A gate that prints
+    nothing, prose, or malformed JSON still suppresses on its exit code
+    alone, so no parsing failure here can turn a skip into a fire or the
+    reverse. JSON objects are preferred because ``heartbeat_gate.py --json``
+    emits one; a plain-text gate falls back to its last line.
+    """
+    text = (stdout or "").strip()
+    if not text:
+        return ""
+    try:
+        payload = json.loads(text)
+    except ValueError:
+        return text.splitlines()[-1].strip()[:GATE_REASON_MAX_CHARS]
+    if isinstance(payload, dict):
+        for key in ("reason", "detail", "summary", "decision"):
+            value = payload.get(key)
+            if isinstance(value, str) and value:
+                return value[:GATE_REASON_MAX_CHARS]
+    return text[:GATE_REASON_MAX_CHARS]
+
+
+def _accumulate_turn_usage(
+    total: dict[str, object], meta: dict[str, object] | None
+) -> None:
+    """Fold one fire's ``turn_meta`` token counts and cost into a per-run tally.
+
+    A scheduled run is not always one turn: the no-tool-call backstop fires a
+    second time into a fresh ``meta``, and the worker's markup-regeneration
+    path adds a third drain. Spend-per-job means the SUM of every drain the run
+    paid for, so each attempt accumulates here rather than overwriting.
+    Non-numeric / missing values are skipped (fail open — telemetry must never
+    break a scheduled run), and ``model`` takes the most recent non-empty id.
+    ``total_cost_usd`` is a float and sums the same way the counters do.
+    """
+    if not meta:
+        return
+    for key in TURN_SPEND_FIELDS:
+        value = meta.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        previous = total.get(key)
+        base = (
+            previous
+            if isinstance(previous, (int, float)) and not isinstance(previous, bool)
+            else 0
+        )
+        summed = base + value
+        total[key] = round(summed, 6) if isinstance(summed, float) else summed
+    model = meta.get("model")
+    if isinstance(model, str) and model:
+        total["model"] = model
 
 
 def _stub_schedule(schedule_id: str) -> Schedule:
@@ -539,6 +654,7 @@ class Scheduler:
             ephemeral=schedule.ephemeral,
             turn_meta=turn_meta,
             cancel=cancel,
+            model=schedule.model,
         )
 
         await self._router.dispatch(event)
@@ -547,6 +663,128 @@ class Scheduler:
     # ------------------------------------------------------------------
     # Guarded fire with timeout + failure handling
     # ------------------------------------------------------------------
+
+    async def _consult_gate(self, schedule: Schedule) -> GateOutcome:
+        """Run ``schedule.gate_command`` and report whether to skip this tick.
+
+        FAILS OPEN ON EVERYTHING. The contract is the one
+        ``scripts/heartbeat_gate.py`` documents and the only one this method
+        implements: a clean exit with code :data:`GATE_SKIP_EXIT_CODE` (0)
+        means "nothing present, skip"; ANY other outcome — any other exit
+        code, a timeout, a missing or non-executable binary, an OS error, an
+        unparseable stdout, an unexpected exception — means FIRE. There is
+        deliberately no branch in here that turns an ambiguous result into a
+        skip, because a gate that wakes too often only costs money while a
+        gate that stays quiet when it should not loses work.
+
+        ``subprocess.run`` is pushed onto a worker thread so a gate that
+        sits for its full :data:`GATE_TIMEOUT_SECONDS` cannot stall the
+        scheduler's event loop. ``CancelledError`` is intentionally NOT
+        caught: a fire cancelled by :meth:`cancel_schedule_tasks` while its
+        gate is running must stay cancelled, exactly as it does at every
+        other await point in the fire path.
+        """
+        command = schedule.gate_command or []
+        if not command:
+            return GateOutcome.fire()
+        started = time.monotonic()
+        try:
+            proc = await asyncio.to_thread(
+                subprocess.run,
+                command,
+                capture_output=True,
+                text=True,
+                timeout=GATE_TIMEOUT_SECONDS,
+                stdin=subprocess.DEVNULL,
+            )
+        except asyncio.CancelledError:
+            raise
+        except subprocess.TimeoutExpired:
+            elapsed = time.monotonic() - started
+            self._log.warning(
+                "scheduler.gate_timeout",
+                schedule_id=schedule.id,
+                timeout_seconds=GATE_TIMEOUT_SECONDS,
+                duration_seconds=elapsed,
+            )
+            return GateOutcome.fire(
+                reason=f"gate timed out after {GATE_TIMEOUT_SECONDS:.0f}s",
+                duration_seconds=elapsed,
+            )
+        except Exception as exc:
+            # Missing binary, not executable, permission denied, a bad argv
+            # type that only blows up at spawn — all of it fires.
+            elapsed = time.monotonic() - started
+            self._log.warning(
+                "scheduler.gate_error",
+                schedule_id=schedule.id,
+                error=str(exc),
+                duration_seconds=elapsed,
+            )
+            return GateOutcome.fire(
+                reason=f"gate error: {type(exc).__name__}: {exc}"[
+                    :GATE_REASON_MAX_CHARS
+                ],
+                duration_seconds=elapsed,
+            )
+
+        elapsed = time.monotonic() - started
+        stdout = (proc.stdout or "")[:GATE_OUTPUT_MAX_CHARS]
+        if proc.returncode != GATE_SKIP_EXIT_CODE:
+            # The expected wake path. Not a warning: a gate saying "there is
+            # work" is the normal, healthy answer most of the time.
+            self._log.info(
+                "scheduler.gate_wake",
+                schedule_id=schedule.id,
+                exit_code=proc.returncode,
+                duration_seconds=elapsed,
+            )
+            return GateOutcome.fire(
+                exit_code=proc.returncode,
+                reason=_gate_reason(proc.stdout or ""),
+                output=stdout,
+                duration_seconds=elapsed,
+            )
+        return GateOutcome(
+            skip=True,
+            exit_code=proc.returncode,
+            reason=_gate_reason(proc.stdout or ""),
+            output=stdout,
+            duration_seconds=elapsed,
+        )
+
+    async def _record_gate_skip(
+        self, schedule: Schedule, outcome: GateOutcome
+    ) -> None:
+        """Audit a suppressed tick.
+
+        This row is the ONLY record that a tick happened at all — no
+        ``audit.schedule.fire`` is emitted for a gated-off tick — so counting
+        ``audit.schedule.gate_skip`` against ``audit.schedule.fire`` gives the
+        measured suppression rate rather than an estimated one. No store
+        mutation: ``_poll_once`` already advanced ``last_fired_at`` via
+        ``mark_dispatched`` (so the next cron tick computes correctly), and a
+        tick that never ran is neither a success nor a failure, so
+        ``last_status`` and ``consecutive_failures`` are left untouched.
+        """
+        audit_event(
+            "audit.schedule.gate_skip",
+            audit_dir=self._audit_dir,
+            actor="anna",
+            fsync_on_write=self._fsync,
+            schedule_id=schedule.id,
+            gate_command=list(schedule.gate_command or ()),
+            exit_code=outcome.exit_code,
+            reason=outcome.reason,
+            gate_output=outcome.output,
+            duration_seconds=outcome.duration_seconds,
+        )
+        self._log.info(
+            "scheduler.gate_skip",
+            schedule_id=schedule.id,
+            reason=outcome.reason,
+            duration_seconds=outcome.duration_seconds,
+        )
 
     async def _guarded_fire(self, schedule: Schedule, *, occurrence_id: int | None = None) -> None:
         """Claim, run and settle one occurrence.
@@ -561,6 +799,13 @@ class Scheduler:
         async with self._semaphore:
             lease = 2 * schedule.timeout_seconds + self._config.scheduler.lease_grace_seconds
             if not self._ledger.claim(occurrence_id, owner=self._owner, lease_seconds=lease):
+                return
+            # Optional pre-flight gate. Runs BEFORE audit.schedule.fire so a
+            # suppressed tick emits exactly one row (gate_skip) and the fire
+            # count stays a count of real fires. Fails open on everything.
+            gate = await self._consult_gate(schedule)
+            if gate.skip:
+                await self._skip_for_gate(schedule, occurrence_id, gate)
                 return
             started_at = datetime.now(UTC)
             try:
@@ -627,7 +872,8 @@ class Scheduler:
                 self._ledger.finish_run(occurrence_id, run_id, status="succeeded", side_effects=result.side_effects,
                                         result=result.to_json(), delivery_status="suppressed",
                                         detail=result.quiet_reason)
-                await self._record_success(schedule, result.output, started_at=started_at, suppressed=True)
+                await self._record_success(schedule, result.output, started_at=started_at, suppressed=True,
+                                          usage=meta.get("_usage"))  # type: ignore[arg-type]
                 return
 
             dest = schedule.destination
@@ -637,7 +883,8 @@ class Scheduler:
                 chunk_chars=self._config.scheduler.delivery_chunk_chars)
             if not written:
                 return  # recovered/cancelled meanwhile: never enqueue a duplicate delivery
-            await self._record_success(schedule, result.output, started_at=started_at)
+            await self._record_success(schedule, result.output, started_at=started_at,
+                                       usage=meta.get("_usage"))  # type: ignore[arg-type]
         await self._deliver_due()
 
     # ------------------------------------------------------------------
@@ -778,7 +1025,10 @@ class Scheduler:
 
     async def _run_agent_prompt(self, schedule: Schedule, meta: dict[str, object]) -> JobResult:
         """Legacy prompt job with its quiet / no-tool-call / markup heuristics."""
+        usage_total: dict[str, object] = {}
         reply = await self._turn(schedule, meta)
+        _accumulate_turn_usage(usage_total, meta)
+        meta["_usage"] = usage_total
         # No-tool-call backstop (2026-07-29 incident: oem-slide-restock-watch
         # resolved in 2.5s with zero tool calls and the bare text "I'll read the
         # skill file first", which the scheduler posted to the operator's DM). A
@@ -802,6 +1052,8 @@ class Scheduler:
                               output_length=len(first_reply))
             meta.clear()
             reply = await self._turn(schedule, meta)
+            _accumulate_turn_usage(usage_total, meta)
+            meta["_usage"] = usage_total
             if self._is_no_tool_call_prose(reply, meta):
                 return self._no_tool_call_abort(schedule, first_reply=first_reply, retry_reply=reply)
         count = meta.get("tool_call_count")
@@ -913,6 +1165,7 @@ class Scheduler:
                     reason=f"send failed ({outcome}): {exc}", kind="delivery")
             return
         self._ledger.outbox_sent(item)
+        self._record_delivered_item(item)
 
     @staticmethod
     def _is_quiet_sentinel(reply: str) -> bool:
@@ -963,6 +1216,8 @@ class Scheduler:
         *,
         started_at: datetime,
         suppressed: bool = False,
+        recorded_conv_key: str | None = None,
+        usage: dict[str, object] | None = None,
     ) -> None:
         """Record a successful fire: mark_fired (resets failures, sets
         last_fired_at + last_status="complete"), audit, and log.
@@ -970,12 +1225,33 @@ class Scheduler:
         Shared by the normal-send path and the quiet-sentinel path so both
         use identical bookkeeping. ``suppressed`` only affects telemetry; the
         persisted success state is the same in both cases.
+        ``recorded_conv_key`` is telemetry too: the conversation whose
+        transcript the delivered post was appended to (see
+        :meth:`_record_delivered_post`), or ``None`` when nothing was
+        recorded — always ``None`` for a suppressed run.
+
+        ``usage`` carries the run's token spend (see
+        :func:`_accumulate_turn_usage`) and is stamped onto the audit row as
+        ADDITIVE keys — ``model`` plus the four billable counters plus a
+        ``duration_s`` alias of the long-standing ``duration_seconds``. Every
+        pre-existing key keeps its name and value, so old log parsers are
+        unaffected. Defaults to ``None`` (keyword-only) so any caller that
+        does not track usage still works.
         """
         completed_at = datetime.now(UTC)
         duration = (completed_at - started_at).total_seconds()
         await self._store.mark_fired(
             schedule.id, status="complete", when=completed_at
         )
+        # Missing counters land as 0 rather than being omitted, so the row has
+        # a stable shape and a summing grep never trips over an absent key.
+        usage_fields: dict[str, object] = {
+            "model": None,
+            **{key: 0 for key in TURN_USAGE_FIELDS},
+            TURN_COST_FIELD: 0.0,
+        }
+        if usage:
+            usage_fields.update(usage)
         audit_event(
             "audit.schedule.complete",
             audit_dir=self._audit_dir,
@@ -985,6 +1261,9 @@ class Scheduler:
             duration_seconds=duration,
             output_length=len(reply),
             suppressed=suppressed,
+            recorded_conv_key=recorded_conv_key,
+            duration_s=round(duration, 3),
+            **usage_fields,
         )
         self._log.info(
             "scheduler.complete",
@@ -992,7 +1271,62 @@ class Scheduler:
             duration_seconds=duration,
             output_length=len(reply),
             suppressed=suppressed,
+            recorded_conv_key=recorded_conv_key,
         )
+
+    async def _skip_for_gate(self, schedule: Schedule, occurrence_id: int, gate: GateOutcome) -> None:
+        """Close an occurrence a ``gate_command`` suppressed.
+
+        Neither a success nor a failure: ``last_status`` and
+        ``consecutive_failures`` are untouched, but ``last_fired_at`` advances
+        (as the pre-ledger scheduler did) so a rollback to that scheduler does
+        not replay the tick.
+        """
+        self._ledger.end_unrun(occurrence_id, status="skipped_gate", detail=gate.reason or "gate skip")
+        await self._record_gate_skip(schedule, gate)
+        await self._store.mark_dispatched(schedule.id, when=datetime.now(UTC))
+
+    def _record_delivered_item(self, item: OutboxItem) -> None:
+        """Append a delivered outbox chunk to the destination conversation's transcript."""
+        schedule = self._store.get(item.schedule_id)
+        if schedule is None:
+            return
+        conv_key = self._record_delivered_post(schedule, item.text)
+        if conv_key is not None:
+            audit_event("audit.schedule.delivered_post_recorded", audit_dir=self._audit_dir, actor="anna",
+                        fsync_on_write=self._fsync, schedule_id=schedule.id, occurrence_id=item.occurrence_id,
+                        chunk=item.chunk_index, recorded_conv_key=conv_key)
+
+    def _record_delivered_post(self, schedule: Schedule, text: str) -> str | None:
+        """Append the delivered post to the destination conversation's transcript.
+
+        The scheduled run itself lives under ``schedule:<id>:<date>``, so
+        without this the conversation at the destination (the operator's DM)
+        has no trace of a message that was posted into it. The row is tagged
+        ``source="schedule:<id>"`` so the resume tail can label it as a
+        scheduled post rather than a conversational reply.
+
+        Returns the conversation key the row landed under, or ``None`` when
+        the destination has no single conversation (a shared channel) —
+        see :func:`anna.runtime.delivered_posts.conv_key_for_destination`.
+        Exception-isolated: the post is already delivered, so a recording
+        problem must never turn a successful fire into a failure.
+        """
+        try:
+            return record_delivered_post(
+                self._config,
+                transport=schedule.destination.transport,
+                channel=schedule.destination.channel,
+                text=text,
+                source=f"schedule:{schedule.id}",
+            )
+        except Exception as exc:  # noqa: BLE001 — never fail a delivered fire
+            self._log.warning(
+                "scheduler.post_record_failed",
+                schedule_id=schedule.id,
+                error=str(exc),
+            )
+            return None
 
     @staticmethod
     def _dest_conv_key(*, transport: str, channel: str) -> str:

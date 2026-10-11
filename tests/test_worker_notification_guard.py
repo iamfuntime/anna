@@ -82,6 +82,7 @@ class _FakeToolResultBlock:
 @dataclass
 class _FakeAssistantMessage:
     content: list[Any]
+    parent_tool_use_id: str | None = None
 
 
 @dataclass
@@ -971,6 +972,84 @@ async def test_path_b_delivers_terminal_report_only(tmp_path: Path) -> None:
         assert [m.text for m in sent] == ["REPORT: three of five links are dead."]
         assert "Reading the output" not in "".join(m.text for m in sent)
         assert "Now cross-checking" not in "".join(m.text for m in sent)
+    finally:
+        await worker._stop_stream_consumer()
+
+
+@pytest.mark.asyncio
+async def test_path_b_subagent_raw_result_is_not_delivered(tmp_path: Path) -> None:
+    """2026-09-29 regression (turn e3be62b4f53f). A background sub-agent's
+    closing message is streamed on the parent session, tagged with
+    ``parent_tool_use_id``, just BEFORE its task notification. The idle path
+    accumulated it as if ANNA had said it, and because neither it nor ANNA's
+    relay had a tool call after it, the raw 5k-char agent result (footer and
+    all) shipped glued in front of the relay. Only ANNA's own relay may reach
+    the transport.
+    """
+    raw_result = (
+        "Both slumps are mostly about the quarterbacks.\n\n"
+        "MISTAKES/FRICTION/WISHES\n- none"
+    )
+    sent: list[OutboundMessage] = []
+    worker = _make_worker(tmp_path, sent)
+    client = _StreamClient()
+    worker._client = client
+    worker._ensure_stream_consumer()
+    try:
+        client.push(
+            _FakeAssistantMessage(
+                content=[_FakeToolUseBlock(name="WebSearch")],
+                parent_tool_use_id="toolu_agent",
+            ),
+            _FakeAssistantMessage(
+                content=[_FakeTextBlock(text=raw_result)],
+                parent_tool_use_id="toolu_agent",
+            ),
+            _system_notification(),
+            _FakeAssistantMessage(
+                content=[_FakeTextBlock(text="Hold Nabers. Odunze is the cut.")]
+            ),
+            _FakeResultMessage(),
+        )
+        await _spin()
+
+        assert [m.text for m in sent] == ["Hold Nabers. Odunze is the cut."]
+        joined = "".join(m.text for m in sent)
+        assert "Both slumps" not in joined
+        assert "MISTAKES/FRICTION/WISHES" not in joined
+        rows = _suppression_rows(worker._config)
+        assert len(rows) == 1
+        assert rows[0]["sources"] == ["system_task_notification"]
+        assert "Both slumps" not in rows[0]["delivered_preview"]
+        # A sidechain message on its own must not open an unsolicited turn —
+        # no parent ResultMessage is guaranteed to close it.
+        assert worker._unsolicited_open is False
+    finally:
+        await worker._stop_stream_consumer()
+
+
+@pytest.mark.asyncio
+async def test_subagent_message_alone_does_not_open_unsolicited_turn(
+    tmp_path: Path,
+) -> None:
+    """A lone sidechain message sends nothing and leaves routing untouched."""
+    sent: list[OutboundMessage] = []
+    worker = _make_worker(tmp_path, sent)
+    client = _StreamClient()
+    worker._client = client
+    worker._ensure_stream_consumer()
+    try:
+        client.push(
+            _FakeAssistantMessage(
+                content=[_FakeTextBlock(text="raw agent result")],
+                parent_tool_use_id="toolu_agent",
+            ),
+        )
+        await _spin()
+
+        assert sent == []
+        assert worker._unsolicited_open is False
+        assert worker._idle_chunks == []
     finally:
         await worker._stop_stream_consumer()
 

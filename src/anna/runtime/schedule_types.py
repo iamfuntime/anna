@@ -17,7 +17,9 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+from anna.config import validate_model_string
 
 
 class ScheduleDestination(BaseModel):
@@ -65,6 +67,25 @@ class Schedule(BaseModel):
     ``schedules.yaml`` entries, where it defaults to False — preserving
     the existing non-ephemeral behavior for every schedule that does not
     opt in.
+
+    ``gate_command`` (default None) is an optional argv the scheduler runs
+    as a cheap pre-flight before each fire. Exit code 0 means "nothing to
+    do, skip this tick"; ANY other outcome — nonzero exit, timeout, crash,
+    missing binary — fires the schedule normally. None (the default, and
+    the value for every legacy ``schedules.yaml`` entry) means no gate and
+    no subprocess: the fire proceeds exactly as it does today. It is an
+    argv list rather than a shell string so no shell ever interprets it.
+    See :meth:`anna.runtime.scheduler.Scheduler._consult_gate`.
+
+    ``model`` (default None) pins the Claude model this schedule's fires
+    run on, in place of the global ``runtime.model``. Same grammar as
+    ``runtime.model`` (a tier alias such as ``sonnet`` or a full model ID),
+    validated by the same :func:`anna.config.validate_model_string`. It is
+    carried on the dispatched ``InboundEvent`` and bound to the fire's own
+    worker (conv_key ``schedule:<id>:<date>``) at spawn, so it never touches
+    the persistent DM / conversation sessions or the global config. None
+    (the default, and the value for every legacy entry) keeps today's
+    behavior exactly: the fire runs on ``runtime.model``.
     """
 
     id: str
@@ -86,8 +107,15 @@ class Schedule(BaseModel):
     overlap_policy: Literal["skip", "queue"] | None = None
     misfire_policy: Literal["run_latest", "skip_late"] | None = None
     misfire_grace_seconds: int | None = None
+    gate_command: list[str] | None = None
+    model: str | None = None
     created_at: datetime
     state: ScheduleState = Field(default_factory=ScheduleState)
+
+    @field_validator("model")
+    @classmethod
+    def _validate_model(cls, v: str | None) -> str | None:
+        return validate_model_string(v)
 
     @model_validator(mode="after")
     def _heartbeat_is_read_only(self) -> "Schedule":

@@ -542,6 +542,16 @@ class SlackAdapter(ChannelAdapter):
                 # most-recent inbound as text, not a rolling voice window.
                 self._voice.clear_voice_inbound(conv_key=conv_key)
 
+        # Every attached file is described to the model (id / name /
+        # mimetype, plus a local path for downloaded documents). Before this,
+        # only voice and image files were handled; a PDF arrived as the bare
+        # caption, or as an EMPTY turn when there was no caption.
+        file_lines = await self._handle_file_attachments(
+            event=event, conv_key=conv_key, voice_file=voice_file
+        )
+        if file_lines:
+            text = "\n".join(p for p in [(text or "").strip(), *file_lines] if p)
+
         return InboundEvent(
             transport="slack",
             conversation_key=conv_key,
@@ -991,6 +1001,169 @@ class SlackAdapter(ChannelAdapter):
                 parts.append(marker)
 
         return "\n".join(p for p in parts if p)
+
+    # ------------------------------------------------------------------
+    # Generic file intake (PDFs, docs, anything not voice / inline image)
+    # ------------------------------------------------------------------
+
+    async def _hydrate_file_entry(self, entry: dict[str, Any]) -> dict[str, Any]:
+        """Fill in a sparse ``files[]`` entry via ``files.info``.
+
+        Slack sometimes delivers only ``{"id", "file_access":
+        "check_file_info"}`` (or omits name / mimetype / url). Best-effort:
+        any failure returns the entry unchanged so it is still listed.
+        """
+        needs_info = entry.get("file_access") == "check_file_info" or not (
+            entry.get("name") and entry.get("mimetype")
+            and (entry.get("url_private_download") or entry.get("url_private"))
+        )
+        file_id = entry.get("id")
+        if not needs_info or not file_id or self._client is None:
+            return entry
+        try:
+            resp = await self._client.files_info(file=file_id)
+            info = resp.get("file") if hasattr(resp, "get") else None
+        except Exception as exc:
+            self._log.warning(
+                "file.info_failed", channel="slack", file_id=file_id, error=str(exc)
+            )
+            return entry
+        if isinstance(info, dict):
+            merged = dict(entry)
+            merged.update(info)
+            return merged
+        return entry
+
+    @staticmethod
+    def _safe_filename(name: str) -> str:
+        base = Path(name or "").name
+        cleaned = "".join(
+            c if (c.isalnum() or c in "._-") else "_" for c in base
+        ).strip("._")
+        return cleaned[:120] or "file"
+
+    def _file_dest_path(self, *, file_id: str, name: str, ts: str) -> Path:
+        dest_dir = self._config.files.inbound.resolved_destination
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        from datetime import datetime
+
+        try:
+            prefix = datetime.fromtimestamp(float(ts)).strftime("%Y-%m-%d")
+        except (TypeError, ValueError, OSError, OverflowError):
+            prefix = datetime.now().strftime("%Y-%m-%d")
+        safe_id = self._safe_filename(file_id)
+        return dest_dir / f"{prefix}-slack-{safe_id}-{self._safe_filename(name)}"
+
+    async def _handle_file_attachments(
+        self,
+        *,
+        event: dict[str, Any],
+        conv_key: str,
+        voice_file: dict[str, Any] | None,
+    ) -> list[str]:
+        """Describe (and where applicable download) every ``files[]`` entry.
+
+        Returns one ``[attached file: ...]`` line per file. Voice-note turns
+        and supported inline images are handled (and surfaced to the model)
+        by their own paths and are skipped here. Every other file is
+        downloaded (bot token, Slack host
+        only, size-capped) into ``files.inbound.destination`` and its local
+        path included; failures are stated in the line so the model can
+        tell the operator instead of claiming nothing arrived.
+        """
+        files = event.get("files")
+        if not isinstance(files, list) or not files:
+            return []
+        # A voice-note turn is exclusive (see _to_inbound_event): the
+        # transcript IS the content, and its text is pinned exactly by the
+        # voice round-trip path. Leave it untouched.
+        if voice_file is not None:
+            return []
+        cfg = self._config.files.inbound
+        ts = str(event.get("ts", ""))
+        lines: list[str] = []
+
+        for raw_entry in files:
+            if not isinstance(raw_entry, dict):
+                continue
+            entry = await self._hydrate_file_entry(raw_entry)
+            file_id = str(entry.get("id") or "unknown")
+            name = str(entry.get("name") or entry.get("title") or "")
+            mimetype = str(entry.get("mimetype") or "unknown")
+            size = entry.get("size")
+            desc = f'id={file_id} name="{name}" mimetype={mimetype}'
+            if isinstance(size, int):
+                desc += f" size={size}"
+
+            # Supported images are already handed to the model as image
+            # content blocks (or given an overflow / size marker) by
+            # _handle_image_inbound; don't duplicate them into the Inbox.
+            if (
+                mimetype in _SUPPORTED_IMAGE_MIMES
+                and self._config.images.inbound.enabled
+            ):
+                continue
+
+            status = await self._save_file_entry(
+                entry=entry, file_id=file_id, name=name, ts=ts,
+                size=size, cfg=cfg, conv_key=conv_key,
+            )
+            lines.append(f"[attached file: {desc} {status}]")
+
+        return lines
+
+    async def _save_file_entry(
+        self,
+        *,
+        entry: dict[str, Any],
+        file_id: str,
+        name: str,
+        ts: str,
+        size: Any,
+        cfg: Any,
+        conv_key: str,
+    ) -> str:
+        """Download one file to the Inbox; return the status suffix."""
+        if not cfg.enabled:
+            return "(not downloaded: file download is off)"
+        if isinstance(size, int) and size > cfg.max_file_size_bytes:
+            self._log.warning(
+                "file.oversize", channel="slack", conv_key=conv_key,
+                file_id=file_id, size=size, stage="pre",
+            )
+            return f"(not downloaded: larger than {cfg.max_file_size_bytes} bytes)"
+        try:
+            data = await self._download_slack_file(
+                entry, max_bytes=cfg.max_file_size_bytes
+            )
+        except Exception as exc:
+            self._log.warning(
+                "file.download_failed", channel="slack", conv_key=conv_key,
+                file_id=file_id, error=str(exc),
+            )
+            return f"(download failed: {exc})"
+        if len(data) > cfg.max_file_size_bytes:
+            self._log.warning(
+                "file.oversize", channel="slack", conv_key=conv_key,
+                file_id=file_id, size=len(data), stage="post",
+            )
+            return f"(not downloaded: larger than {cfg.max_file_size_bytes} bytes)"
+        try:
+            dest = self._file_dest_path(file_id=file_id, name=name, ts=ts)
+            tmp = dest.with_name(dest.name + ".part")
+            tmp.write_bytes(data)
+            os.replace(tmp, dest)
+        except Exception as exc:
+            self._log.warning(
+                "file.save_failed", channel="slack", conv_key=conv_key,
+                file_id=file_id, error=str(exc),
+            )
+            return f"(downloaded but could not save: {exc})"
+        self._log.info(
+            "file.inbound.saved", channel="slack", conv_key=conv_key,
+            file_id=file_id, path=str(dest), size=len(data),
+        )
+        return f"saved_to={dest}"
 
     @classmethod
     def conversation_key_for(cls, event: Any) -> str:

@@ -141,11 +141,15 @@ class InboundEvent:
 
     ``turn_meta`` is an optional caller-owned dict the worker writes
     per-turn telemetry into before it resolves ``completion_future`` —
-    currently just ``tool_call_count``. It is the return channel the
-    future itself cannot be (the future carries the reply text only).
-    The Phase 2 scheduler passes a fresh dict per fire and reads
-    ``tool_call_count`` to detect a scheduled turn that produced prose
-    without executing a single tool. Left ``None`` by every
+    ``tool_call_count``, the resolved ``model`` id, the four billable
+    token counters (``input_tokens``, ``output_tokens``,
+    ``cache_creation_input_tokens``, ``cache_read_input_tokens``) summed
+    across every assistant message in the turn, and ``duration_s``. It is
+    the return channel the future itself cannot be (the future carries
+    the reply text only). The Phase 2 scheduler passes a fresh dict per
+    fire, reads ``tool_call_count`` to detect a scheduled turn that
+    produced prose without executing a single tool, and stamps the token
+    counts onto ``audit.schedule.complete``. Left ``None`` by every
     transport-originated event; when ``None`` the worker writes nothing
     and every consumer must treat the count as UNKNOWN (fail open).
 
@@ -155,6 +159,15 @@ class InboundEvent:
     inbound is exclusive and never co-carries images. Like the callable
     fields it is excluded from compare / hash / repr so the dataclass
     stays hashable and the raw bytes never bloat logs.
+
+    ``model`` is an optional per-event Claude model override. Set only by
+    the Phase 2 scheduler, from ``Schedule.model``, for a schedule pinned
+    to a model other than the global ``runtime.model``. Like ``ephemeral``
+    it is read by ``ConversationRouter`` on the FIRST event for a conv_key
+    and bound to that worker at spawn; scheduled fires use their own
+    ``schedule:<id>:<date>`` conv_key, so the override can never reach a
+    DM / conversation session. ``None`` (every transport-originated event)
+    means "use ``runtime.model``" — today's behavior.
 
     Both callable / future fields are excluded from compare / hash so
     the dataclass remains hashable and equality compares on the
@@ -201,6 +214,9 @@ class InboundEvent:
     # itself a safe reply address.
     reply_transport: str | None = field(default=None, compare=False, hash=False)
     reply_conversation_key: str | None = field(default=None, compare=False, hash=False)
+    model: str | None = field(
+        default=None, compare=False, hash=False, repr=False
+    )
 
 
 @dataclass(frozen=True)

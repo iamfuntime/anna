@@ -276,6 +276,25 @@ class ConversationRouter:
         async with self._workers_lock:
             worker = self._workers.get(key)
             if worker is not None:
+                # The model override is bound at spawn (like ``ephemeral``).
+                # A scheduled fire whose Schedule.model changed since this
+                # worker spawned keeps the worker's bound model until it
+                # idle-closes or the per-day conv_key rolls over. Surface
+                # that instead of silently running on the old model. Only
+                # scheduler-originated events are compared: a background
+                # delegation completion landing on the same conv_key
+                # carries no model and must not be read as "unset".
+                if (
+                    "schedule_id" in event.raw
+                    and event.model != getattr(worker, "model_override", None)
+                ):
+                    self._log.warning(
+                        "router.schedule_model_pending",
+                        conv_key=key,
+                        schedule_id=event.raw.get("schedule_id"),
+                        bound_model=getattr(worker, "model_override", None),
+                        requested_model=event.model,
+                    )
                 return worker
             # Phase 2 §5 subtask 7: propagate ``event.ephemeral`` to the
             # worker on the FIRST event for a given conv_key. Subsequent
@@ -296,6 +315,7 @@ class ConversationRouter:
                 google_clients=self._google_clients,
                 subagent_runner=self._subagent_runner,
                 ephemeral=event.ephemeral,
+                model_override=event.model,
                 visibility=self._build_visibility_callbacks(event.transport),
                 alerter=self._alerter,
             )
@@ -306,6 +326,7 @@ class ConversationRouter:
                 channel=event.transport,
                 conv_key=key,
                 ephemeral=event.ephemeral,
+                model_override=event.model,
             )
         return worker
 

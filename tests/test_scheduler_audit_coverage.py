@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -43,6 +44,8 @@ EXPECTED_EVENTS = (
     # Tool-free-scheduled-turn guard (2026-07-29 oem-slide-restock-watch).
     "audit.schedule.no_tool_call_retry",
     "audit.schedule.no_tool_call_abort",
+    # Optional per-schedule gate_command pre-flight.
+    "audit.schedule.gate_skip",
     # Notification-only reply guard (2026-07-30 sub-agent flood).
     "audit.reply.notification_only_suppressed",
 )
@@ -189,6 +192,7 @@ def _make_schedule(
     id: str = "audit-test",
     enabled: bool = True,
     state: ScheduleState | None = None,
+    gate_command: list[str] | None = None,
 ) -> Schedule:
     return Schedule(
         id=id,
@@ -197,6 +201,7 @@ def _make_schedule(
         destination=ScheduleDestination(transport="slack", channel="CTEST"),
         timeout_seconds=300,
         enabled=enabled,
+        gate_command=gate_command,
         created_at=datetime(2026, 6, 1, tzinfo=timezone.utc),
         state=state or ScheduleState(),
     )
@@ -243,6 +248,16 @@ async def test_every_expected_event_emits(tmp_path: Path) -> None:
     # Restore the fail-open default so nothing below inherits the zero count.
     router.tool_call_count = None
     router.reply = "ok"
+
+    # 7d: the gate_command pre-flight. A gate that exits 0 is the one
+    # unambiguous "skip" signal, and the row it emits is the only record the
+    # tick happened, so the suppression rate is measured and not estimated.
+    await store.create(
+        _make_schedule(
+            id="gated", gate_command=[sys.executable, "-c", "raise SystemExit(0)"]
+        )
+    )
+    await sched._guarded_fire(store.get("gated"))  # type: ignore[arg-type]
 
     # 7c: the notification-only reply guard (2026-07-30). A turn triggered by
     # NOTHING but a finished background delegation runs to completion and has

@@ -16,6 +16,8 @@ from pathlib import Path
 import pytest
 
 from anna.config import AnnaConfig
+from anna.log import transcript_event
+from anna.runtime.delivered_posts import record_delivered_post
 from anna.runtime.supervisor import Supervisor
 from anna.runtime.worker import ConversationWorker
 
@@ -398,3 +400,147 @@ def test_broken_transcript_dir_falls_back_to_checkpoint(tmp_path: Path, monkeypa
     assert "# Recent checkpoints (resume context)" in prompt
     assert "session summary" in prompt
     assert TAIL_HEADING not in prompt
+
+
+# ---------------------------------------------------------------------------
+# Scheduled posts delivered into this conversation (2026-10-07 incident)
+# ---------------------------------------------------------------------------
+
+
+def test_scheduled_post_in_resume_context_with_origin_label(tmp_path: Path) -> None:
+    """The DM worker that spawns for the operator's reply must see the
+    scheduled post the reply is about, labelled as a scheduled post."""
+    worker = _make_worker(tmp_path)
+    cfg = worker._config
+    vault_root = cfg.vault.resolved_path
+
+    # The DM's last checkpoint predates the scheduled post.
+    ckpt = _plant_checkpoint(vault_root, "2026-10-03-0945", "PDF read crashed twice")
+    _set_mtime(ckpt, 1_000_000.0)
+
+    # The scheduler delivers the heartbeat alert into the operator's DM ...
+    alert = "DocuSign: Damon signed the offer letter 4 minutes ago."
+    recorded = record_delivered_post(
+        cfg,
+        transport="slack",
+        channel="UTEST",
+        text=alert,
+        source="schedule:heartbeat",
+    )
+    assert recorded == CONV_KEY
+    # ... and the operator replies, which the router logs before it spawns
+    # the worker.
+    transcript_event(
+        channel="slack",
+        conv_key=CONV_KEY,
+        transcripts_dir=cfg.transcripts_dir,
+        direction="inbound",
+        text="Fuck yea it did",
+        sender_id="UTEST",
+        sender_display="UTEST",
+        is_dm=True,
+        is_thread=False,
+    )
+
+    prompt = worker._assemble_system_prompt(
+        anna_home=cfg.anna_home,
+        vault_root=vault_root,
+        format_rule="(no rule)",
+    )
+
+    assert "# Recent checkpoints (resume context)" in prompt
+    assert TAIL_HEADING in prompt
+    labelled = f"**anna (scheduled: heartbeat):** {alert}"
+    assert labelled in prompt
+    assert "**you:** Fuck yea it did" in prompt
+    # Chronological: the post the operator is replying to comes first, and
+    # the whole tail sits after the checkpoint block.
+    assert (
+        prompt.index("PDF read crashed twice")
+        < prompt.index(labelled)
+        < prompt.index("**you:** Fuck yea it did")
+    )
+    # It is not mislabelled as a conversational reply.
+    assert f"**anna:** {alert}" not in prompt
+
+
+def test_scheduled_post_alone_in_resume_context_without_checkpoint(
+    tmp_path: Path,
+) -> None:
+    """First contact in a DM that has only ever received a scheduled post."""
+    worker = _make_worker(tmp_path)
+    cfg = worker._config
+
+    record_delivered_post(
+        cfg,
+        transport="slack",
+        channel="UTEST",
+        text="Calendar: standup moved to 10:30.",
+        source="schedule:heartbeat",
+    )
+
+    prompt = worker._assemble_system_prompt(
+        anna_home=cfg.anna_home,
+        vault_root=cfg.vault.resolved_path,
+        format_rule="(no rule)",
+    )
+    assert "Recent checkpoints" not in prompt
+    assert TAIL_HEADING in prompt
+    assert "**anna (scheduled: heartbeat):** Calendar: standup moved to 10:30." in prompt
+
+
+def test_scheduled_post_covered_by_checkpoint_not_repeated(tmp_path: Path) -> None:
+    """Same dedup rule as every other transcript line: a row the latest
+    checkpoint explicitly covers (stable sequence + event id, never mtime)
+    is not replayed in the tail."""
+    worker = _make_worker(tmp_path)
+    cfg = worker._config
+    vault_root = cfg.vault.resolved_path
+
+    record_delivered_post(
+        cfg,
+        transport="slack",
+        channel="UTEST",
+        text="an alert the checkpoint already covers",
+        source="schedule:heartbeat",
+    )
+    rows = [
+        json.loads(line)
+        for path in cfg.transcripts_dir.rglob("*.jsonl")
+        for line in path.read_text().splitlines()
+    ]
+    row = next(r for r in rows if r.get("source") == "schedule:heartbeat")
+    ckpt = _plant_checkpoint(vault_root, "2099-01-01-0000", "covers the alert")
+    ckpt.write_text(
+        "---\n"
+        f"coverage_end_sequence: {row['sequence']}\n"
+        f"coverage_end_event_id: {row['event_id']}\n"
+        "---\n# Checkpoint\n\ncovers the alert\n",
+        encoding="utf-8",
+    )
+
+    prompt = worker._assemble_system_prompt(
+        anna_home=cfg.anna_home,
+        vault_root=vault_root,
+        format_rule="(no rule)",
+    )
+    assert "covers the alert" in prompt
+    assert TAIL_HEADING not in prompt
+    assert "an alert the checkpoint already covers" not in prompt
+
+
+def test_scheduled_post_with_legacy_checkpoint_is_replayed(tmp_path: Path) -> None:
+    """A legacy checkpoint (no coverage metadata) cannot prove it covers the
+    post; mtime is not a cursor, so the post is shown rather than lost."""
+    worker = _make_worker(tmp_path)
+    cfg = worker._config
+    record_delivered_post(
+        cfg, transport="slack", channel="UTEST",
+        text="an alert nobody acknowledged", source="schedule:heartbeat",
+    )
+    ckpt = _plant_checkpoint(cfg.vault.resolved_path, "2099-01-01-0000", "legacy summary")
+    _set_mtime(ckpt, datetime(2099, 1, 1, tzinfo=timezone.utc).timestamp())
+    prompt = worker._assemble_system_prompt(
+        anna_home=cfg.anna_home, vault_root=cfg.vault.resolved_path, format_rule="(no rule)",
+    )
+    assert "an alert nobody acknowledged" in prompt

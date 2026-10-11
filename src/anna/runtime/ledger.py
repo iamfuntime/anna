@@ -41,7 +41,7 @@ from anna.runtime.fsutil import private_file
 
 ACTIVE_EXEC = ("claimed", "running")
 TERMINAL_EXEC = ("succeeded", "failed", "timeout", "cancelled", "unknown", "blocked",
-                 "skipped_overlap", "skipped_misfire", "partial", "auth_required", "resolved_unknown")
+                 "skipped_overlap", "skipped_misfire", "skipped_gate", "partial", "auth_required", "resolved_unknown")
 MAX_RECORDED_MISFIRES = 20
 
 

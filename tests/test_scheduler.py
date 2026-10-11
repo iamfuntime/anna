@@ -577,6 +577,202 @@ async def test_mark_dispatched_preserves_failure_state(tmp_path: Path) -> None:
     assert schedule.state.consecutive_failures == 2
 
 
+# ---------------------------------------------------------------------------
+# Delivered post -> destination conversation transcript (2026-10-07 incident:
+# a heartbeat alert landed in the operator's DM and the DM's own conversation
+# had no record of it when the operator replied 17 seconds later).
+# ---------------------------------------------------------------------------
+
+
+DM_USER = "USP2QLB41"
+
+
+def _dm_transcript_rows(cfg: AnnaConfig, user_id: str = DM_USER) -> list[dict]:
+    conv_dir = cfg.transcripts_dir / f"slack-dm-{user_id}"
+    rows: list[dict] = []
+    if not conv_dir.is_dir():
+        return rows
+    for path in sorted(conv_dir.glob("*.jsonl")):
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                rows.append(json.loads(line))
+    return rows
+
+
+def _make_dm_scheduler(
+    cfg: AnnaConfig, store: ScheduleStore, reply: str
+) -> tuple[Scheduler, FakeAdapter]:
+    router = FakeRouter()
+    router.reply = reply
+    adapter = FakeAdapter()
+    sched = Scheduler(
+        config=cfg,
+        store=store,
+        router=router,  # type: ignore[arg-type]
+        adapters={"slack": adapter},
+        alerter=FakeAlerter(),  # type: ignore[arg-type]
+    )
+    return sched, adapter
+
+
+@pytest.mark.asyncio
+async def test_scheduled_post_to_dm_recorded_in_dm_transcript(tmp_path: Path) -> None:
+    """A delivered scheduled post is appended to the destination DM's own
+    transcript as an outbound row tagged with the schedule it came from."""
+    cfg, store = await _make_store_with_schedule(
+        tmp_path, schedule=_make_schedule(id="heartbeat", channel=DM_USER)
+    )
+    alert = "DocuSign: Damon signed the offer letter 4 minutes ago."
+    sched, adapter = _make_dm_scheduler(cfg, store, alert)
+
+    await sched._guarded_fire(store.get("heartbeat"))  # type: ignore[arg-type]
+
+    assert [m.text for m in adapter.sent] == [alert]
+    rows = _dm_transcript_rows(cfg)
+    assert len(rows) == 1
+    assert rows[0]["direction"] == "outbound"
+    assert rows[0]["conv_key"] == f"slack:dm:{DM_USER}"
+    assert rows[0]["text"] == alert
+    assert rows[0]["source"] == "schedule:heartbeat"
+
+    audits = _read_audit_records(cfg.audit_dir)
+    complete = _events(audits, "audit.schedule.complete")
+    assert complete[0]["suppressed"] is False
+    # Execution is recorded before delivery in the ledger design, so the
+    # recording is its own audit row rather than a field on ``complete``.
+    recorded = _events(audits, "audit.schedule.delivered_post_recorded")
+    assert recorded[0]["recorded_conv_key"] == f"slack:dm:{DM_USER}"
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        QUIET_SENTINEL,
+        f"I'll re-read the skill and run the checks.\n{QUIET_SENTINEL}",
+        # Blank-output guard: no alphanumeric character at all.
+        ".",
+        # Leaked tool-call markup guard.
+        '<function_calls>\n<invoke name="Read">\n</invoke>\n</function_calls>',
+    ],
+)
+@pytest.mark.asyncio
+async def test_suppressed_scheduled_output_never_recorded(
+    tmp_path: Path, reply: str
+) -> None:
+    """Nothing was posted, so nothing may be written to the DM transcript —
+    least of all the literal sentinel."""
+    cfg, store = await _make_store_with_schedule(
+        tmp_path, schedule=_make_schedule(id="heartbeat", channel=DM_USER)
+    )
+    sched, adapter = _make_dm_scheduler(cfg, store, reply)
+
+    await sched._guarded_fire(store.get("heartbeat"))  # type: ignore[arg-type]
+
+    assert adapter.sent == []
+    assert _dm_transcript_rows(cfg) == []
+    assert not (cfg.transcripts_dir / f"slack-dm-{DM_USER}").exists()
+
+    complete = _events(_read_audit_records(cfg.audit_dir), "audit.schedule.complete")
+    assert complete[0]["suppressed"] is True
+    assert complete[0]["recorded_conv_key"] is None
+
+
+@pytest.mark.asyncio
+async def test_failed_send_to_dm_not_recorded(tmp_path: Path) -> None:
+    """A post that never reached Slack must not appear in the DM's history."""
+    cfg, store = await _make_store_with_schedule(
+        tmp_path, schedule=_make_schedule(id="heartbeat", channel=DM_USER)
+    )
+    sched, adapter = _make_dm_scheduler(cfg, store, "an alert that will not send")
+    adapter.send_should_raise = RuntimeError("network down")
+
+    await sched._guarded_fire(store.get("heartbeat"))  # type: ignore[arg-type]
+
+    assert _dm_transcript_rows(cfg) == []
+    audits = _read_audit_records(cfg.audit_dir)
+    assert _events(audits, "audit.schedule.fail")
+    assert not _events(audits, "audit.schedule.delivered_post_recorded")
+
+
+@pytest.mark.asyncio
+async def test_scheduled_post_to_shared_channel_not_recorded(tmp_path: Path) -> None:
+    """A shared channel has no single conversation key (channel conversations
+    are keyed per thread), so the post is delivered but not recorded."""
+    cfg, store = await _make_store_with_schedule(tmp_path, schedule=_make_schedule())
+    sched, adapter = _make_dm_scheduler(cfg, store, "Morning brief: all quiet.")
+
+    await sched._guarded_fire(store.get("morning-brief"))  # type: ignore[arg-type]
+
+    assert len(adapter.sent) == 1
+    assert not cfg.transcripts_dir.exists()
+    complete = _events(_read_audit_records(cfg.audit_dir), "audit.schedule.complete")
+    assert complete[0]["recorded_conv_key"] is None
+
+
+@pytest.mark.asyncio
+async def test_record_failure_does_not_fail_delivered_fire(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The post is already delivered; a recording crash must leave the run a
+    success rather than counting toward the three-strikes auto-disable."""
+    cfg, store = await _make_store_with_schedule(
+        tmp_path, schedule=_make_schedule(id="heartbeat", channel=DM_USER)
+    )
+    sched, adapter = _make_dm_scheduler(cfg, store, "an alert")
+
+    def _boom(*_args: object, **_kwargs: object) -> str:
+        raise RuntimeError("transcript recorder exploded")
+
+    monkeypatch.setattr("anna.runtime.scheduler.record_delivered_post", _boom)
+
+    await sched._guarded_fire(store.get("heartbeat"))  # type: ignore[arg-type]
+
+    assert len(adapter.sent) == 1
+    audits = _read_audit_records(cfg.audit_dir)
+    assert _events(audits, "audit.schedule.complete")
+    assert not _events(audits, "audit.schedule.fail")
+    assert store.get("heartbeat").state.consecutive_failures == 0  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_next_dm_worker_resume_context_contains_scheduled_post(
+    tmp_path: Path,
+) -> None:
+    """End to end: the scheduler delivers an alert to the DM, then a fresh
+    worker for that DM builds its system prompt and finds the alert in the
+    resume context, labelled with the schedule it came from."""
+    from anna.runtime.worker import ConversationWorker
+
+    cfg, store = await _make_store_with_schedule(
+        tmp_path, schedule=_make_schedule(id="heartbeat", channel=DM_USER)
+    )
+    cfg.vault.path = str(tmp_path / "vault")
+    cfg.core_dir.mkdir(parents=True, exist_ok=True)
+    alert = "DocuSign: Damon signed the offer letter 4 minutes ago."
+    sched, _adapter = _make_dm_scheduler(cfg, store, alert)
+
+    await sched._guarded_fire(store.get("heartbeat"))  # type: ignore[arg-type]
+
+    async def _noop_send(_msg: OutboundMessage) -> None:
+        return None
+
+    worker = ConversationWorker(
+        conversation_key=f"slack:dm:{DM_USER}",
+        transport="slack",
+        config=cfg,
+        supervisor=Supervisor(config=cfg),
+        send=_noop_send,
+    )
+    prompt = worker._assemble_system_prompt(
+        anna_home=cfg.anna_home,
+        vault_root=cfg.vault.resolved_path,
+        format_rule="(no rule)",
+    )
+
+    assert "# Unsaved conversation tail (since last checkpoint)" in prompt
+    assert f"**anna (scheduled: heartbeat):** {alert}" in prompt
+
+
 @pytest.mark.asyncio
 async def test_dest_conv_key_format() -> None:
     assert (

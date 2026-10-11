@@ -13,6 +13,9 @@ The single tool, ``slack_post``:
 * Sends an :class:`~anna.transports.base.OutboundMessage` keyed
   ``slack:dm:<channel>`` — the no-thread form that posts a fresh message
   to a channel (AdminAlerter uses exactly this key shape).
+* Appends the delivered post to the destination conversation's transcript
+  when the destination is a DM (see :mod:`anna.runtime.delivered_posts`),
+  so that conversation knows about a message posted into it from elsewhere.
 * Emits an ``audit.slack_post.dispatched`` event so the operator can
   reconstruct what ANNA posted.
 * Returns a short text response (errors are returned as text, not raised,
@@ -31,6 +34,7 @@ from claude_agent_sdk import create_sdk_mcp_server, tool
 
 from anna.config import AnnaConfig
 from anna.log import audit_event, get_logger
+from anna.runtime.delivered_posts import record_delivered_post
 from anna.transports.base import ChannelAdapter, OutboundMessage
 
 
@@ -134,6 +138,26 @@ class SlackAlertTools:
             )
             return _text_response(f"Slack post to {channel} failed: {exc}")
 
+        # The post bypassed the destination conversation's own worker, so
+        # that conversation has no trace of it. Append it to that
+        # conversation's transcript (a DM today; a shared channel has no
+        # single conversation key and records nothing) so the operator's
+        # next message there has a referent. Guarded like the send above: a
+        # recording problem must not turn a delivered post into a failure.
+        recorded_conv_key: str | None = None
+        try:
+            recorded_conv_key = record_delivered_post(
+                self.config,
+                transport="slack",
+                channel=channel,
+                text=text,
+                source=f"slack_post:{conv_key}",
+            )
+        except Exception as exc:  # noqa: BLE001 — the post is already delivered
+            self._log.warning(
+                "slack_post.record_failed", channel=channel, error=str(exc)
+            )
+
         audit_event(
             "audit.slack_post.dispatched",
             audit_dir=self.config.audit_dir,
@@ -142,6 +166,7 @@ class SlackAlertTools:
             fsync_on_write=self.config.logging.audit.fsync_on_write,
             channel=channel,
             text_len=len(text),
+            recorded_conv_key=recorded_conv_key,
         )
         self._log.info("slack_post.dispatched", channel=channel, text_len=len(text))
         return _text_response(f"posted to Slack channel {channel}")
