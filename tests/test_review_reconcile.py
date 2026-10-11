@@ -14,9 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from anna.runtime.delivered_posts import conv_key_for_destination
 from anna.runtime.ledger import iso, now_utc
-from anna.runtime.schedule_types import ScheduleState
 from anna.vault.transcript_resume import render_delivered_posts
 from tests.test_scheduler_gate_command import _events, _read_audit_records
 from tests.test_scheduler_ledger import Router, build, make_schedule, settle

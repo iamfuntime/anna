@@ -8,7 +8,6 @@ Synthetic fixtures only; everything lives under tmp_path.
 from __future__ import annotations
 
 import sqlite3
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 

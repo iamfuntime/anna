@@ -736,7 +736,7 @@ def _confirm_plan(state: WizardState) -> bool:
     if _live_units_blocked(state):
         click.echo("  Service     : NOT installed (trial ANNA_HOME; the live units are never touched)")
     else:
-        click.echo(f"  Service     : systemd user unit 'anna', enabled + started now")
+        click.echo("  Service     : systemd user unit 'anna', enabled + started now")
     web_state = "enabled (127.0.0.1:8765)" if state.web_enabled else "disabled (unit installed but stopped)"
     click.echo(f"  Web dashboard: {web_state}")
     return click.confirm("\nWrite config and start ANNA?", default=True)
@@ -976,6 +976,8 @@ def _write_anna_yaml(state: WizardState, path: Path) -> None:
     slack_admin = state.slack_admin_channel or ""
     telegram_admin = state.telegram_admin_chat_id or ""
     web_enabled_yaml = "true" if state.web_enabled else "false"
+    cli_socket = state.anna_home / "anna.sock"  # under the chosen home, never the literal ~/anna
+    target_unit = '""' if _live_units_blocked(state) else "anna.service"  # a trial home must not restart a live unit
 
     body = f"""# ============================================================
 # ANNA configuration
@@ -1012,7 +1014,7 @@ transports:
   # ships NDJSON framing only; the field is kept for forward-compat.
   cli:
     enabled: true
-    socket_path: {state.anna_home / "anna.sock"}
+    socket_path: {cli_socket}
     idle_gap_minutes: 30
     framing: ndjson
 
@@ -1075,7 +1077,7 @@ web:
   enabled: {web_enabled_yaml}
   host: 127.0.0.1
   port: 8765
-  target_unit: {"anna.service" if not _live_units_blocked(state) else '""'}
+  target_unit: {target_unit}
 """
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(body, encoding="utf-8")

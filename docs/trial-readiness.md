@@ -11,7 +11,7 @@ Evidence at the commit that contains this file (see `git log -1`; run on 2026-10
 
 | check | result |
 | --- | --- |
-| full suite | recorded in the status document at the commit that contains this file |
+| full suite | 1,904 passed, 1 skipped (was 1,840 at `fb4865a`); also run from a `git archive` copy with a scrubbed environment |
 | earlier reviews (`foundation-review-10ff5ba`, `integration-review-cf72508`) | fixed in `87fa663`, `d1a289d`, `20044d7` |
 | reconciliation review `fb4865a` (H1, H2, M1-M9, L1-L7) | fixed; L8 (Slack file intake hardening, identical to main) deliberately deferred |
 | two-build upgrade -> rollback -> retrial | `tests/test_upgrade_rollback_acceptance.py`: a vendored mock of main `59b946a` (golden `schedules.yaml`, its pydantic model, its rewrite-on-every-fire store) and this build alternate on one temp home with a fake clock |
@@ -69,7 +69,7 @@ alone, or set it explicitly if `uv` complains with the overridden `HOME`.)
 cd "$FEATURE_WORKTREE"
 git status --short --branch        # expect branch iamfuntime/anna-reliability, clean
 ANNA_HOME="$(mktemp -d)" HOME="$(mktemp -d)" uv run --extra dev pytest -q -p no:cacheprovider
-# expect: 1840 passed, 1 skipped
+# expect: 1904 passed, 1 skipped
 ```
 
 Focused groups: `tests/test_review_fixes.py` (foundation review), `tests/test_integration_fixes.py`,
