@@ -189,6 +189,7 @@ def _make_worker(
     flush_seconds: int = 30,
     voice_only: bool = False,
     voice_enabled: bool = True,
+    turn_watchdog: bool = False,
 ) -> ConversationWorker:
     cfg = AnnaConfig()
     object.__setattr__(cfg, "anna_home", tmp_path / "anna_home")
@@ -196,6 +197,12 @@ def _make_worker(
     cfg.logging.audit.fsync_on_write = False
     cfg.core_dir.mkdir(parents=True, exist_ok=True)
     cfg.runtime.visibility.periodic_flush_seconds = flush_seconds
+    # The interactive-turn watchdog (add4819) is default-ON and flushes the
+    # pending buffer at its 60s soft threshold — a deliberate override of the
+    # drip gate, which these tests cross whenever they advance the clock past
+    # 60s. Off by default here so each test exercises the drip gate alone; the
+    # override is covered by its own tests below and in test_turn_watchdog.py.
+    cfg.runtime.turn_watchdog.enabled = turn_watchdog
     cfg.voice.outbound.enabled = voice_enabled
     cfg.voice.outbound.voice_only = voice_only
     supervisor = Supervisor(config=cfg)
@@ -457,6 +464,81 @@ async def test_disabled_interval_never_drips(tmp_path: Path, clock: _FakeClock) 
     await asyncio.gather(worker._handle(_make_event()), _driver())
 
     assert [m.text for m in sent] == ["one\ntwo"]
+
+
+# ---------------------------------------------------------------------------
+# The turn watchdog overrides the drip gate (deliberate — add4819)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_watchdog_flushes_despite_voice_only(tmp_path: Path, clock: _FakeClock) -> None:
+    """Voice-only suppresses the drip timer but NOT the watchdog: a turn that
+    runs past the soft threshold still flushes mid-turn, so a long voice reply
+    arrives as two clips rather than one. A dead channel outweighs the
+    one-message preference (``_turn_watchdog_active``). The split is decided
+    here; the transport is what renders each message as audio."""
+    sent: list[OutboundMessage] = []
+    worker = _make_worker(
+        tmp_path,
+        sent,
+        flush_seconds=30,
+        voice_only=True,
+        voice_enabled=True,
+        turn_watchdog=True,
+    )
+
+    gates = {"hold": asyncio.Event()}
+    worker._client = _GappedClient(
+        steps=[
+            _FakeTextBlock(text="spoken"),
+            ("gate", "hold"),
+            _FakeTextBlock(text="reply"),
+        ],
+        gates=gates,
+    )
+
+    async def _driver() -> None:
+        await _spin()
+        # Past the 60s soft AND the 120s hard threshold.
+        clock.advance(120)
+        await _wait_for(lambda: len(sent) >= 1)
+        gates["hold"].set()
+
+    await asyncio.gather(worker._handle(_make_event()), _driver())
+
+    assert [m.text for m in sent] == ["spoken", "reply"]
+
+
+@pytest.mark.asyncio
+async def test_watchdog_flushes_despite_disabled_interval(
+    tmp_path: Path, clock: _FakeClock
+) -> None:
+    """``periodic_flush_seconds == 0`` turns the drip timer off, but the
+    watchdog still owns the channel-hostage guard: a turn past the soft
+    threshold flushes what is pending instead of going silent."""
+    sent: list[OutboundMessage] = []
+    worker = _make_worker(tmp_path, sent, flush_seconds=0, turn_watchdog=True)
+
+    gates = {"hold": asyncio.Event()}
+    worker._client = _GappedClient(
+        steps=[
+            _FakeTextBlock(text="one"),
+            ("gate", "hold"),
+            _FakeTextBlock(text="two"),
+        ],
+        gates=gates,
+    )
+
+    async def _driver() -> None:
+        await _spin()
+        clock.advance(120)
+        await _wait_for(lambda: len(sent) >= 1)
+        gates["hold"].set()
+
+    await asyncio.gather(worker._handle(_make_event()), _driver())
+
+    assert [m.text for m in sent] == ["one", "two"]
 
 
 # ---------------------------------------------------------------------------

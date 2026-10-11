@@ -87,7 +87,46 @@ def _accumulate_turn_usage(
         total["model"] = model
 
 
-__all__ = ["QUIET_SENTINEL", "Scheduler"]
+# Auth-outage marker (2026-09-04 incident: the OAuth refresh token lapsed and
+# the bundled CLI answered every scheduled turn with the synthetic text
+# "Failed to authenticate: OAuth session expired and could not be refreshed"
+# — zero tool calls, so the no-tool-call backstop retried, then failed, and
+# three ticks later auto-disabled `heartbeat`). An expired session is a
+# board-wide condition, not a defect of the schedule that happened to fire
+# first: it must never count toward a schedule's three strikes, and the
+# operator needs ONE loud alert, not one per schedule per tick.
+#
+# Matching (2026-09-05 false positive: a healthy morning-brief reply that
+# merely *mentioned* the previous day's outage mid-text was swallowed,
+# stamped auth_expired, and paged the operator). The CLI's synthetic failure
+# is the ENTIRE reply — audit 2026-09-04 17:00Z..22:28Z shows the identical
+# 72-char text every tick, zero tool calls:
+#     "Failed to authenticate: OAuth session expired and could not be refreshed"
+# So a REPLY counts as auth-expired only when it has that shape: short,
+# starts with the marker or with AUTH_EXPIRED_PREFIX, contains the marker,
+# and the run recorded no tool calls (unknown count fails open, like the
+# no-tool-call backstop). Exception text keeps the plain substring match —
+# an exception carrying the phrase cannot be a normal reply.
+AUTH_EXPIRED_MARKER = "OAuth session expired and could not be refreshed"
+AUTH_EXPIRED_PREFIX = "Failed to authenticate"
+# Upper bound on a synthetic failure reply. The real one is 72 chars; a
+# real brief/digest is thousands. Generous so minor CLI rewording still
+# matches, tight enough that no postable prose can.
+AUTH_EXPIRED_REPLY_MAX_CHARS = 240
+
+# Minimum spacing between auth-expired operator alerts. Every schedule that
+# fires during an outage hits the same wall; the first one alerts, the rest
+# are logged only, until this much time has passed.
+AUTH_ALERT_INTERVAL_SECONDS = 3600.0
+
+__all__ = [
+    "AUTH_ALERT_INTERVAL_SECONDS",
+    "AUTH_EXPIRED_MARKER",
+    "AUTH_EXPIRED_PREFIX",
+    "AUTH_EXPIRED_REPLY_MAX_CHARS",
+    "QUIET_SENTINEL",
+    "Scheduler",
+]
 
 
 class Scheduler:
@@ -119,6 +158,9 @@ class Scheduler:
         self._tasks_by_schedule: dict[str, set[asyncio.Task[None]]] = {}
         self._shutdown_grace_seconds: float = 5.0
         self._cancel_grace_seconds: float = 2.0
+        # Monotonic timestamp of the last auth-expired operator alert, for
+        # the once-per-AUTH_ALERT_INTERVAL_SECONDS rate limit. None = never.
+        self._last_auth_alert_monotonic: float | None = None
 
     # ------------------------------------------------------------------
     # Public lifecycle
@@ -346,6 +388,14 @@ class Scheduler:
                     timeout=schedule.timeout_seconds,
                 )
                 _accumulate_turn_usage(usage_total, meta)
+                # Auth-outage intercept (2026-09-04 incident). Checked BEFORE
+                # the no-tool-call backstop because that is exactly the shape
+                # an expired session produces: a tool-free synthetic reply.
+                # Retrying cannot help (the credential is the problem, not
+                # the model) and the text must never post to the destination.
+                if self._is_auth_expired_reply(reply, meta):
+                    await self._handle_auth_expired(schedule, detail=reply or "")
+                    return
                 # No-tool-call backstop (2026-07-29 incident:
                 # oem-slide-restock-watch resolved in 2.5s with zero tool
                 # calls and the bare text "I'll read the skill file first",
@@ -382,6 +432,11 @@ class Scheduler:
                         timeout=schedule.timeout_seconds,
                     )
                     _accumulate_turn_usage(usage_total, meta)
+                    if self._is_auth_expired_reply(reply, meta):
+                        # Session lapsed between the first attempt and the
+                        # retry — same board-wide condition, same handling.
+                        await self._handle_auth_expired(schedule, detail=reply or "")
+                        return
                     if self._is_no_tool_call_prose(reply, meta):
                         await self._handle_no_tool_call_abort(
                             schedule, first_reply=first_reply, retry_reply=reply
@@ -393,6 +448,9 @@ class Scheduler:
                 )
                 return
             except Exception as exc:
+                if self._is_auth_expired_exception(str(exc)):
+                    await self._handle_auth_expired(schedule, detail=str(exc))
+                    return
                 await self._handle_failure(schedule, reason=f"error: {exc}", kind="fail")
                 return
 
@@ -525,6 +583,99 @@ class Scheduler:
         if cls._is_quiet_sentinel(reply) or cls._is_blank_output(reply):
             return False
         return not _contains_unparsed_toolcall_markup(reply)
+
+    @staticmethod
+    def _is_auth_expired_exception(text: str | None) -> bool:
+        """True when EXCEPTION text carries :data:`AUTH_EXPIRED_MARKER`.
+
+        Plain substring: an exception message is never postable prose, so
+        the 2026-09-05 false-positive shape cannot arise here.
+        """
+        return bool(text) and AUTH_EXPIRED_MARKER in text
+
+    @staticmethod
+    def _is_auth_expired_reply(reply: str | None, meta: dict[str, object]) -> bool:
+        """True when a REPLY is the bundled CLI's synthetic auth failure.
+
+        Shape match, not substring (2026-09-05 false positive: a 2.7k-char
+        morning brief that quoted the phrase mid-text was intercepted). All
+        of the following must hold, mirroring what the CLI actually emits
+        (see :data:`AUTH_EXPIRED_MARKER`):
+
+        * the stripped text is at most :data:`AUTH_EXPIRED_REPLY_MAX_CHARS`,
+        * it STARTS with the marker or with :data:`AUTH_EXPIRED_PREFIX`,
+        * it contains the marker,
+        * ``meta["tool_call_count"]`` is absent/unknown or ``0`` — a run that
+          executed tools authenticated fine, whatever its text says.
+        """
+        if not reply:
+            return False
+        text = reply.strip()
+        if not text or len(text) > AUTH_EXPIRED_REPLY_MAX_CHARS:
+            return False
+        if not (text.startswith(AUTH_EXPIRED_MARKER) or text.startswith(AUTH_EXPIRED_PREFIX)):
+            return False
+        if AUTH_EXPIRED_MARKER not in text:
+            return False
+        count = meta.get("tool_call_count")
+        if isinstance(count, int) and count > 0:
+            return False
+        return True
+
+    async def _handle_auth_expired(self, schedule: Schedule, *, detail: str) -> None:
+        """Board-wide auth outage: record it WITHOUT striking the schedule.
+
+        The run is neither a success (nothing ran) nor a schedule-local
+        failure (every schedule would fail identically). Bookkeeping:
+
+        * ``consecutive_failures`` is left untouched and the schedule is
+          NOT auto-disabled — :meth:`ScheduleStore.mark_auth_expired` only
+          stamps ``last_status="auth_expired"``. ``last_fired_at`` was
+          already advanced by ``mark_dispatched``, so the schedule simply
+          waits for its next cron tick and re-tries then; once the operator
+          re-logs in, the next tick succeeds and resets state as usual.
+        * The reply text never reaches the destination transport.
+        * One operator alert per :data:`AUTH_ALERT_INTERVAL_SECONDS` goes
+          out through :class:`AdminAlerter` (critical level, since every
+          scheduled run is down until a human re-logs in). Suppressed
+          repeats are still audited and logged so the outage stays
+          reconstructable per schedule.
+        """
+        await self._store.mark_auth_expired(schedule.id)
+        now_mono = asyncio.get_running_loop().time()
+        last = self._last_auth_alert_monotonic
+        should_alert = last is None or (now_mono - last) >= AUTH_ALERT_INTERVAL_SECONDS
+        audit_event(
+            "audit.schedule.auth_expired",
+            audit_dir=self._audit_dir,
+            actor="anna",
+            fsync_on_write=self._fsync,
+            level="ERROR",
+            schedule_id=schedule.id,
+            detail=detail[:280],
+            alerted=should_alert,
+        )
+        self._log.error(
+            "anna.auth.session_expired",
+            schedule_id=schedule.id,
+            alerted=should_alert,
+            note="run skipped; consecutive_failures NOT incremented",
+        )
+        if not should_alert:
+            return
+        self._last_auth_alert_monotonic = now_mono
+        # AdminAlerter.critical is best-effort; do not block the loop on it.
+        asyncio.create_task(
+            self._alerter.critical(
+                "ANNA OAuth session expired and could not be refreshed. "
+                f"Scheduled run '{schedule.id}' was skipped (not counted as a "
+                "failure; nothing auto-disabled). EVERY scheduled run will "
+                "skip until someone re-logs in on the anna host "
+                "(`claude login` as funtime, writes ~/.claude/.credentials.json). "
+                "Next alert in 1h if still expired."
+            ),
+            name="scheduler.alert.auth_expired",
+        )
 
     async def _handle_no_tool_call_abort(
         self, schedule: Schedule, *, first_reply: str, retry_reply: str

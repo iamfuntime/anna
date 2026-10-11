@@ -43,7 +43,7 @@ class ScheduleState(BaseModel):
     """
 
     last_fired_at: datetime | None = None
-    last_status: Literal["complete", "fail", "timeout"] | None = None
+    last_status: Literal["complete", "fail", "timeout", "auth_expired"] | None = None
     consecutive_failures: int = 0
 
 

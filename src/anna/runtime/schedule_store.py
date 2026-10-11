@@ -331,6 +331,27 @@ class ScheduleStore:
             await self.save()
             return new_count
 
+    async def mark_auth_expired(self, schedule_id: str) -> None:
+        """Stamp ``last_status="auth_expired"`` WITHOUT touching
+        ``consecutive_failures`` or ``last_fired_at``.
+
+        An expired OAuth session is a board-wide outage, not a defect of the
+        schedule that happened to fire; it must never contribute to the
+        three-strikes auto-disable. ``last_fired_at`` keeps the value
+        ``mark_dispatched`` set so the schedule waits for its next cron tick
+        instead of re-firing every poll.
+        """
+        async with await self._supervisor.acquire(_STORE_KEY):
+            schedule = self._cache.get(schedule_id)
+            if schedule is None:
+                return
+            schedule.state = ScheduleState(
+                last_fired_at=schedule.state.last_fired_at,
+                last_status="auth_expired",
+                consecutive_failures=schedule.state.consecutive_failures,
+            )
+            await self.save()
+
     async def mark_disabled(self, schedule_id: str, *, reason: str) -> None:
         async with await self._supervisor.acquire(_STORE_KEY):
             schedule = self._cache.get(schedule_id)
