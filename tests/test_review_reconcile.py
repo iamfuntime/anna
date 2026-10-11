@@ -488,3 +488,17 @@ async def test_prune_drops_delivered_post_records_so_reused_ids_start_clean(tmp_
     led._conn.commit()
     led.prune(now=now_utc(), retention_days=30, text_retention_days=30)
     assert led._conn.execute("SELECT COUNT(*) FROM delivered_post_records").fetchone()[0] == 0
+
+
+async def test_long_dm_post_default_transport_chunking_records_full_text_once(tmp_path):
+    """Default (transport-specific) chunking: an 8k DM post goes out in <=3900 parts, and the
+    live worker's context row holds the FULL text exactly once, even on a repeated settle pass."""
+    cfg, store, router, adapter, sched = await build(tmp_path, schedule=_dm_schedule())
+    text = "\n".join(f"row {i:04d} " + "y" * 62 for i in range(120))
+    _enqueue(sched, text, chunk=sched._chunk_limit)
+    await sched._deliver_due()
+    sched._record_settled_posts()
+    assert len(adapter.sent) >= 3 and all(len(m.text) <= 3900 for m in adapter.sent)
+    assert "".join(m.text for m in adapter.sent) == text
+    rows = _transcript_rows(cfg, f"slack:dm:{DM}")
+    assert len(rows) == 1 and rows[0]["text"] == text

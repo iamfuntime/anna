@@ -343,7 +343,7 @@ outbox rows commit in ONE transaction -> deliver outbox.
   counted as a failure, **never re-run**. A send in flight at crash/lease expiry
   -> `uncertain`, **never auto-resent**.
 - **Delivery vs execution:** delivery retries touch only outbox rows with
-  backoff (`delivery_*` settings); chunked at `delivery_chunk_chars`, chunk i+1
+  backoff (`delivery_*` settings); chunked at the destination transport's own limit (Slack 3900, Telegram 4096; `delivery_chunk_chars` is an optional explicit cap), chunk i+1
   only after chunk i is sent. Only errors that prove "not sent" (connection
   errors, HTTP 429, `retry_safe`, missing adapter) retry; other send errors are
   `uncertain` (opt-in `retry_unknown_send_errors`). Terminal delivery

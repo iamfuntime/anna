@@ -59,7 +59,13 @@ from anna.runtime.worker import (
     _contains_unparsed_toolcall_markup,
     _matched_markers,
 )
-from anna.transports.base import ChannelAdapter, InboundEvent, OutboundMessage
+from anna.transports.base import (
+    SLACK_MAX_CHARS,
+    TELEGRAM_MAX_CHARS,
+    ChannelAdapter,
+    InboundEvent,
+    OutboundMessage,
+)
 
 if TYPE_CHECKING:
     from anna.runtime.alerter import AdminAlerter
@@ -945,7 +951,7 @@ class Scheduler:
         written = self._ledger.finish_run(
             occurrence_id, run_id, status="succeeded", side_effects=result.side_effects,
             result=result.to_json(), outbox=[(dest.transport, dest.channel, result.output)],
-            chunk_chars=self._config.scheduler.delivery_chunk_chars)
+            chunk_chars=self._chunk_limit)
         if not written:
             return  # recovered/cancelled meanwhile: never enqueue a duplicate delivery
         await self._record_success(schedule, result.output, started_at=started_at,
@@ -997,7 +1003,7 @@ class Scheduler:
             specs = job.outbox_specs(schedule, outcome, now_f, tz) if allowed else []
             finish(occurrence_id, run_id, status=exec_status, side_effects="none", result=outcome.summary,
                    error=error, detail=error, outbox=specs or None,
-                   chunk_chars=cfg.scheduler.delivery_chunk_chars, heartbeat=outcome.commit)
+                   chunk_chars=self._chunk_limit, heartbeat=outcome.commit)
             audit_event("audit.schedule.heartbeat", audit_dir=self._audit_dir, actor="anna",
                         fsync_on_write=self._fsync, level="WARNING", schedule_id=schedule.id,
                         occurrence_id=occurrence_id, status="failed", error=error[:200],
@@ -1037,7 +1043,7 @@ class Scheduler:
         written = finish(
             occurrence_id, run_id, status=exec_status, side_effects="none", result=outcome.summary,
             error=None if outcome.status == "success" else outcome.status,
-            outbox=specs or None, chunk_chars=cfg.scheduler.delivery_chunk_chars,
+            outbox=specs or None, chunk_chars=self._chunk_limit,
             detail=outcome.status, heartbeat=outcome.commit)
         if not written:
             return  # recovered / cancelled meanwhile: never double-apply
@@ -1444,6 +1450,18 @@ class Scheduler:
         audit_event("audit.schedule.delivered_post_recorded", audit_dir=self._audit_dir, actor="anna",
                     fsync_on_write=self._fsync, schedule_id=sid, occurrence_id=occ, msg_index=idx,
                     parts=total, sent_parts=sent, partial=partial, recorded_conv_key=written, delivery_key=key)
+
+    def _chunk_limit(self, transport: str) -> int:
+        """Max characters per delivered part for ``transport``.
+
+        An explicit ``scheduler.delivery_chunk_chars`` wins; otherwise the
+        transport's own message limit, so a long post is split only where the
+        adapter itself would have split it (never at a universal lower cap).
+        """
+        configured = self._config.scheduler.delivery_chunk_chars
+        if configured is not None:
+            return configured
+        return {"slack": SLACK_MAX_CHARS, "telegram": TELEGRAM_MAX_CHARS}.get(transport, 3500)
 
     @staticmethod
     def _dest_conv_key(*, transport: str, channel: str) -> str:

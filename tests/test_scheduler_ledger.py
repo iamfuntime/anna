@@ -465,3 +465,49 @@ async def test_worker_interrupts_running_turn_on_cancel(tmp_path, sdk_fakes):
     cancel.set()
     await asyncio.wait_for(turn, 5)
     assert client.interrupted and meta["cancel_requested"] and meta["turn_state"] == "finished"
+
+
+# ---- transport-specific delivery chunking (no universal 3500 cap) -----------------------------------
+
+def _long_text(n: int) -> str:
+    return "\n".join(f"row {i:04d} " + "y" * 62 for i in range(n))  # ~71 chars/line
+
+
+async def _deliver(tmp_path, text, cfg=None):
+    router = Router(reply=text)
+    cfg, store, router, adapter, sched = await build(tmp_path, router=router, cfg=cfg)
+    await sched._poll_once(); await settle(sched)
+    return sched, adapter, sched._ledger.recent("s1")[0]
+
+
+async def test_default_slack_post_between_3500_and_3900_arrives_whole(tmp_path):
+    text = _long_text(52)  # ~3700 chars
+    assert 3500 < len(text) <= 3900
+    sched, adapter, occ = await _deliver(tmp_path, text)
+    assert [m.text for m in adapter.sent] == [text]
+    assert len(sched._ledger.outbox(occ.id)) == 1 and occ.delivery_status == "delivered"
+
+
+async def test_default_slack_longer_post_splits_at_transport_limit_losslessly(tmp_path):
+    text = _long_text(120)  # ~8500 chars
+    sched, adapter, occ = await _deliver(tmp_path, text)
+    parts = [m.text for m in adapter.sent]
+    assert len(parts) >= 3 and all(len(p) <= 3900 for p in parts) and max(map(len, parts)) > 3500
+    assert "".join(parts) == text
+    assert occ.delivery_status == "delivered"
+
+
+async def test_explicit_cap_still_overrides_for_every_transport(tmp_path):
+    cfg = make_cfg(tmp_path); cfg.scheduler.delivery_chunk_chars = 1000
+    text = _long_text(52)
+    sched, adapter, _ = await _deliver(tmp_path, text, cfg)
+    assert len(adapter.sent) >= 4 and all(len(m.text) <= 1000 for m in adapter.sent)
+    assert "".join(m.text for m in adapter.sent) == text
+
+
+def test_chunk_limit_per_transport(tmp_path):
+    from anna.runtime.scheduler import Scheduler
+    cfg = make_cfg(tmp_path)
+    limit = Scheduler._chunk_limit
+    holder = type("H", (), {"_config": cfg})()
+    assert (limit(holder, "slack"), limit(holder, "telegram"), limit(holder, "cli")) == (3900, 4096, 3500)

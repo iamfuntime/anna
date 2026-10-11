@@ -1364,7 +1364,11 @@ class SchedulerConfig(BaseModel):
     delivery_max_attempts: int = 5
     delivery_backoff_base_seconds: float = 30.0
     delivery_backoff_max_seconds: float = 900.0
-    delivery_chunk_chars: int = 3500
+    # None (default): split only at the destination transport's own limit
+    # (Slack 3900, Telegram 4096), exactly where ``main``'s adapters split, so
+    # a 3500-3900 char post arrives whole. An int is an explicit cap for every
+    # transport.
+    delivery_chunk_chars: int | None = None
     retention_days: float = 30.0
     text_retention_days: float = 7.0
     prune_interval_hours: float = 6.0

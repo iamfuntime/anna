@@ -729,12 +729,14 @@ class RuntimeLedger:
 
     def finish_run(self, occurrence_id: int, run_id: int, *, status: str, side_effects: str,
                    result: dict[str, Any] | None = None, error: str | None = None,
-                   outbox: list[tuple[Any, ...]] | None = None, chunk_chars: int = 3500,
+                   outbox: list[tuple[Any, ...]] | None = None,
+                   chunk_chars: int | Callable[[str], int] = 3500,
                    delivery_status: str | None = None, detail: str | None = None,
                    heartbeat: HeartbeatCommit | None = None) -> bool:
         """Atomically close the run, set exec status and enqueue outbox rows.
 
-        ``outbox`` is a list of ``(transport, channel, text)``.  Returns False if
+        ``outbox`` is a list of ``(transport, channel, text)``; ``chunk_chars`` is a
+        fixed limit or a callable mapping the transport name to its limit.  Returns False if
         the occurrence is no longer ``running`` (e.g. recovered or cancelled
         meanwhile) - in which case nothing is written, so a late finisher can
         never enqueue a duplicate delivery.
@@ -754,7 +756,8 @@ class RuntimeLedger:
                 for msg_index, spec in enumerate(outbox):
                     transport, channel, text = spec[:3]
                     not_before = spec[3] if len(spec) > 3 and spec[3] else now  # quiet hours defer delivery
-                    parts = split_chunks(text, chunk_chars)
+                    limit = chunk_chars(transport) if callable(chunk_chars) else chunk_chars
+                    parts = split_chunks(text, limit)
                     for i, part in enumerate(parts):
                         self._conn.execute(
                             "INSERT INTO schedule_outbox(occurrence_id,run_id,schedule_id,transport,channel,"
