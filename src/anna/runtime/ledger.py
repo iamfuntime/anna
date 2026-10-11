@@ -43,6 +43,9 @@ ACTIVE_EXEC = ("claimed", "running")
 TERMINAL_EXEC = ("succeeded", "failed", "timeout", "cancelled", "unknown", "blocked",
                  "skipped_overlap", "skipped_misfire", "skipped_gate", "partial", "auth_required", "resolved_unknown")
 MAX_RECORDED_MISFIRES = 20
+STRAND_PREFIX = "cancelled: an earlier part of this message ended "
+FUTURE_STAMP_TOLERANCE = timedelta(seconds=60)  # a last_fired_at further ahead than this is ignored
+STAMP_EPSILON = timedelta(milliseconds=1)  # YAML round-trip slack when comparing against our own stamp
 
 
 def process_start_token(pid: int | None = None) -> str:
@@ -113,6 +116,7 @@ class OutboxItem:
     chunk_count: int
     text: str
     attempts: int
+    msg_index: int = 0
 
 
 @dataclass
@@ -167,6 +171,7 @@ class RuntimeLedger:
         self._path = path
         self._conn = sqlite3.connect(path, timeout=2.0)
         self._conn.row_factory = sqlite3.Row
+        self.notes: list[dict[str, Any]] = []
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._migrate()
@@ -203,6 +208,10 @@ class RuntimeLedger:
             if 4 in applied:
                 self.backup(self._path.with_name(f"{self._path.name}.bak-v4-{iso(now_utc()).replace(':', '')}"))
             self._migrate_v5()
+        if 6 not in applied:
+            if 5 in applied:
+                self.backup(self._path.with_name(f"{self._path.name}.bak-v5-{iso(now_utc()).replace(':', '')}"))
+            self._migrate_v6()
 
     def backup(self, dest: Path) -> Path:
         if dest.exists():
@@ -317,6 +326,45 @@ class RuntimeLedger:
             self._conn.execute("CREATE INDEX IF NOT EXISTS control_pending ON control_requests(status, id)")
             self._conn.execute("INSERT INTO ledger_migrations(version, applied_at) VALUES(5, ?)", (iso(now_utc()),))
 
+    def _migrate_v6(self) -> None:
+        """Additive: remember the ``last_fired_at`` stamps THIS build wrote into schedules.yaml.
+
+        A stamp the ledger build wrote is completion/recovery wall-clock time, not a cron tick; only a
+        stamp NEWER than every one recorded here (written by an older build after a rollback, or by a
+        hand edit) may move the cursor.  See ``materialize``.
+        """
+        with self._immediate():
+            self._conn.execute("""CREATE TABLE IF NOT EXISTS schedule_stamps (
+                schedule_id TEXT PRIMARY KEY, stamp TEXT NOT NULL, written_at TEXT NOT NULL)""")
+            # One row per delivered MESSAGE (all its chunks) once its post was written to the destination
+            # transcript.  Messages settled before this migration are seeded so they are never back-filled.
+            self._conn.execute("""CREATE TABLE IF NOT EXISTS delivered_post_records (
+                occurrence_id INTEGER NOT NULL, msg_index INTEGER NOT NULL, sent_parts INTEGER NOT NULL,
+                partial INTEGER NOT NULL DEFAULT 0, conv_key TEXT, recorded_at TEXT NOT NULL,
+                PRIMARY KEY(occurrence_id, msg_index))""")
+            self._conn.execute(
+                "INSERT OR IGNORE INTO delivered_post_records(occurrence_id,msg_index,sent_parts,partial,conv_key,recorded_at) "
+                "SELECT occurrence_id, msg_index, 0, 0, NULL, ? FROM schedule_outbox GROUP BY occurrence_id, msg_index "
+                "HAVING SUM(status IN ('pending','sending'))=0", (iso(now_utc()),))
+            self._conn.execute("INSERT INTO ledger_migrations(version, applied_at) VALUES(6, ?)", (iso(now_utc()),))
+
+    def note_stamp(self, schedule_id: str, when: datetime) -> None:
+        """Record (before it is written to the YAML) a ``last_fired_at`` this build is about to write."""
+        with self._conn:
+            self._conn.execute(
+                "INSERT INTO schedule_stamps(schedule_id,stamp,written_at) VALUES(?,?,?) "
+                "ON CONFLICT(schedule_id) DO UPDATE SET stamp=MAX(stamp, excluded.stamp), written_at=excluded.written_at",
+                (schedule_id, iso(when), iso(now_utc())))
+
+    def own_stamp(self, schedule_id: str) -> datetime | None:
+        row = self._conn.execute("SELECT stamp FROM schedule_stamps WHERE schedule_id=?", (schedule_id,)).fetchone()
+        return parse(row[0]) if row else None
+
+    def drain_notes(self) -> list[dict[str, Any]]:
+        """Reconciliation events produced by ``materialize`` since the last call (for audit)."""
+        notes, self.notes = self.notes, []
+        return notes
+
     def pending_controls(self, limit: int = 20) -> list[sqlite3.Row]:
         return self._conn.execute("SELECT * FROM control_requests WHERE status='pending' ORDER BY id LIMIT ?",
                                   (limit,)).fetchall()
@@ -387,8 +435,10 @@ class RuntimeLedger:
                     "UPDATE schedule_outbox SET status=?, provider_outcome=?, next_attempt_at=?, attempts=CASE WHEN ? "
                     "THEN 0 ELSE attempts END, updated_at=? WHERE id=?",
                     (status, outcome, now, status == "pending", now, tid))
+                released = self._unstrand(tid) if status in ("sent", "pending") else 0
                 self._refresh_delivery(row[1])
-                return "applied", f"delivery {tid} -> {status}"
+                extra = f"; released {released} later part(s) that were held back" if released else ""
+                return "applied", f"delivery {tid} -> {status}{extra}"
         return "rejected", f"unknown target kind {kind!r}"
 
     @contextlib.contextmanager
@@ -497,30 +547,45 @@ class RuntimeLedger:
         return parse(row[0]) if row else None
 
     def materialize(self, *, schedule_id: str, cron: str, tz: Any, baseline: datetime, now: datetime,
-                    job_kind: str, run_safety: str, overlap: str, misfire: str, grace_seconds: int) -> list[int]:
+                    job_kind: str, run_safety: str, overlap: str, misfire: str, grace_seconds: int,
+                    last_fired_at: datetime | None = None) -> list[int]:
         """Create the occurrence(s) now due for a schedule; one transaction.
 
-        ``baseline`` (legacy ``last_fired_at`` or ``created_at``) seeds the cursor
-        the first time a schedule is seen and also lifts a stale cursor.  Only the newest due tick may run;
-        older missed ticks are recorded ``skipped_misfire`` (bounded) so old cron
-        ticks are never replayed.  The cursor advances in the same transaction.
+        ``baseline`` (legacy ``last_fired_at`` or ``created_at``) seeds the cursor the first time a
+        schedule is seen.  ``last_fired_at`` (the YAML stamp, if any) may later LIFT a stale cursor, but
+        only when it is EXTERNAL: this build stamps ``last_fired_at`` with completion / recovery time, so
+        a stamp it wrote itself (recorded in ``schedule_stamps``) must never move the cursor - that would
+        silently drop a tick that came due while the run was finishing or the daemon was down.  A stamp
+        newer than every stamp this build wrote comes from an older build (rollback -> retrial) or a hand
+        edit, i.e. that build already ran the schedule; the cursor jumps to it and work this build queued
+        earlier is superseded (see ``_supersede``).  A stamp from the future is ignored (clock step / bad
+        edit) so it can never pin the cursor.  Only the newest due tick may run; older missed ticks are
+        recorded ``skipped_misfire`` (bounded).  The cursor advances in the same transaction.
         Returns the ids of occurrences created in ``pending``.
         """
         created: list[int] = []
         with self._conn:
             stored = self.cursor(schedule_id)
-            base = baseline.astimezone(UTC)
-            # The cursor may be STALE: after a rollback to a build that kept
-            # its own ``last_fired_at`` in schedules.yaml (and a re-upgrade),
-            # or a restored/copied ledger, the YAML state is newer than the
-            # ledger.  The later of the two wins, so ticks the older build
-            # already ran are never replayed.  A cursor ahead of the baseline
-            # (the normal case) is unchanged.
-            cur = base if stored is None or base > stored else stored
+            cur = baseline.astimezone(UTC) if stored is None else stored
+            if stored is not None and last_fired_at is not None:
+                lf = last_fired_at.astimezone(UTC) if last_fired_at.tzinfo else last_fired_at.replace(tzinfo=UTC)
+                own = self.own_stamp(schedule_id)
+                if lf > now + FUTURE_STAMP_TOLERANCE:
+                    self.notes.append({"schedule_id": schedule_id, "kind": "future_stamp_ignored",
+                                       "last_fired_at": iso(lf)})
+                elif lf > stored and (own is None or lf > own + STAMP_EPSILON):
+                    cur = min(lf, now)
+                    self._set_cursor(schedule_id, cur)
+                    note: dict[str, Any] = {"schedule_id": schedule_id, "kind": "external_stamp", "cursor": iso(cur),
+                                            "previous_cursor": iso(stored), "last_fired_at": iso(lf),
+                                            "own_stamp": iso(own) if own else None}
+                    if job_kind != "google_heartbeat":
+                        note.update(self._supersede(schedule_id, cur))
+                    self.notes.append(note)
             newest_local = croniter(cron, now.astimezone(tz)).get_prev(datetime)
             newest = newest_local.astimezone(UTC)
             if newest <= cur:
-                if stored is None or cur > stored:
+                if stored is None:
                     self._set_cursor(schedule_id, cur)
                 return created
             # Older missed ticks (bounded) between the cursor and the newest tick.
@@ -545,6 +610,35 @@ class RuntimeLedger:
             if occ is not None and status == "pending":
                 created.append(occ)
         return created
+
+    def _supersede(self, schedule_id: str, upto: datetime) -> dict[str, Any]:
+        """Close work this build queued BEFORE an older build ran the schedule (rollback window).
+
+        Conservative policy: only never-started ``cron`` occurrences due at or before the external stamp and
+        outbox rows still ``pending`` that were created at or before it.  Claimed / running occurrences and
+        ``sending`` / ``uncertain`` rows are owned by recovery and never touched here; manual occurrences
+        are operator intent and kept.  Skipping is the safe side: the older build already ran that tick, so
+        running it again would repeat its side effects.
+        """
+        ts, now = iso(upto), iso(now_utc())
+        occ = [r[0] for r in self._conn.execute(
+            "SELECT id FROM schedule_occurrences WHERE schedule_id=? AND exec_status='pending' AND trigger='cron' "
+            "AND scheduled_for<=?", (schedule_id, ts))]
+        for oid in occ:
+            self._conn.execute(
+                "UPDATE schedule_occurrences SET exec_status='skipped_misfire', finished_at=?, updated_at=?, "
+                "detail='superseded: an older build ran this schedule after it was queued (external last_fired_at)' "
+                "WHERE id=?", (now, now, oid))
+        out = self._conn.execute(
+            "SELECT id, occurrence_id FROM schedule_outbox WHERE schedule_id=? AND status='pending' AND created_at<=?",
+            (schedule_id, ts)).fetchall()
+        for r in out:
+            self._conn.execute(
+                "UPDATE schedule_outbox SET status='cancelled', updated_at=?, provider_outcome='cancelled: superseded "
+                "(an older build ran this schedule after this text was queued)' WHERE id=?", (now, r["id"]))
+        for oid in {r["occurrence_id"] for r in out}:
+            self._refresh_delivery(oid)
+        return {"superseded_occurrences": occ, "superseded_outbox": [r["id"] for r in out]}
 
     def _schedule_busy(self, schedule_id: str, overlap: str) -> bool:
         active = self._conn.execute(
@@ -668,12 +762,16 @@ class RuntimeLedger:
             return changed > 0
 
     def recover_expired(self, *, now: datetime, max_run_attempts: int,
-                        owner_alive: Callable[[str | None], bool | None] | None = None) -> list[Recovery]:
+                        owner_alive: Callable[[str | None], bool | None] | None = None,
+                        own_owner: str | None = None, own_active: frozenset[int] = frozenset()) -> list[Recovery]:
         """Apply the recovery rules. Never re-runs side-effecting work.
 
         With ``owner_alive`` a claim is recovered when its lease expired AND its owner is not
         provably alive, or immediately when the owner is provably dead.  A claim whose owner is
-        provably ALIVE (another live daemon, or this one) is never taken over.
+        provably ALIVE (another live daemon) is never taken over.  A claim owned by the CALLING process
+        (``own_owner``) that no task of that process is executing any more (``own_active``) is an orphan -
+        an exception escaped after the claim and the row was left ``running`` - and is recovered at once,
+        otherwise it would block its schedule until a restart.
         """
         out: list[Recovery] = []
         ts = iso(now)
@@ -684,6 +782,8 @@ class RuntimeLedger:
             for row in candidates:
                 expired = (row["lease_expires_at"] or "") < ts
                 alive = owner_alive(row["lease_owner"]) if owner_alive is not None else None
+                if own_owner is not None and row["lease_owner"] == own_owner and row["id"] not in own_active:
+                    alive = False  # orphaned by this very process
                 if alive is True:
                     if expired:
                         out.append(Recovery(row["id"], row["schedule_id"], "skipped",
@@ -832,7 +932,8 @@ class RuntimeLedger:
                     "UPDATE schedule_outbox SET status='sending', attempts=attempts+1, lease_expires_at=?, updated_at=? "
                     "WHERE id=?", (iso(now + timedelta(seconds=lease_seconds)), ts, r["id"]))
                 items.append(OutboxItem(r["id"], r["occurrence_id"], r["schedule_id"], r["transport"], r["channel"],
-                                        r["chunk_index"], r["chunk_count"], r["text"], r["attempts"] + 1))
+                                        r["chunk_index"], r["chunk_count"], r["text"], r["attempts"] + 1,
+                                        r["msg_index"]))
         return items
 
     def outbox_sent(self, item: OutboxItem, *, provider_outcome: str = "ok") -> None:
@@ -867,28 +968,94 @@ class RuntimeLedger:
                 self._strand_later_chunks(item.id, status)
             self._refresh_delivery(item.occurrence_id)
 
-    def _strand_later_chunks(self, outbox_id: int, why: str) -> None:
+    def _strand_later_chunks(self, outbox_id: int, why: str) -> int:
         """Later parts of a message are never released after an earlier part ended without being sent."""
-        self._conn.execute(
+        return self._conn.execute(
             "UPDATE schedule_outbox SET status='cancelled', provider_outcome=?, updated_at=? WHERE status='pending' "
             "AND (occurrence_id, msg_index) = (SELECT occurrence_id, msg_index FROM schedule_outbox WHERE id=?) "
             "AND chunk_index > (SELECT chunk_index FROM schedule_outbox WHERE id=?)",
-            (f"cancelled: an earlier part of this message ended {why} (later parts are not sent out of order)",
-             iso(now_utc()), outbox_id, outbox_id))
+            (f"{STRAND_PREFIX}{why} (later parts are not sent out of order)",
+             iso(now_utc()), outbox_id, outbox_id)).rowcount
+
+    def _unstrand(self, outbox_id: int) -> int:
+        """After an operator settled a part (verified delivered / resend), release the parts stranded behind it."""
+        now = iso(now_utc())
+        n = self._conn.execute(
+            "UPDATE schedule_outbox SET status='pending', provider_outcome='released: earlier part settled by operator', "
+            "next_attempt_at=?, updated_at=? WHERE status='cancelled' AND provider_outcome LIKE ? "
+            "AND (occurrence_id, msg_index) = (SELECT occurrence_id, msg_index FROM schedule_outbox WHERE id=?) "
+            "AND chunk_index > (SELECT chunk_index FROM schedule_outbox WHERE id=?)",
+            (now, now, STRAND_PREFIX + "%", outbox_id, outbox_id)).rowcount
+        if n:  # a partial record is stale once the rest goes out; the completed message is recorded again
+            self._conn.execute(
+                "DELETE FROM delivered_post_records WHERE partial=1 AND (occurrence_id, msg_index) = "
+                "(SELECT occurrence_id, msg_index FROM schedule_outbox WHERE id=?)", (outbox_id,))
+        return n
 
     def recover_outbox(self, *, now: datetime) -> int:
-        """An in-flight send whose lease expired may or may not have been delivered: uncertain, never resent."""
+        return len(self.recover_outbox_rows(now=now))
+
+    def recover_outbox_rows(self, *, now: datetime) -> list[dict[str, Any]]:
+        """An in-flight send whose lease expired may or may not have been delivered: uncertain, never resent.
+
+        Returns one dict per recovered row (with the number of later parts that were stranded) so the
+        caller can make the loss visible.
+        """
         ts = iso(now)
+        out: list[dict[str, Any]] = []
         with self._conn:
-            rows = self._conn.execute("SELECT id, occurrence_id FROM schedule_outbox WHERE status='sending' "
+            rows = self._conn.execute("SELECT id, occurrence_id, schedule_id, transport, channel, msg_index, chunk_index, "
+                                      "chunk_count FROM schedule_outbox WHERE status='sending' "
                                       "AND lease_expires_at<?", (ts,)).fetchall()
             for r in rows:
                 self._conn.execute(
                     "UPDATE schedule_outbox SET status='uncertain', provider_outcome='uncertain: send interrupted', "
                     "lease_expires_at=NULL, updated_at=? WHERE id=?", (ts, r["id"]))
-                self._strand_later_chunks(r["id"], "uncertain")
+                stranded = self._strand_later_chunks(r["id"], "uncertain")
                 self._refresh_delivery(r["occurrence_id"])
-        return len(rows)
+                out.append({**dict(r), "stranded": stranded})
+        return out
+
+    def interrupted_send(self, item: OutboxItem) -> dict[str, Any]:
+        """Detail of a row the caller just ended ``uncertain`` (for audit); how many later parts were stranded."""
+        stranded = self._conn.execute(
+            "SELECT COUNT(*) FROM schedule_outbox WHERE occurrence_id=? AND msg_index=? AND chunk_index>? "
+            "AND status='cancelled' AND provider_outcome LIKE ?",
+            (item.occurrence_id, item.msg_index, item.chunk_index, STRAND_PREFIX + "%")).fetchone()[0]
+        return {"id": item.id, "occurrence_id": item.occurrence_id, "schedule_id": item.schedule_id,
+                "transport": item.transport, "channel": item.channel, "msg_index": item.msg_index,
+                "chunk_index": item.chunk_index, "chunk_count": item.chunk_count, "stranded": int(stranded)}
+
+    # --- delivered-post records (one transcript row per settled message)
+
+    def settled_unrecorded(self, *, since: datetime, limit: int = 20) -> list[dict[str, Any]]:
+        """Messages with no chunk still pending/sending, at least one chunk sent, and no transcript record yet."""
+        groups = self._conn.execute(
+            "SELECT occurrence_id, msg_index FROM schedule_outbox o WHERE updated_at>=? AND NOT EXISTS ("
+            "SELECT 1 FROM delivered_post_records r WHERE r.occurrence_id=o.occurrence_id AND r.msg_index=o.msg_index) "
+            "GROUP BY occurrence_id, msg_index HAVING SUM(status IN ('pending','sending'))=0 AND SUM(status='sent')>0 "
+            "ORDER BY MIN(id) LIMIT ?", (iso(since), limit)).fetchall()
+        out: list[dict[str, Any]] = []
+        for g in groups:
+            rows = self._conn.execute(
+                "SELECT * FROM schedule_outbox WHERE occurrence_id=? AND msg_index=? ORDER BY chunk_index",
+                (g["occurrence_id"], g["msg_index"])).fetchall()
+            sent = [r for r in rows if r["status"] == "sent"]
+            out.append({"occurrence_id": g["occurrence_id"], "msg_index": g["msg_index"],
+                        "schedule_id": rows[0]["schedule_id"], "transport": rows[0]["transport"],
+                        "channel": rows[0]["channel"], "chunk_count": rows[0]["chunk_count"],
+                        "sent_parts": len(sent), "text": "".join(r["text"] for r in sent),
+                        "partial": len(sent) < rows[0]["chunk_count"],
+                        "unconfirmed": [r["chunk_index"] for r in rows if r["status"] == "uncertain"]})
+        return out
+
+    def mark_recorded(self, occurrence_id: int, msg_index: int, *, sent_parts: int, partial: bool,
+                      conv_key: str | None) -> None:
+        with self._conn:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO delivered_post_records(occurrence_id,msg_index,sent_parts,partial,conv_key,"
+                "recorded_at) VALUES(?,?,?,?,?,?)",
+                (occurrence_id, msg_index, sent_parts, int(partial), conv_key, iso(now_utc())))
 
     def _refresh_delivery_for_schedule(self, schedule_id: str) -> None:
         for r in self._conn.execute("SELECT DISTINCT occurrence_id FROM schedule_outbox WHERE schedule_id=?",

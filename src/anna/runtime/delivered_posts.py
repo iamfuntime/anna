@@ -98,6 +98,7 @@ def record_delivered_post(
     channel: str,
     text: str,
     source: str,
+    **extra: object,
 ) -> str | None:
     """Append a delivered post to its destination conversation's transcript.
 
@@ -109,11 +110,13 @@ def record_delivered_post(
     ``slack_post`` tool.
 
     Returns the conversation key the row was written under, or ``None`` when
-    nothing was recorded (blank text, or a destination with no single
-    conversation — see :func:`conv_key_for_destination`). The write itself
-    goes through :func:`anna.log.transcript_event`, so it shares the
-    per-conversation write lock and the row shape of every other transcript
-    line, and a filesystem failure is logged there rather than raised.
+    nothing was recorded (blank text, a destination with no single
+    conversation — see :func:`conv_key_for_destination` — or a transcript
+    write that failed). The write itself goes through
+    :func:`anna.log.transcript_event`, so it shares the per-conversation write
+    lock and the row shape of every other transcript line, and a filesystem
+    failure is logged there rather than raised. ``extra`` fields (e.g. an
+    idempotency ``delivery_key``) are stored on the row verbatim.
     """
     if not text or not text.strip():
         return None
@@ -127,14 +130,17 @@ def record_delivered_post(
             reason="destination has no single conversation key",
         )
         return None
-    transcript_event(
+    written = transcript_event(
         channel=transport,
         conv_key=conv_key,
         transcripts_dir=config.transcripts_dir,
         direction="outbound",
         text=text,
         source=source,
+        **extra,
     )
+    if written is None:
+        return None
     _log.info(
         "delivered_post.recorded",
         transport=transport,
@@ -143,3 +149,29 @@ def record_delivered_post(
         text_len=len(text),
     )
     return conv_key
+
+
+def transcript_has_delivery_key(config: AnnaConfig, conv_key: str, key: str, *, tail_bytes: int = 262144) -> bool:
+    """True when a recent transcript row of ``conv_key`` already carries ``delivery_key == key``.
+
+    Makes recording idempotent across the one crash window between the transcript append and the
+    ledger bookkeeping. Bounded: reads only the tail of the two newest files of that conversation.
+    """
+    from anna.log import safe_conv_key
+
+    base = config.transcripts_dir / safe_conv_key(conv_key)
+    try:
+        files = sorted(base.rglob("*.jsonl"))[-2:]
+    except OSError:
+        return False
+    needle = f'"delivery_key": "{key}"'
+    for path in files:
+        try:
+            size = path.stat().st_size
+            with path.open("rb") as fp:
+                fp.seek(max(0, size - tail_bytes))
+                if needle in fp.read().decode("utf-8", errors="replace"):
+                    return True
+        except OSError:
+            continue
+    return False

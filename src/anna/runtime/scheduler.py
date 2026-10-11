@@ -28,14 +28,18 @@ import json
 import shutil
 import subprocess
 import time
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
 from zoneinfo import ZoneInfo
 
 from anna.config import AnnaConfig
 from anna.log import audit_event, get_logger
-from anna.runtime.delivered_posts import record_delivered_post
+from anna.runtime.delivered_posts import (
+    conv_key_for_destination,
+    record_delivered_post,
+    transcript_has_delivery_key,
+)
 from anna.runtime.heartbeat import Classifier, HeartbeatJob, heartbeat_min_timeout
 from anna.runtime.ledger import (
     OutboxItem,
@@ -303,6 +307,7 @@ class Scheduler:
         self._shutting_down = False
         self._last_prune = 0.0
         self._spawned: set[int] = set()
+        self._active_fires: set[int] = set()  # occurrences a task of THIS process is executing right now
         self._shutdown_grace_seconds: float = 5.0
         self._cancel_grace_seconds: float = config.scheduler.cancel_grace_seconds + 1.0
 
@@ -465,9 +470,11 @@ class Scheduler:
                         outcome=done["outcome"], detail=done["detail"], requested_by=done["requested_by"])
         await self._apply_controls()
         for rec in self._ledger.recover_expired(now=now, max_run_attempts=cfg.max_run_attempts,
-                                                owner_alive=owner_alive):
+                                                owner_alive=owner_alive, own_owner=self._owner,
+                                                own_active=frozenset(self._active_fires)):
             await self._on_recovery(rec)
-        self._ledger.recover_outbox(now=now)
+        for info in self._ledger.recover_outbox_rows(now=now):
+            await self._report_interrupted_send(info, "send interrupted (daemon stopped mid-send)")
         if load_ok:
             await self._reconcile_deleted()
         self._maybe_prune(now)
@@ -485,6 +492,7 @@ class Scheduler:
                 continue
             self._spawn(found, occ.id)
         await self._deliver_due()
+        self._record_settled_posts()  # also back-fills messages settled while a crash hid the bookkeeping
 
     async def _apply_controls(self) -> None:
         """Daemon-owned Google connector controls queued by the dashboard (see runtime/controls.py)."""
@@ -561,13 +569,34 @@ class Scheduler:
                 overlap=schedule.overlap_policy or cfg.default_overlap_policy,
                 misfire=schedule.misfire_policy or cfg.default_misfire_policy,
                 grace_seconds=schedule.misfire_grace_seconds or cfg.misfire_grace_seconds,
+                last_fired_at=schedule.state.last_fired_at,
             )
         except Exception as exc:
             self._log.warning("scheduler.materialize_failed", schedule_id=schedule.id, error=str(exc))
             return
+        for note in self._ledger.drain_notes():
+            kind = note.pop("kind")
+            audit_event(f"audit.schedule.cursor_{kind}", audit_dir=self._audit_dir, actor="anna",
+                        fsync_on_write=self._fsync, level="WARNING", **note)
+            self._log.warning(f"scheduler.cursor_{kind}", schedule_id=schedule.id)
         for occ_id in created:
             audit_event("audit.schedule.occurrence", audit_dir=self._audit_dir, actor="anna",
                         fsync_on_write=self._fsync, schedule_id=schedule.id, occurrence_id=occ_id)
+
+    # The ledger records every ``last_fired_at`` this build writes (BEFORE the write), so
+    # ``materialize`` can tell its own completion-time stamps from ones an older build wrote.
+
+    async def _mark_fired(self, schedule_id: str, *, when: datetime) -> None:
+        self._ledger.note_stamp(schedule_id, when)
+        await self._store.mark_fired(schedule_id, status="complete", when=when)
+
+    async def _mark_dispatched(self, schedule_id: str, *, when: datetime) -> None:
+        self._ledger.note_stamp(schedule_id, when)
+        await self._store.mark_dispatched(schedule_id, when=when)
+
+    async def _mark_failed(self, schedule_id: str, *, reason: str, when: datetime, kind: str) -> int:
+        self._ledger.note_stamp(schedule_id, when)
+        return await self._store.mark_failed(schedule_id, reason=reason, when=when, kind=kind)
 
     def _spawn(self, schedule: Schedule, occurrence_id: int) -> asyncio.Task[None]:
         self._spawned.add(occurrence_id)
@@ -796,6 +825,13 @@ class Scheduler:
         if occurrence_id is None:
             occurrence_id = self._ledger.create_manual(
                 schedule_id=schedule.id, job_kind=schedule.job_kind, run_safety=schedule.run_safety)
+        self._active_fires.add(occurrence_id)
+        try:
+            await self._guarded_fire_claimed(schedule, occurrence_id)
+        finally:
+            self._active_fires.discard(occurrence_id)
+
+    async def _guarded_fire_claimed(self, schedule: Schedule, occurrence_id: int) -> None:
         async with self._semaphore:
             lease = 2 * schedule.timeout_seconds + self._config.scheduler.lease_grace_seconds
             if not self._ledger.claim(occurrence_id, owner=self._owner, lease_seconds=lease):
@@ -823,69 +859,100 @@ class Scheduler:
             )
             self._log.info("scheduler.fire", schedule_id=schedule.id, occurrence_id=occurrence_id)
 
-            if schedule.job_kind == "google_heartbeat":
-                await self._run_heartbeat(schedule, occurrence_id, run_id)
-                await self._deliver_due()
-                return
-            meta: dict[str, object] = {}
             try:
-                result = await self._run_job(schedule, meta)
+                deliver = await self._execute_started(schedule, occurrence_id, run_id, started_at)
             except asyncio.CancelledError:
-                if schedule.id not in self._deleted and schedule.run_safety == "read_only":
-                    # SHUTDOWN of a read-only run: hand it back to the queue for the next start.
-                    self._ledger.repend_running(occurrence_id, run_id, owner=self._owner,
-                                                detail="shutdown: read-only run returned to the queue")
-                    self._audit_shutdown(schedule, occurrence_id, "repended")
-                    raise
-                verdict = meta.get("_cancel_verdict")
-                status, effects, detail = verdict if isinstance(verdict, tuple) else (
-                    "unknown", "unknown", "scheduler task cancelled; outcome unverified")
-                self._ledger.finish_run(occurrence_id, run_id, status=status, side_effects=effects,
-                                        error=detail, detail=detail)
-                if schedule.id not in self._deleted:
-                    # SHUTDOWN of side-effecting work: say plainly that the outcome is unknown.
-                    self._audit_shutdown(schedule, occurrence_id, status)
-                    await self._store.mark_failed(schedule.id, reason=f"shutdown: {status}",
-                                                  when=datetime.now(UTC), kind="interrupted")
                 raise
-            except _TurnTimeout as exc:
-                self._ledger.finish_run(occurrence_id, run_id, status=exc.status, side_effects=exc.side_effects,
-                                        error=exc.detail, detail=exc.detail)
-                await self._handle_failure(
-                    schedule, reason=f"timeout after {schedule.timeout_seconds}s ({exc.status}: {exc.detail})",
-                    kind="timeout")
+            except Exception as exc:  # noqa: BLE001 - bookkeeping blew up AFTER the run started
+                await self._abort_started(schedule, occurrence_id, run_id, exc)
                 return
-            except Exception as exc:
-                self._ledger.finish_run(occurrence_id, run_id, status="failed", side_effects="unknown",
-                                        error=f"{type(exc).__name__}: {exc}"[:300])
-                await self._handle_failure(schedule, reason=f"error: {exc}", kind="fail")
-                return
+        if deliver:
+            await self._deliver_due()
 
-            if result.outcome == "failed":
-                self._ledger.finish_run(occurrence_id, run_id, status="failed", side_effects=result.side_effects,
-                                        result=result.to_json(), error=result.error, detail=result.error)
-                await self._handle_failure(schedule, reason=result.error or "job failed",
-                                           kind=str(result.data.get("kind", "fail")))
-                return
+    async def _execute_started(self, schedule: Schedule, occurrence_id: int, run_id: int,
+                               started_at: datetime) -> bool:
+        """Run a started occurrence to its terminal state. True = the caller should deliver the outbox."""
+        if schedule.job_kind == "google_heartbeat":
+            await self._run_heartbeat(schedule, occurrence_id, run_id)
+            await self._deliver_due()
+            return False
+        meta: dict[str, object] = {}
+        try:
+            result = await self._run_job(schedule, meta)
+        except asyncio.CancelledError:
+            if schedule.id not in self._deleted and schedule.run_safety == "read_only":
+                # SHUTDOWN of a read-only run: hand it back to the queue for the next start.
+                self._ledger.repend_running(occurrence_id, run_id, owner=self._owner,
+                                            detail="shutdown: read-only run returned to the queue")
+                self._audit_shutdown(schedule, occurrence_id, "repended")
+                raise
+            verdict = meta.get("_cancel_verdict")
+            status, effects, detail = verdict if isinstance(verdict, tuple) else (
+                "unknown", "unknown", "scheduler task cancelled; outcome unverified")
+            self._ledger.finish_run(occurrence_id, run_id, status=status, side_effects=effects,
+                                    error=detail, detail=detail)
+            if schedule.id not in self._deleted:
+                # SHUTDOWN of side-effecting work: say plainly that the outcome is unknown.
+                self._audit_shutdown(schedule, occurrence_id, status)
+                await self._store.mark_failed(schedule.id, reason=f"shutdown: {status}",
+                                              when=datetime.now(UTC), kind="interrupted")
+            raise
+        except _TurnTimeout as exc:
+            self._ledger.finish_run(occurrence_id, run_id, status=exc.status, side_effects=exc.side_effects,
+                                    error=exc.detail, detail=exc.detail)
+            await self._handle_failure(
+                schedule, reason=f"timeout after {schedule.timeout_seconds}s ({exc.status}: {exc.detail})",
+                kind="timeout")
+            return False
+        except Exception as exc:
+            self._ledger.finish_run(occurrence_id, run_id, status="failed", side_effects="unknown",
+                                    error=f"{type(exc).__name__}: {exc}"[:300])
+            await self._handle_failure(schedule, reason=f"error: {exc}", kind="fail")
+            return False
 
-            if result.outcome == "quiet":
-                self._ledger.finish_run(occurrence_id, run_id, status="succeeded", side_effects=result.side_effects,
-                                        result=result.to_json(), delivery_status="suppressed",
-                                        detail=result.quiet_reason)
-                await self._record_success(schedule, result.output, started_at=started_at, suppressed=True,
-                                          usage=meta.get("_usage"))  # type: ignore[arg-type]
-                return
+        if result.outcome == "failed":
+            self._ledger.finish_run(occurrence_id, run_id, status="failed", side_effects=result.side_effects,
+                                    result=result.to_json(), error=result.error, detail=result.error)
+            await self._handle_failure(schedule, reason=result.error or "job failed",
+                                       kind=str(result.data.get("kind", "fail")))
+            return False
 
-            dest = schedule.destination
-            written = self._ledger.finish_run(
-                occurrence_id, run_id, status="succeeded", side_effects=result.side_effects,
-                result=result.to_json(), outbox=[(dest.transport, dest.channel, result.output)],
-                chunk_chars=self._config.scheduler.delivery_chunk_chars)
-            if not written:
-                return  # recovered/cancelled meanwhile: never enqueue a duplicate delivery
-            await self._record_success(schedule, result.output, started_at=started_at,
-                                       usage=meta.get("_usage"))  # type: ignore[arg-type]
-        await self._deliver_due()
+        if result.outcome == "quiet":
+            self._ledger.finish_run(occurrence_id, run_id, status="succeeded", side_effects=result.side_effects,
+                                    result=result.to_json(), delivery_status="suppressed",
+                                    detail=result.quiet_reason)
+            await self._record_success(schedule, result.output, started_at=started_at, suppressed=True,
+                                      usage=meta.get("_usage"))  # type: ignore[arg-type]
+            return False
+
+        dest = schedule.destination
+        written = self._ledger.finish_run(
+            occurrence_id, run_id, status="succeeded", side_effects=result.side_effects,
+            result=result.to_json(), outbox=[(dest.transport, dest.channel, result.output)],
+            chunk_chars=self._config.scheduler.delivery_chunk_chars)
+        if not written:
+            return  # recovered/cancelled meanwhile: never enqueue a duplicate delivery
+        await self._record_success(schedule, result.output, started_at=started_at,
+                                   usage=meta.get("_usage"))  # type: ignore[arg-type]
+        return True
+
+    async def _abort_started(self, schedule: Schedule, occurrence_id: int, run_id: int, exc: Exception) -> None:
+        """An exception escaped after ``start_run``: never leave the occurrence ``running`` for a live owner.
+
+        The outcome is genuinely unverifiable (the run may have acted), so it ends ``unknown`` and is not
+        re-run.  If even this write fails, ``recover_expired`` reclaims the row because this process no
+        longer has a fire task for it.
+        """
+        detail = f"internal error after run start: {type(exc).__name__}: {exc}"[:300]
+        self._log.error("scheduler.fire_aborted", schedule_id=schedule.id, occurrence_id=occurrence_id, error=detail)
+        try:
+            closed = self._ledger.finish_run(occurrence_id, run_id, status="unknown", side_effects="unknown",
+                                             error=detail, detail=detail)
+        except Exception as inner:  # noqa: BLE001
+            self._log.error("scheduler.fire_abort_unrecorded", occurrence_id=occurrence_id, error=str(inner)[:200])
+            return  # orphan recovery closes it on a later poll
+        if closed:
+            await self._handle_failure(schedule, reason=detail, kind="interrupted")
 
     # ------------------------------------------------------------------
     # Built-in read-only Gmail + Calendar heartbeat (no worker turn, no LLM)
@@ -919,7 +986,7 @@ class Scheduler:
                         fsync_on_write=self._fsync, level="WARNING", schedule_id=schedule.id,
                         occurrence_id=occurrence_id, status="failed", error=error[:200],
                         job_alert=outcome.summary.get("job_alert"))
-            await self._store.mark_failed(schedule.id, reason=error, when=now_f, kind="fail")
+            await self._mark_failed(schedule.id, reason=error, when=now_f, kind="fail")
             if outcome.notices and not specs:  # cannot go to the (non-allowlisted) destination: tell the admin
                 await self._warn_admin(outcome.notices[0].text)
 
@@ -968,7 +1035,7 @@ class Scheduler:
             await self._record_success(schedule, "", started_at=now)
         else:
             # Recorded for the dashboard, but a heartbeat is never auto-disabled.
-            await self._store.mark_failed(schedule.id, reason=outcome.status, when=now, kind="fail")
+            await self._mark_failed(schedule.id, reason=outcome.status, when=now, kind="fail")
 
     # ------------------------------------------------------------------
     # Jobs
@@ -1126,6 +1193,23 @@ class Scheduler:
         except Exception as exc:  # noqa: BLE001
             self._log.warning("scheduler.admin_warn_failed", error=str(exc)[:200])
 
+    async def _report_interrupted_send(self, info: dict[str, Any], why: str) -> None:
+        """An ambiguous / partial delivery must be visible: audit + admin notice, never silent truncation."""
+        left = int(info.get("stranded", 0))
+        audit_event("audit.schedule.delivery_interrupted", audit_dir=self._audit_dir, actor="anna",
+                    fsync_on_write=self._fsync, level="WARNING", schedule_id=info["schedule_id"],
+                    occurrence_id=info["occurrence_id"], outbox_id=info["id"], part=info["chunk_index"] + 1,
+                    parts=info["chunk_count"], stranded_parts=left, transport=info["transport"],
+                    channel=info["channel"], reason=why)
+        self._record_settled_posts()
+        await self._warn_admin(
+            f"Delivery of scheduled output '{info['schedule_id']}' (run #{info['occurrence_id']}) to "
+            f"{info['transport']}:{info['channel']} was interrupted at part {info['chunk_index'] + 1} of "
+            f"{info['chunk_count']} ({why}). That part may or may not have arrived and was NOT resent"
+            + (f"; the remaining {left} part(s) were not sent" if left else "")
+            + ". Review it in the dashboard (Runs): mark delivered / resend / abandon.",
+            exclude=info["transport"])
+
     async def _send_item(self, item: OutboxItem) -> None:
         cfg = self._config.scheduler
         try:
@@ -1142,6 +1226,7 @@ class Scheduler:
             # Interrupted mid-send: delivery unknown. Never resend automatically.
             self._ledger.outbox_failed(item, error="cancelled mid-send", retryable=False, max_attempts=1,
                                        backoff_base=0, backoff_max=0)
+            await self._report_interrupted_send(self._ledger.interrupted_send(item), "send cancelled mid-flight")
             raise
         except Exception as exc:
             retryable = classify_send_error(exc) or (
@@ -1155,7 +1240,10 @@ class Scheduler:
                         occurrence_id=item.occurrence_id, chunk=item.chunk_index, attempts=item.attempts,
                         outcome=outcome, error=f"{type(exc).__name__}: {exc}"[:200])
             if outcome in ("failed", "uncertain"):
-                if self._ledger.get(item.occurrence_id).job_kind != "agent_prompt":
+                self._record_settled_posts()
+                if outcome == "uncertain" and self._ledger.interrupted_send(item)["stranded"]:
+                    await self._report_interrupted_send(self._ledger.interrupted_send(item), f"{type(exc).__name__}")
+                elif self._ledger.get(item.occurrence_id).job_kind != "agent_prompt":
                     await self._warn_admin(
                         f"A {outcome} delivery of heartbeat output to {item.transport}:{item.channel} could not be "
                         f"confirmed ({type(exc).__name__}). It will be repeated on the next successful heartbeat.",
@@ -1165,7 +1253,7 @@ class Scheduler:
                     reason=f"send failed ({outcome}): {exc}", kind="delivery")
             return
         self._ledger.outbox_sent(item)
-        self._record_delivered_item(item)
+        self._record_settled_posts()
 
     @staticmethod
     def _is_quiet_sentinel(reply: str) -> bool:
@@ -1227,8 +1315,9 @@ class Scheduler:
         persisted success state is the same in both cases.
         ``recorded_conv_key`` is telemetry too: the conversation whose
         transcript the delivered post was appended to (see
-        :meth:`_record_delivered_post`), or ``None`` when nothing was
-        recorded — always ``None`` for a suppressed run.
+        :meth:`_record_settled_posts`). The post is only recorded once it is
+        delivered, after this row is written, so this is always ``None`` here;
+        the record is audited as ``audit.schedule.delivered_post_recorded``.
 
         ``usage`` carries the run's token spend (see
         :func:`_accumulate_turn_usage`) and is stamped onto the audit row as
@@ -1240,9 +1329,7 @@ class Scheduler:
         """
         completed_at = datetime.now(UTC)
         duration = (completed_at - started_at).total_seconds()
-        await self._store.mark_fired(
-            schedule.id, status="complete", when=completed_at
-        )
+        await self._mark_fired(schedule.id, when=completed_at)
         # Missing counters land as 0 rather than being omitted, so the row has
         # a stable shape and a summing grep never trips over an absent key.
         usage_fields: dict[str, object] = {
@@ -1262,6 +1349,9 @@ class Scheduler:
             output_length=len(reply),
             suppressed=suppressed,
             recorded_conv_key=recorded_conv_key,
+            delivery="suppressed" if suppressed else "queued",
+            destination_conv_key=None if suppressed else conv_key_for_destination(
+                self._config, transport=schedule.destination.transport, channel=schedule.destination.channel),
             duration_s=round(duration, 3),
             **usage_fields,
         )
@@ -1284,49 +1374,59 @@ class Scheduler:
         """
         self._ledger.end_unrun(occurrence_id, status="skipped_gate", detail=gate.reason or "gate skip")
         await self._record_gate_skip(schedule, gate)
-        await self._store.mark_dispatched(schedule.id, when=datetime.now(UTC))
+        await self._mark_dispatched(schedule.id, when=datetime.now(UTC))
 
-    def _record_delivered_item(self, item: OutboxItem) -> None:
-        """Append a delivered outbox chunk to the destination conversation's transcript."""
-        schedule = self._store.get(item.schedule_id)
-        if schedule is None:
-            return
-        conv_key = self._record_delivered_post(schedule, item.text)
-        if conv_key is not None:
-            audit_event("audit.schedule.delivered_post_recorded", audit_dir=self._audit_dir, actor="anna",
-                        fsync_on_write=self._fsync, schedule_id=schedule.id, occurrence_id=item.occurrence_id,
-                        chunk=item.chunk_index, recorded_conv_key=conv_key)
+    def _record_settled_posts(self) -> None:
+        """Write one transcript row per SETTLED outbox message (all parts together, destination from the row).
 
-    def _record_delivered_post(self, schedule: Schedule, text: str) -> str | None:
-        """Append the delivered post to the destination conversation's transcript.
-
-        The scheduled run itself lives under ``schedule:<id>:<date>``, so
-        without this the conversation at the destination (the operator's DM)
-        has no trace of a message that was posted into it. The row is tagged
-        ``source="schedule:<id>"`` so the resume tail can label it as a
-        scheduled post rather than a conversational reply.
-
-        Returns the conversation key the row landed under, or ``None`` when
-        the destination has no single conversation (a shared channel) —
-        see :func:`anna.runtime.delivered_posts.conv_key_for_destination`.
-        Exception-isolated: the post is already delivered, so a recording
-        problem must never turn a successful fire into a failure.
+        A long report is delivered as several parts; recording each part would leave a live DM worker only
+        the tail of it, so the row is written once the message settled: every part sent (full text), or
+        some parts sent and the rest stranded/uncertain/failed (the sent prefix plus an explicit marker).
+        Idempotent: the row carries a ``delivery_key`` (checked before writing) and the ledger remembers
+        what was recorded, so a crash between the append and the bookkeeping repeats nothing.
+        Exception-isolated: the post is already delivered, so a recording problem must never fail a fire.
         """
         try:
-            return record_delivered_post(
-                self._config,
-                transport=schedule.destination.transport,
-                channel=schedule.destination.channel,
-                text=text,
-                source=f"schedule:{schedule.id}",
-            )
-        except Exception as exc:  # noqa: BLE001 — never fail a delivered fire
-            self._log.warning(
-                "scheduler.post_record_failed",
-                schedule_id=schedule.id,
-                error=str(exc),
-            )
-            return None
+            messages = self._ledger.settled_unrecorded(since=now_utc() - timedelta(days=7))
+        except Exception as exc:  # noqa: BLE001
+            self._log.warning("scheduler.post_record_failed", error=str(exc)[:200])
+            return
+        for msg in messages:
+            try:
+                self._record_one_settled(msg)
+            except Exception as exc:  # noqa: BLE001
+                self._log.warning("scheduler.post_record_failed", schedule_id=msg["schedule_id"], error=str(exc)[:200])
+
+    def _record_one_settled(self, msg: dict[str, Any]) -> None:
+        occ, idx, sid = msg["occurrence_id"], msg["msg_index"], msg["schedule_id"]
+        partial, sent, total = bool(msg["partial"]), msg["sent_parts"], msg["chunk_count"]
+        conv_key = conv_key_for_destination(self._config, transport=msg["transport"], channel=msg["channel"])
+        if conv_key is None:  # a shared channel: nothing to attach a reply to
+            self._ledger.mark_recorded(occ, idx, sent_parts=sent, partial=partial, conv_key=None)
+            return
+        text = msg["text"]
+        if partial:
+            unconfirmed = msg["unconfirmed"]
+            text += (f"\n\n[Partial delivery: {sent} of {total} parts of this message were sent"
+                     + (f"; part {unconfirmed[0] + 1} may or may not have arrived" if unconfirmed else "")
+                     + "; the remaining parts were NOT sent.]")
+        key = f"outbox:{occ}:{idx}:{sent}"
+        if transcript_has_delivery_key(self._config, conv_key, key):
+            written: str | None = conv_key
+        else:
+            written = record_delivered_post(self._config, transport=msg["transport"], channel=msg["channel"],
+                                            text=text, source=f"schedule:{sid}", delivery_key=key)
+        if written is None:
+            self._log.warning("scheduler.post_record_failed", schedule_id=sid, error="transcript write failed")
+            audit_event("audit.schedule.delivered_post_record_failed", audit_dir=self._audit_dir, actor="anna",
+                        fsync_on_write=self._fsync, level="WARNING", schedule_id=sid, occurrence_id=occ,
+                        msg_index=idx, delivery_key=key)
+            self._ledger.mark_recorded(occ, idx, sent_parts=sent, partial=partial, conv_key=None)
+            return
+        self._ledger.mark_recorded(occ, idx, sent_parts=sent, partial=partial, conv_key=written)
+        audit_event("audit.schedule.delivered_post_recorded", audit_dir=self._audit_dir, actor="anna",
+                    fsync_on_write=self._fsync, schedule_id=sid, occurrence_id=occ, msg_index=idx,
+                    parts=total, sent_parts=sent, partial=partial, recorded_conv_key=written, delivery_key=key)
 
     @staticmethod
     def _dest_conv_key(*, transport: str, channel: str) -> str:
@@ -1360,9 +1460,7 @@ class Scheduler:
         if kind == "interrupted" and self._interrupted_streak(schedule.id) >= self._config.scheduler.interruption_threshold:
             reason = f"{reason} (interrupted {self._config.scheduler.interruption_threshold}+ runs in a row)"
             kind = "fail"
-        new_count = await self._store.mark_failed(
-            schedule.id, reason=reason, when=when, kind=kind
-        )
+        new_count = await self._mark_failed(schedule.id, reason=reason, when=when, kind=kind)
         audit_event(
             "audit.schedule.fail",
             audit_dir=self._audit_dir,

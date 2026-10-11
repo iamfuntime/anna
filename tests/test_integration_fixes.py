@@ -349,7 +349,7 @@ def test_l3_failed_migration_rolls_back_completely_and_reopens(tmp_path, monkeyp
         RuntimeLedger(path)
     monkeypatch.setattr(RuntimeLedger, "_migrate_v2", real)
     led = RuntimeLedger(path)                                                                # was: "table already exists"
-    assert led._conn.execute("SELECT MAX(version) FROM ledger_migrations").fetchone()[0] == 5
+    assert led._conn.execute("SELECT MAX(version) FROM ledger_migrations").fetchone()[0] == 6
     assert led._conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE name='schedule_outbox_v1'").fetchone()[0] == 0
 
 

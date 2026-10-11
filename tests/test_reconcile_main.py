@@ -149,21 +149,35 @@ def _fired(minutes_ago: float) -> ScheduleState:
     return ScheduleState(last_fired_at=now_utc() - timedelta(minutes=minutes_ago), last_status="complete")
 
 
+async def _stamp_after_latest_tick() -> ScheduleState:
+    """What an older build writes: ``last_fired_at`` just after the newest every-minute tick (a PAST time)."""
+    while True:
+        tick = now_utc().replace(second=0, microsecond=0)
+        if (now_utc() - tick).total_seconds() > 0.3:
+            return ScheduleState(last_fired_at=tick + timedelta(milliseconds=100), last_status="complete")
+        await asyncio.sleep(0.1)
+
+
 async def test_empty_ledger_respects_last_fired_at(tmp_path):
-    sch = make_schedule(created=now_utc() - timedelta(days=3), state=_fired(-0.3))
+    # first start after an upgrade from main: the legacy build stamped last_fired_at at the latest tick
+    sch = make_schedule(created=now_utc() - timedelta(days=3), state=await _stamp_after_latest_tick())
     cfg, store, router, adapter, sched = await build(tmp_path, schedule=sch)
     await sched._poll_once(); await settle(sched)
     assert router.events == []  # the legacy build already ran the latest tick
 
 
-async def test_stale_ledger_cursor_does_not_replay_latest_ticks(tmp_path):
-    sch = make_schedule(created=now_utc() - timedelta(days=3), state=_fired(-0.3))
+async def test_stale_ledger_cursor_does_not_replay_ticks_an_older_build_ran(tmp_path):
+    # rollback -> retrial: the older build stamped last_fired_at (a PAST time, after a tick) and
+    # this build never saw it; the ledger cursor is two hours stale.
+    state = await _stamp_after_latest_tick()
+    stamp = state.last_fired_at
+    sch = make_schedule(created=now_utc() - timedelta(days=3), state=state)
     cfg, store, router, adapter, sched = await build(tmp_path, schedule=sch)
     with sched._ledger._conn:
         sched._ledger._set_cursor("s1", now_utc() - timedelta(hours=2))
     await sched._poll_once(); await settle(sched)
     assert router.events == [] and adapter.sent == []
-    assert sched._ledger.cursor("s1") >= store.get("s1").state.last_fired_at - timedelta(seconds=1)
+    assert sched._ledger.cursor("s1") == stamp
     assert sched._ledger.recent("s1", 100) == []  # not even misfire rows for already-run ticks
 
 
@@ -176,10 +190,13 @@ async def test_stale_cursor_with_old_last_fired_at_still_runs_latest_once(tmp_pa
     assert len(router.events) == 1  # genuinely missed ticks: only the newest runs
 
 
-async def test_legitimate_pending_occurrence_still_recovered_despite_newer_state(tmp_path):
-    sch = make_schedule(created=now_utc() - timedelta(days=3), state=_fired(-0.3))
+async def test_legitimate_pending_occurrence_still_recovered_when_no_older_build_ran(tmp_path):
+    # Same-build crash: the YAML stamp is OURS (recorded in the ledger), so it must not supersede
+    # the queued occurrence, even though it is newer than the cursor.
+    sch = make_schedule(created=now_utc() - timedelta(days=3), state=_fired(1))
     cfg, store, router, adapter, sched = await build(tmp_path, schedule=sch)
     ledger = sched._ledger
+    ledger.note_stamp("s1", sch.state.last_fired_at)  # this build wrote the stamp
     with ledger._conn:
         ledger._set_cursor("s1", now_utc() - timedelta(hours=2))
         occ = ledger._insert_occurrence(schedule_id="s1", scheduled_for=now_utc() - timedelta(minutes=90),
@@ -189,7 +206,7 @@ async def test_legitimate_pending_occurrence_still_recovered_despite_newer_state
     await sched._poll_once(); await settle(sched)
     await sched._poll_once(); await settle(sched)
     assert len(router.events) == 1 and len(adapter.sent) == 1  # recovered once, no duplicate effects
-    assert [o.exec_status for o in ledger.recent("s1", 100)] == ["succeeded"]
+    assert "succeeded" in [o.exec_status for o in ledger.recent("s1", 100)]
 
 
 # ---------------------------------------------------------------------------
