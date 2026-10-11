@@ -55,6 +55,18 @@ def _plant_checkpoint(vault_root: Path, stamp: str, summary: str) -> Path:
     return path
 
 
+def _plant_main_checkpoint(vault_root: Path, stamp: str, summary: str, kind: str = "closeout") -> Path:
+    """A checkpoint exactly as the supported ``main`` writer emits it (no uuid, no coverage)."""
+    path = _plant_checkpoint(vault_root, stamp, summary)
+    path.write_text(
+        f"---\ncreated: {stamp[:10]}\ntags:\n  - domain/anna\n  - type/checkpoint\n"
+        f"transport: slack\nconversation_key: {CONV_KEY}\ncheckpoint_kind: {kind}\n---\n\n"
+        f"# Checkpoint\n\n{summary}\n",
+        encoding="utf-8",
+    )
+    return path
+
+
 def test_no_checkpoints_omits_resume_block(tmp_path: Path) -> None:
     worker = _make_worker(tmp_path)
     prompt = worker._assemble_system_prompt(
@@ -257,7 +269,7 @@ def test_legacy_checkpoint_covers_older_events_by_filename_stamp(tmp_path: Path)
     # before it; its filename stamp (not a restorable mtime) is the cutoff.
     worker = _make_worker(tmp_path)
     vault_root = worker._config.vault.resolved_path
-    _plant_checkpoint(vault_root, "2026-05-31-090000", "covers everything")
+    _plant_main_checkpoint(vault_root, "2026-05-31-090000", "covers everything")
     stamp = datetime(2026, 5, 31, 9, 0, 0, tzinfo=timezone.utc).timestamp()
     _plant_transcript(
         worker._config.transcripts_dir,
@@ -283,7 +295,7 @@ def test_legacy_checkpoint_covers_older_events_by_filename_stamp(tmp_path: Path)
 def test_legacy_checkpoint_covering_everything_has_no_tail(tmp_path: Path) -> None:
     worker = _make_worker(tmp_path)
     vault_root = worker._config.vault.resolved_path
-    _plant_checkpoint(vault_root, "2026-05-31-090000", "covers everything")
+    _plant_main_checkpoint(vault_root, "2026-05-31-090000", "covers everything")
     stamp = datetime(2026, 5, 31, 9, 0, 0, tzinfo=timezone.utc).timestamp()
     _plant_transcript(
         worker._config.transcripts_dir,

@@ -65,6 +65,7 @@ from anna.vault.transcript_resume import (
     render_delivered_posts,
     render_tail_block,
     legacy_checkpoint_cutoff,
+    legacy_line_key,
     transcript_tail_since,
     uncovered_sequences_before,
     validated_checkpoint_coverage,
@@ -836,6 +837,11 @@ class ConversationWorker:
         self._coverage_frozen = False
         self._resume_tail_sequences: set[int] = set()
         self._resume_legacy_cutoff: float | None = None
+        # Unsequenced (main-era) lines the resume tail showed this session, and
+        # the newest of their timestamps: the closeout that summarizes them
+        # advances the durable legacy boundary over them (and only them).
+        self._resume_legacy_shown: set[tuple[str, str, str]] = set()
+        self._resume_legacy_shown_ts: float | None = None
         self._on_idle_close = on_idle_close
         # Live transport adapters (same dict the router/alerter hold). Used by
         # the anna_slack_alerts MCP server to post through ANNA's own Slack
@@ -2248,6 +2254,9 @@ class ConversationWorker:
                 ),
                 covered_through_ts=self._resume_legacy_cutoff,
             )
+            shown_legacy = [obj for obj in tail if not isinstance(obj.get("sequence"), int)]
+            self._resume_legacy_shown = {legacy_line_key(obj) for obj in shown_legacy}
+            self._resume_legacy_shown_ts = latest_ts(shown_legacy)
             # What this session is shown at resume counts as seen by its summary.
             self._resume_tail_sequences = {
                 obj["sequence"] for obj in tail if isinstance(obj.get("sequence"), int)
@@ -2450,6 +2459,7 @@ class ConversationWorker:
                 kind="closeout",
                 coverage_end_sequence=coverage_sequence,
                 coverage_end_event_id=coverage_event_id,
+                legacy_cutoff_ts=self._closeout_legacy_cutoff() if coverage_sequence else None,
             )
 
         # ----- 2. Per-core-file eviction ---------------------------------
@@ -2496,6 +2506,7 @@ class ConversationWorker:
         kind: str,
         coverage_end_sequence: int | None = None,
         coverage_end_event_id: str | None = None,
+        legacy_cutoff_ts: float | None = None,
     ) -> Path | None:
         """Write a checkpoint under the supervisor lock and audit it.
 
@@ -2527,6 +2538,7 @@ class ConversationWorker:
                     coverage_end_sequence=coverage_end_sequence,
                     coverage_end_event_id=coverage_end_event_id,
                     unsummarized_events=self._coverage_unsummarized if coverage_end_sequence else 0,
+                    legacy_cutoff_ts=legacy_cutoff_ts,
                 )
             except OSError as exc:
                 self._log.error("worker.checkpoint_write_failed", error=str(exc))
@@ -3774,6 +3786,7 @@ class ConversationWorker:
                             prior,
                             seen_sequences=self._resume_tail_sequences,
                             covered_through_ts=self._resume_legacy_cutoff,
+                            seen_legacy=self._resume_legacy_shown,
                         )
                         # Catch-up: older history this session was never shown cannot freeze coverage
                         # forever, but it is NOT claimed as summarized - the checkpoint records how many
@@ -3783,6 +3796,18 @@ class ConversationWorker:
                     if self._coverage_advance_allowed:
                         self._last_processed_transcript_sequence = sequence
                         self._last_processed_transcript_event_id = event_id
+
+    def _closeout_legacy_cutoff(self) -> float | None:
+        """Migration marker for an explicit-coverage closeout.
+
+        Carries the resume-time legacy boundary forward and advances it over the
+        unsequenced (main-era) lines this session was shown, because the summary
+        written now covers them. Lines it was not shown stay above the boundary
+        only if newer; older unshown ones are reported through the checkpoint's
+        ``unsummarized`` note, exactly like unshown sequenced history.
+        """
+        values = [v for v in (self._resume_legacy_cutoff, self._resume_legacy_shown_ts) if v is not None]
+        return max(values) if values else None
 
     def _closeout_coverage(self) -> tuple[int | None, str | None]:
         """Coverage for a checkpoint: the processed inbound plus the replies that followed it."""

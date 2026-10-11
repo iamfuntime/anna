@@ -27,6 +27,7 @@ def write_checkpoint(
     coverage_end_sequence: int | None = None,
     coverage_end_event_id: str | None = None,
     unsummarized_events: int = 0,
+    legacy_cutoff_ts: float | None = None,
 ) -> Path:
     """Write a markdown checkpoint and return its path.
 
@@ -61,6 +62,9 @@ def write_checkpoint(
             f"coverage_end_sequence: {coverage_end_sequence}\n"
             f"coverage_end_event_id: {coverage_end_event_id}\n"
             + (f"coverage_unsummarized_events: {unsummarized_events}\n" if unsummarized_events else "")
+            # Migration marker: unsequenced (main-era) transcript lines at or before
+            # this epoch are summarized. Only an explicit-coverage checkpoint carries it.
+            + (f"coverage_legacy_cutoff_ts: {legacy_cutoff_ts:.6f}\n" if legacy_cutoff_ts and legacy_cutoff_ts > 0 else "")
         )
     frontmatter = (
         f"---\n"
@@ -71,6 +75,9 @@ def write_checkpoint(
         f"transport: {transport}\n"
         f"conversation_key: {conversation_key}\n"
         f"checkpoint_kind: {kind}\n"
+        # New-build provenance: a main-format checkpoint never has this key, so
+        # a coverage-less periodic / failed-turn checkpoint is not mistaken for one.
+        f"checkpoint_schema: 2\n"
         f"{coverage}"
         f"---\n\n"
     )

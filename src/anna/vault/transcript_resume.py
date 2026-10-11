@@ -76,60 +76,144 @@ def latest_checkpoint_coverage(vault_root: Path, conv_key: str) -> int | None:
     return None
 
 
-_LEGACY_STAMP_RE = re.compile(
-    r"^(\d{4})-(\d{2})-(\d{2})-(\d{2})(\d{2})(\d{2})?(?:-[0-9a-f]{32})?\.md$"
-)
-_COVERAGE_KEY_RE = re.compile(r"^coverage_[a-z_]+:", re.MULTILINE)
-_FUTURE_SKEW_SECONDS = 300.0
+# Exact filenames of the supported ``main`` checkpoint writer: second-granular
+# ``YYYY-MM-DD-HHMMSS.md`` (or the older minute-only ``HHMM``), with NO uuid
+# suffix.  The coverage-aware build always appends ``-<uuid>``, so a uuid name
+# is new-build provenance and is never a legacy time boundary.
+_LEGACY_STAMP_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})-(\d{2})(\d{2})(\d{2})?\.md$")
+_NEW_STAMP_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})-(\d{2})(\d{2})(\d{2})-[0-9a-f]{32}\.md$")
+_COVERAGE_KEY_RE = re.compile(r"^(?:coverage_[a-z_]+|checkpoint_schema):", re.MULTILINE)
+_LEGACY_MARKER_RE = re.compile(r"^coverage_legacy_cutoff_ts:\s*(\d{1,12}(?:\.\d{1,6})?)\s*$", re.MULTILINE)
+_FRONTMATTER_CREATED_RE = re.compile(r"^created:\s*(\d{4}-\d{2}-\d{2})\s*$", re.MULTILINE)
+# Tolerance for filesystem timestamp rounding only; a stamp ahead of the file's
+# own mtime (or of now) by more than this is a tampered/odd file, not coverage.
+_FUTURE_SKEW_SECONDS = 2.0
 
 
-def legacy_checkpoint_cutoff(vault_root: Path, conv_key: str, *, now: float | None = None) -> float | None:
-    """Epoch cutoff covered by a NEWEST checkpoint written without coverage metadata.
-
-    Builds before the explicit-coverage ledger (``main``) wrote checkpoints
-    with no ``coverage_*`` keys and resumed by "events newer than the
-    checkpoint". Without this fallback every new session replays up to
-    ``tail_max_turns`` exchanges those checkpoints already summarized until
-    the transcripts age out.
-
-    Deliberately conservative:
-
-    * only the single newest checkpoint counts, and only when it carries no
-      ``coverage_*`` key at all (a malformed *new-style* checkpoint covers
-      nothing rather than being guessed at);
-    * the cutoff is the wall-clock stamp in the file name (``YYYY-MM-DD-HHMMSS``,
-      optionally ``-<uuid>``, or the older minute-only ``HHMM``), never the
-      file mtime alone — it is capped by the mtime so a copied/restored file
-      cannot hide newer events, and a stamp in the future is ignored;
-    * an unreadable file or unparseable name yields None (replay, never hide).
-
-    Events lacking a parseable ``ts`` are never covered by this cutoff.
-    """
-    recent = list_recent_checkpoints(vault_root=vault_root, conversation_key=conv_key, limit=1)
-    if not recent:
-        return None
-    path = recent[0]
-    match = _LEGACY_STAMP_RE.match(path.name)
-    if match is None:
-        return None
-    try:
-        text = path.read_text(encoding="utf-8")
-        mtime = path.stat().st_mtime
-    except OSError:
-        return None
-    if _COVERAGE_KEY_RE.search(text):
-        return None
+def _stamp_epoch(match: re.Match[str]) -> float | None:
     year, month, day, hour, minute, second = match.groups()
     try:
-        stamp = datetime(
+        return datetime(
             int(year), int(month), int(day), int(hour), int(minute), int(second or 0), tzinfo=UTC
         ).timestamp()
     except ValueError:
         return None
-    current = datetime.now(UTC).timestamp() if now is None else now
-    if stamp > current + _FUTURE_SKEW_SECONDS:
+
+
+def _is_main_format(path: Path, text: str, match: re.Match[str]) -> bool:
+    """True only for a checkpoint shaped like the supported ``main`` writer's output."""
+    if not text.startswith("---\n"):
+        return False
+    end = text.find("\n---\n", 4)
+    if end < 0:
+        return False
+    front = text[4:end]
+    if _COVERAGE_KEY_RE.search(front):
+        return False
+    if "\n  - type/checkpoint\n" not in "\n" + front + "\n":
+        return False
+    created = _FRONTMATTER_CREATED_RE.search(front)
+    return created is not None and created.group(1) == "-".join(match.groups()[:3])
+
+
+def _legacy_file_cutoff(path: Path, now: float) -> float | None:
+    match = _LEGACY_STAMP_RE.match(path.name)
+    if match is None:
+        return None
+    stamp = _stamp_epoch(match)
+    if stamp is None:
+        return None
+    try:
+        text = path.read_text(encoding="utf-8")
+        mtime = path.stat().st_mtime
+    except (OSError, UnicodeDecodeError):
+        return None
+    if stamp > now + _FUTURE_SKEW_SECONDS or stamp > mtime + _FUTURE_SKEW_SECONDS:
+        return None
+    if not _is_main_format(path, text, match):
         return None
     return min(stamp, mtime)
+
+
+def _marker_cutoff(path: Path, text: str, now: float) -> float | None:
+    """The migration marker a coverage-bearing new-build checkpoint carries forward."""
+    match = _NEW_STAMP_RE.match(path.name)
+    marker = _LEGACY_MARKER_RE.search(text)
+    if match is None or marker is None:
+        return None
+    stamp = _stamp_epoch(match)
+    if stamp is None:
+        return None
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return None
+    value = float(marker.group(1))
+    # A marker can only claim time that had already passed when the file was written.
+    if value > stamp + 1.0 + _FUTURE_SKEW_SECONDS or value > mtime + _FUTURE_SKEW_SECONDS:
+        return None
+    if value > now + _FUTURE_SKEW_SECONDS:
+        return None
+    return value
+
+
+def legacy_checkpoint_cutoff(vault_root: Path, conv_key: str, *, now: float | None = None) -> float | None:
+    """Epoch boundary below which UNSEQUENCED (``main``-era) transcript lines are summarized.
+
+    Builds before the explicit-coverage ledger (``main``) wrote checkpoints
+    with no ``coverage_*`` keys and transcript lines with no ``sequence``, and
+    resumed by "events newer than the checkpoint". Without a boundary every
+    new session replays up to ``tail_max_turns`` exchanges those checkpoints
+    already summarized.
+
+    The boundary is the maximum of two independently trusted sources:
+
+    * the newest checkpoint of EXACT supported ``main`` format - an
+      uuid-less ``YYYY-MM-DD-HHMMSS.md`` name whose frontmatter is the main
+      writer's and carries no ``coverage_*`` / ``checkpoint_schema`` key. The
+      coverage-aware build always writes a uuid name and ``checkpoint_schema``,
+      so its periodic and coverage-less closeout checkpoints are never legacy
+      provenance. A stamp ahead of the file's mtime or of now (tampered, stray
+      or future-dated) disqualifies that file (the next older one is tried);
+    * the ``coverage_legacy_cutoff_ts`` migration marker of the newest
+      new-build checkpoint that carries explicit coverage. The closeout that
+      summarized legacy lines it was shown advances and carries this forward,
+      so the boundary survives any number of later resumes without leaning on
+      a single newest file.
+
+    The boundary only ever hides lines that have no ``sequence`` and a
+    parseable ``ts`` (see :func:`transcript_tail_since`); sequenced events are
+    governed by explicit coverage alone. Anything unreadable, unparseable or
+    unrecognised yields no boundary (replay, never hide).
+    """
+    current = datetime.now(UTC).timestamp() if now is None else now
+    files = list_recent_checkpoints(vault_root=vault_root, conversation_key=conv_key, limit=1000)
+    cutoffs: list[float] = []
+    for path in files:
+        if _LEGACY_STAMP_RE.match(path.name):
+            value = _legacy_file_cutoff(path, current)
+            if value is not None:
+                cutoffs.append(value)
+                break
+    for path in files:
+        if not _NEW_STAMP_RE.match(path.name):
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        if _COVERAGE_SEQUENCE_RE.search(text) is None or _COVERAGE_EVENT_RE.search(text) is None:
+            continue
+        marker = _marker_cutoff(path, text, current)
+        if marker is not None:
+            cutoffs.append(marker)
+        break  # newest coverage-bearing checkpoint; it carries the marker forward
+    return max(cutoffs) if cutoffs else None
+
+
+def legacy_line_key(obj: dict) -> tuple[str, str, str]:
+    """Identity of an unsequenced transcript line (no ``event_id`` to key on)."""
+    return (str(obj.get("ts") or ""), str(obj.get("direction") or ""), str(obj.get("text") or ""))
 
 
 def validated_checkpoint_coverage(
@@ -190,6 +274,7 @@ def uncovered_sequences_before(
     *,
     seen_sequences: set[int] | frozenset[int] = frozenset(),
     covered_through_ts: float | None = None,
+    seen_legacy: set[tuple[str, str, str]] | frozenset[tuple[str, str, str]] = frozenset(),
 ) -> list[int]:
     """Whether a new worker would skip durable history before ``sequence``.
 
@@ -218,14 +303,13 @@ def uncovered_sequences_before(
                 continue
             if not isinstance(obj, dict):
                 continue
-            if covered_through_ts is not None:
-                ts = _parse_ts(obj.get("ts"))
-                if ts is not None and ts <= covered_through_ts:
-                    if isinstance(obj.get("sequence"), int):
-                        file_max = max(file_max, obj["sequence"])
-                    continue  # already summarized by a legacy checkpoint
             event_sequence = obj.get("sequence")
             if not isinstance(event_sequence, int):
+                ts = _parse_ts(obj.get("ts"))
+                if covered_through_ts is not None and ts is not None and ts <= covered_through_ts:
+                    continue  # unsequenced (main-era) line already summarized by the legacy boundary
+                if legacy_line_key(obj) in seen_legacy:
+                    continue  # shown to the session at resume
                 gap.append(-1)  # legacy line without a sequence: cannot be ordered, counts as unseen
                 continue
             file_max = max(file_max, event_sequence)
@@ -391,11 +475,13 @@ def _recent_lines(
                 continue
             if not isinstance(obj, dict):
                 continue
-            if covered_through_ts is not None:
+            sequence = obj.get("sequence")
+            if covered_through_ts is not None and not isinstance(sequence, int):
+                # Time never hides a sequenced event: only unsequenced (main-era)
+                # lines, which explicit coverage cannot order, are covered by it.
                 ts = _parse_ts(obj.get("ts"))
                 if ts is not None and ts <= covered_through_ts:
                     continue
-            sequence = obj.get("sequence")
             if covered_through_sequence is not None and isinstance(sequence, int):
                 if sequence <= covered_through_sequence:
                     continue

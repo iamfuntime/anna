@@ -415,8 +415,8 @@ def test_older_minute_only_stamp(tmp_path: Path) -> None:
 
 def test_mtime_caps_cutoff_and_future_stamp_ignored(tmp_path: Path) -> None:
     p = _plant(tmp_path, "2026-09-01-120000.md")
-    os.utime(p, (_STAMP - 500, _STAMP - 500))  # older mtime wins (conservative)
-    assert legacy_checkpoint_cutoff(tmp_path, CONV_KEY, now=_STAMP + 60) == _STAMP - 500
+    os.utime(p, (_STAMP - 500, _STAMP - 500))  # stamp ahead of its own mtime: tampered/odd, not coverage
+    assert legacy_checkpoint_cutoff(tmp_path, CONV_KEY, now=_STAMP + 60) is None
     os.utime(p, (_STAMP + 9999, _STAMP + 9999))  # restored/copied later mtime ignored
     assert legacy_checkpoint_cutoff(tmp_path, CONV_KEY, now=_STAMP + 60) == _STAMP
     assert legacy_checkpoint_cutoff(tmp_path, CONV_KEY, now=_STAMP - 3600) is None  # stamp in the future
@@ -427,8 +427,10 @@ def test_no_cutoff_for_new_style_malformed_missing_or_odd_names(tmp_path: Path) 
     _plant(tmp_path, "2026-09-01-120000-" + "a" * 32 + ".md",
            "---\ncoverage_end_sequence: nope\n---\n# Checkpoint\n")
     assert legacy_checkpoint_cutoff(tmp_path, CONV_KEY, now=_STAMP + 60) is None  # malformed new-style
-    _plant(tmp_path, "2026-09-01-120100.md", "")  # empty legacy-looking file is still legacy
-    assert legacy_checkpoint_cutoff(tmp_path, CONV_KEY, now=_STAMP + 120) == _STAMP + 60
+    _plant(tmp_path, "2026-09-01-120100.md", "")  # empty legacy-looking file is not main format
+    assert legacy_checkpoint_cutoff(tmp_path, CONV_KEY, now=_STAMP + 120) is None
+    _plant(tmp_path, "2026-09-01-120200.md", "# Checkpoint\n\nhand-made note\n")  # arbitrary markdown
+    assert legacy_checkpoint_cutoff(tmp_path, CONV_KEY, now=_STAMP + 180) is None
     _plant(tmp_path, "2026-09-01-999999x.md")
     assert legacy_checkpoint_cutoff(tmp_path, CONV_KEY, now=_STAMP + 120) is None  # unparseable name
     _plant(tmp_path, "2026-13-45-250000.md")
@@ -462,6 +464,7 @@ def test_sequenced_events_after_legacy_cutoff_retained_and_gap_ignores_covered(t
             {**_line(_STAMP + 5, "inbound", "new sequenced"), "sequence": 2, "event_id": "b" * 32}]
     _write_day(tmp_path, "2026-09-01", objs)
     out = transcript_tail_since(tmp_path, CONV_KEY, None, 8, 1500, covered_through_ts=_STAMP)
-    assert [o["text"] for o in out] == ["new sequenced"]
+    # Time only ever hides UNSEQUENCED lines: sequenced events need explicit coverage.
+    assert [o["text"] for o in out] == ["old sequenced", "new sequenced"]
     assert uncovered_sequences_before(tmp_path, CONV_KEY, 3, None) == [-1, 1, 2]
-    assert uncovered_sequences_before(tmp_path, CONV_KEY, 3, None, covered_through_ts=_STAMP) == [2]
+    assert uncovered_sequences_before(tmp_path, CONV_KEY, 3, None, covered_through_ts=_STAMP) == [1, 2]
