@@ -132,6 +132,8 @@ def validate_result(raw: str | dict[str, Any], *, source_text: str, max_candidat
 def extraction_blocked_reason(config: AnnaConfig) -> str | None:
     """Why extraction must not run, or None. Preserves the no-silent-billing intent."""
     cfg = config.memory.extraction
+    if not config.memory.enabled:
+        return "memory.enabled is false (memory kill switch)"
     if not cfg.enabled:
         return "memory.extraction.enabled is false"
     if config.auth.mode == "api_key" and not cfg.allow_api_key_billing:

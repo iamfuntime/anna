@@ -204,6 +204,9 @@ async def post_memory_forget(request: Request, fact_id: int, owner: Annotated[st
     if not owner or not scope:
         return _back(owner, scope, flash="select_scope")
 
+    if not cfg.memory.enabled:  # kill switch: never create/open the DB from a write route
+        return _back(owner, scope, flash="no_memory")
+
     def _do() -> str:
         store = _store(cfg)
         try:
@@ -225,6 +228,9 @@ async def post_memory_correct(request: Request, fact_id: int, owner: Annotated[s
     cfg = request.app.state.cfg
     if not owner or not scope or not content.strip():
         return _back(owner, scope, flash="missing_fields")
+
+    if not cfg.memory.enabled:  # kill switch: never create/open the DB from a write route
+        return _back(owner, scope, flash="no_memory")
 
     def _do() -> str:
         store = _store(cfg)

@@ -1327,21 +1327,20 @@ class ConversationWorker:
             "private" if self.conversation_key.startswith("user:")
             else f"group:{self.conversation_key}"
         )
-        memory_server = build_memory_server(
-            tools=MemoryTools(
-                self._memory_store,
-                owner_id=owner_id,
-                scope=memory_scope,
-                source_event_id=lambda: self._active_memory_source_id,
-                writable=self._memory_writable(),
-            )
-        )
-
         mcp_servers: dict[str, Any] = {
             "anna_self_edit": self_edit_server,
             "anna_slack_alerts": slack_alerts_server,
-            "anna_memory": memory_server,
         }
+        if self._config.memory.enabled:  # kill switch: no server, no tools, no DB open
+            mcp_servers["anna_memory"] = build_memory_server(
+                tools=MemoryTools(
+                    self._memory_store,
+                    owner_id=owner_id,
+                    scope=memory_scope,
+                    source_event_id=lambda: self._active_memory_source_id,
+                    writable=self._memory_writable(),
+                )
+            )
         include_google = False
         if self._google_clients is not None and self._config.google.enabled:
             google_tools = GoogleTools(
@@ -1416,6 +1415,7 @@ class ConversationWorker:
             include_google=include_google,
             include_web=include_web,
             include_delegate=include_delegate,
+            include_memory=self._config.memory.enabled,
         )
         if custom_specs:
             custom_servers, custom_tool_names = build_mcp_servers(
@@ -3840,6 +3840,8 @@ class ConversationWorker:
         counted but never raised: the reply has already been handled.
         """
         cfg = self._config.memory.extraction
+        if not self._config.memory.enabled:
+            return
         # Trust boundary: only a direct message from an authorized human is the
         # owner's own words. Group/channel messages can come from other
         # participants, so they are never auto-extracted.
@@ -3903,16 +3905,18 @@ class ConversationWorker:
         # Owner-scoped DMs use their canonical owner key; non-DM conversations
         # remain isolated in a private group scope.
         owner_id, scope = self._memory_owner_scope()
-        try:
-            facts = self._memory_store.search(
-                owner_id=owner_id,
-                visibility_scopes={scope},
-                query=event.text,
-                limit=6,
-            )
-        except Exception as exc:
-            self._log.warning("worker.memory.retrieve_failed", error=str(exc))
-            facts = []
+        facts: list[Any] = []
+        if self._config.memory.enabled:
+            try:
+                facts = self._memory_store.search(
+                    owner_id=owner_id,
+                    visibility_scopes={scope},
+                    query=event.text,
+                    limit=6,
+                )
+            except Exception as exc:
+                self._log.warning("worker.memory.retrieve_failed", error=str(exc))
+                facts = []
         if facts:
             query_text = f"{render_memory_block(facts)}\n\n{query_text}"
         if (
