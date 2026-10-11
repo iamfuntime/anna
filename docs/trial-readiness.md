@@ -8,12 +8,31 @@ Evidence at `a12363e` plus the lint fix in this change set (run on 2026-10-10, P
 
 | check | result |
 | --- | --- |
-| full suite | 1,646 passed, 1 skipped, 3 warnings (51 s) |
+| full suite (after merging origin/main `59b946a`) | 1,840 passed, 1 skipped, 3 warnings (78 s) |
 | `/tmp/anna-foundation-review-10ff5ba.md` (H1-H2, M1-M6, L1-L6) | all fixed in `87fa663`; the integration review re-verified them and found only residual O1 (fails safe), later fixed as L4 in `d1a289d` |
 | `/tmp/anna-integration-review-cf72508.md` (H1, M1-M5, L1-L7) | all fixed in `d1a289d` / `20044d7` with `tests/test_integration_fixes.py` |
 | `ruff --select F821` | was 2 undefined-name hits (`Path` in `anna/__main__.py`, annotation-only so no runtime error); fixed |
 | rest of ruff / mypy | **not clean, pre-existing**: ~296 ruff findings (mostly import order, `UTC`, `ASYNC109`) and 128 mypy errors (strict mode vs. SDK/pydantic `Literal` types, missing stubs). No new type error indicates a runtime bug; none were changed here |
 | offline smoke | `anna doctor` against a fresh trial home exits 1 with `??` rows (honest "not verified"); dashboard serves `/health`, `/google`, `/repairs`, `/memory` (200), rejects a foreign `Host` (403) and a cross-origin POST (403) |
+
+## Isolation rules (reconciled with origin/main `59b946a`)
+
+A trial home must be self-contained. Set all of these explicitly in the trial `anna.yaml` (the defaults now follow
+`$ANNA_HOME`, but be explicit):
+
+| setting | trial value | why |
+| --- | --- | --- |
+| `scheduler.state_path` | `$TRIAL_HOME/schedules.yaml` | the daemon would otherwise open `~/anna/schedules.yaml` and could run real jobs |
+| `vault.path` | `$TRIAL_HOME/vault` | the vault holds checkpoints/conversations |
+| `transports.cli.socket_path` | `$TRIAL_HOME/anna.sock` | avoid colliding with the live socket |
+| `web.target_unit` | `""` (disabled, recommended) or a dedicated unit such as `anna-trial.service` | the default `anna.service` is the LIVE service |
+| `memory.enabled` | `false` if the trial must not create/open a memory DB | kill switch; default is `true` for compatibility |
+
+Enforced in code: `anna` (the daemon) **refuses to start** when `ANNA_HOME` is not the account's real `~/anna` but
+the scheduler path, vault path or CLI socket points into it. Both dashboard Restart buttons (Home and Config, the same
+partial) are **disabled** when `ANNA_HOME` is not the real `~/anna` and `web.target_unit` is still `anna.service`;
+`POST /restart` returns 403 and no dbus/systemctl call is ever made. "Real `~/anna`" is taken from the passwd entry, so
+overriding `$HOME` does not fool the check.
 
 ## Prerequisites
 
@@ -37,7 +56,7 @@ alone, or set it explicitly if `uv` complains with the overridden `HOME`.)
 cd "$FEATURE_WORKTREE"
 git status --short --branch        # expect branch iamfuntime/anna-reliability, clean
 ANNA_HOME="$(mktemp -d)" HOME="$(mktemp -d)" uv run --extra dev pytest -q -p no:cacheprovider
-# expect: 1646 passed, 1 skipped
+# expect: 1840 passed, 1 skipped
 ```
 
 Focused groups: `tests/test_review_fixes.py` (foundation review), `tests/test_integration_fixes.py`,
@@ -52,7 +71,10 @@ transports:
   slack: {enabled: false}
   telegram: {enabled: false}
   cli: {enabled: true, socket_path: $TRIAL_HOME/anna.sock}
-web: {enabled: true, port: 18799}
+scheduler: {state_path: $TRIAL_HOME/schedules.yaml}
+vault: {path: $TRIAL_HOME/vault}
+web: {enabled: true, port: 18799, target_unit: ""}
+memory: {enabled: false}
 google: {enabled: true, accounts: []}
 heartbeat: {enabled: false}
 EOF
@@ -92,6 +114,21 @@ daemon, Connect, Verify. Expect the "unverified app" warning; Testing-mode refre
    (`curl -X POST -H 'Origin: http://evil.example' -d path=/x http://127.0.0.1:18799/google/client`) expect 403.
 6. Optional, with the go-ahead: the live Google flow in step 4, then check `anna doctor` shows the account only after
    a real receipt, and that a wrong-mailbox login saves nothing.
+
+## Upgrade / rollback / retrial semantics
+
+* Schedules keep `gate_command`, the `model` pin and any unknown keys across load/save (unknown keys are preserved).
+* The ledger cursor can be stale after a rollback to a build that only maintains `last_fired_at`; the **later** of cursor
+  and `last_fired_at` wins, so a retrial never replays the latest tick of every schedule. Genuinely missed ticks still run
+  once (newest only); pending occurrences are still recovered once.
+* A restart/crash-interrupted run is an *infrastructure interruption*: audited (`audit.schedule.shutdown_interrupted` /
+  `recovered`), it advances `last_fired_at` but does **not** increment `consecutive_failures`. A job that interrupts
+  `scheduler.interruption_threshold` (default 5) runs in a row is counted as a real failure so a poison job still trips the
+  breaker (`failure_threshold`, default 3). `last_status` gains no new value, so an older build still loads the file.
+* Delivered scheduled posts are recorded in the destination DM transcript when the outbox chunk is actually sent
+  (`audit.schedule.delivered_post_recorded`); suppressed and failed sends record nothing.
+* The built-in `google_heartbeat` and memory extraction remain opt-in (`heartbeat.enabled`, `memory.extraction.enabled`
+  both `false`); an existing gated agent heartbeat schedule is independent of the built-in job.
 
 ## Rollback
 

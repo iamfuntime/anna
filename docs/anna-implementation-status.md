@@ -621,6 +621,23 @@ re-run those reviews against HEAD so nothing is left to guesswork.
 Validation: full suite 1,646 passed, 1 skipped (`tests/test_google_connect.py`: 22 tests); ruff clean on new files; mypy clean on new
 modules except missing third-party stubs.
 
+## Reconciliation with origin/main `59b946a`, and trial-isolation fixes
+
+* Merged `origin/main` (normal merge, no rebase). Preserved: schedule `gate_command` (consulted after claim, before the
+  run; a skip closes the occurrence as `skipped_gate`, advances `last_fired_at`, touches neither `last_status` nor
+  `consecutive_failures`), per-schedule `model` pin (validated, carried on `InboundEvent.model`), delivered-post recording
+  in the destination DM (now per *sent* outbox chunk, `audit.schedule.delivered_post_recorded`), notification leakage
+  guard, Slack file intake, per-run token accounting (`usage` on `audit.schedule.complete`) and outbound sanitization.
+  `Schedule` now keeps unknown fields (`extra="allow"`).
+* Stale ledger cursor: `materialize` uses the later of ledger cursor and `last_fired_at`/`created_at`.
+* Restart/crash interruptions (`kind="interrupted"`) do not count toward auto-disable; `scheduler.interruption_threshold`
+  (default 5 in a row) re-arms the breaker for poison jobs.
+* Trial isolation: scheduler/vault/socket defaults follow `$ANNA_HOME`; daemon refuses to boot if a non-real home points
+  into the real `~/anna`; dashboard Restart disabled for isolated homes unless a dedicated `web.target_unit` is set.
+* `memory.enabled` kill switch (default `true`, compatibility). Not covered: the offline `anna memory-import` CLI still
+  opens the DB because the operator invokes it explicitly.
+* Tests: `tests/test_reconcile_main.py`, `tests/test_trial_isolation.py`, `tests/test_memory_kill_switch.py`.
+
 ## Deferred milestones
 
 1. **Phase 0:** finish exact event coverage/replay.

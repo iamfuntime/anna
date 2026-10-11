@@ -47,7 +47,9 @@ ANNA_HOME="$TRIAL_HOME" uv run --directory "$FEATURE_WORKTREE" python -m anna_we
 ANNA_HOME="$TRIAL_HOME" uv run --directory "$FEATURE_WORKTREE" anna
 ```
 Without the daemon, Connect still saves a token; Verify and "drop cached session" simply wait (the page says so).
-Nothing restarts the daemon for you: adding an account or changing services edits `anna.yaml` and shows "restart required".
+Use the isolation settings in `docs/trial-readiness.md` ("Isolation rules"): explicit `scheduler.state_path`, `vault.path`,
+`web.target_unit: ""`. The daemon refuses to start if those point into the real `~/anna`, and the dashboard Restart buttons are
+disabled in a trial home. Nothing restarts the daemon for you: adding an account or changing services edits `anna.yaml` and shows "restart required".
 
 ## 3. Live test prerequisites (only with the owner's explicit go-ahead; this guide never runs them)
 

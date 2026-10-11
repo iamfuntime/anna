@@ -150,14 +150,14 @@ def _fired(minutes_ago: float) -> ScheduleState:
 
 
 async def test_empty_ledger_respects_last_fired_at(tmp_path):
-    sch = make_schedule(created=now_utc() - timedelta(days=3), state=_fired(0))
+    sch = make_schedule(created=now_utc() - timedelta(days=3), state=_fired(-0.3))
     cfg, store, router, adapter, sched = await build(tmp_path, schedule=sch)
     await sched._poll_once(); await settle(sched)
     assert router.events == []  # the legacy build already ran the latest tick
 
 
 async def test_stale_ledger_cursor_does_not_replay_latest_ticks(tmp_path):
-    sch = make_schedule(created=now_utc() - timedelta(days=3), state=_fired(0))
+    sch = make_schedule(created=now_utc() - timedelta(days=3), state=_fired(-0.3))
     cfg, store, router, adapter, sched = await build(tmp_path, schedule=sch)
     with sched._ledger._conn:
         sched._ledger._set_cursor("s1", now_utc() - timedelta(hours=2))
@@ -177,7 +177,7 @@ async def test_stale_cursor_with_old_last_fired_at_still_runs_latest_once(tmp_pa
 
 
 async def test_legitimate_pending_occurrence_still_recovered_despite_newer_state(tmp_path):
-    sch = make_schedule(created=now_utc() - timedelta(days=3), state=_fired(0))
+    sch = make_schedule(created=now_utc() - timedelta(days=3), state=_fired(-0.3))
     cfg, store, router, adapter, sched = await build(tmp_path, schedule=sch)
     ledger = sched._ledger
     with ledger._conn:
@@ -298,12 +298,12 @@ def _fleet(n: int = 15) -> list[Schedule]:
         Schedule(id="heartbeat", cron="* * * * *", prompt="check", created_at=created,
                  destination=ScheduleDestination(transport="slack", channel=ACCEPT_DM),
                  gate_command=_py("raise SystemExit(10)"), model="sonnet",
-                 state=_fired(0.2), from_newer_build={"keep": True})
+                 state=_fired(-0.3), from_newer_build={"keep": True})
     ]
     for i in range(n - 1):
         out.append(Schedule(id=f"job{i}", cron="* * * * *", prompt="x", created_at=created,
                             destination=ScheduleDestination(transport="slack", channel="CDEST"),
-                            state=_fired(0.2)))
+                            state=_fired(-0.3)))
     return out
 
 
@@ -333,7 +333,7 @@ async def test_upgrade_rollback_retrial_acceptance(tmp_path):
     # 3. ROLLBACK to a build without the ledger (it advances last_fired_at only), then RETRIAL:
     #    the ledger cursors are now stale for ALL 15 schedules. Nothing may replay.
     for s in store.list():
-        await store.mark_dispatched(s.id, when=now_utc())
+        await store.mark_dispatched(s.id, when=now_utc() + timedelta(seconds=20))
         with sched._ledger._conn:
             sched._ledger._set_cursor(s.id, now_utc() - timedelta(hours=3))
     events_before, sent_before = len(router.events), len(adapter.sent)
