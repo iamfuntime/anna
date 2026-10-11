@@ -132,3 +132,61 @@ async def test_suppressed_run_records_no_delivered_post(tmp_path: Path) -> None:
     await sched._guarded_fire(store.get("heartbeat"))  # type: ignore[arg-type]
     assert adapter.sent == []
     assert not list(cfg.transcripts_dir.rglob("*.jsonl"))
+
+
+# ---------------------------------------------------------------------------
+# Stale ledger cursor vs newer schedules.yaml last_fired_at (rollback/retrial)
+# ---------------------------------------------------------------------------
+
+from datetime import timedelta  # noqa: E402
+
+from anna.runtime.ledger import now_utc  # noqa: E402
+from anna.runtime.schedule_types import ScheduleState  # noqa: E402
+from tests.test_scheduler_ledger import build, make_schedule, settle  # noqa: E402
+
+
+def _fired(minutes_ago: float) -> ScheduleState:
+    return ScheduleState(last_fired_at=now_utc() - timedelta(minutes=minutes_ago), last_status="complete")
+
+
+async def test_empty_ledger_respects_last_fired_at(tmp_path):
+    sch = make_schedule(created=now_utc() - timedelta(days=3), state=_fired(0))
+    cfg, store, router, adapter, sched = await build(tmp_path, schedule=sch)
+    await sched._poll_once(); await settle(sched)
+    assert router.events == []  # the legacy build already ran the latest tick
+
+
+async def test_stale_ledger_cursor_does_not_replay_latest_ticks(tmp_path):
+    sch = make_schedule(created=now_utc() - timedelta(days=3), state=_fired(0))
+    cfg, store, router, adapter, sched = await build(tmp_path, schedule=sch)
+    with sched._ledger._conn:
+        sched._ledger._set_cursor("s1", now_utc() - timedelta(hours=2))
+    await sched._poll_once(); await settle(sched)
+    assert router.events == [] and adapter.sent == []
+    assert sched._ledger.cursor("s1") >= store.get("s1").state.last_fired_at - timedelta(seconds=1)
+    assert sched._ledger.recent("s1", 100) == []  # not even misfire rows for already-run ticks
+
+
+async def test_stale_cursor_with_old_last_fired_at_still_runs_latest_once(tmp_path):
+    sch = make_schedule(created=now_utc() - timedelta(days=3), state=_fired(30))
+    cfg, store, router, adapter, sched = await build(tmp_path, schedule=sch)
+    with sched._ledger._conn:
+        sched._ledger._set_cursor("s1", now_utc() - timedelta(hours=2))
+    await sched._poll_once(); await settle(sched)
+    assert len(router.events) == 1  # genuinely missed ticks: only the newest runs
+
+
+async def test_legitimate_pending_occurrence_still_recovered_despite_newer_state(tmp_path):
+    sch = make_schedule(created=now_utc() - timedelta(days=3), state=_fired(0))
+    cfg, store, router, adapter, sched = await build(tmp_path, schedule=sch)
+    ledger = sched._ledger
+    with ledger._conn:
+        ledger._set_cursor("s1", now_utc() - timedelta(hours=2))
+        occ = ledger._insert_occurrence(schedule_id="s1", scheduled_for=now_utc() - timedelta(minutes=90),
+                                        trigger="cron", job_kind="agent_prompt", run_safety="side_effecting",
+                                        status="pending", detail=None)
+    assert occ
+    await sched._poll_once(); await settle(sched)
+    await sched._poll_once(); await settle(sched)
+    assert len(router.events) == 1 and len(adapter.sent) == 1  # recovered once, no duplicate effects
+    assert [o.exec_status for o in ledger.recent("s1", 100)] == ["succeeded"]

@@ -500,19 +500,27 @@ class RuntimeLedger:
                     job_kind: str, run_safety: str, overlap: str, misfire: str, grace_seconds: int) -> list[int]:
         """Create the occurrence(s) now due for a schedule; one transaction.
 
-        ``baseline`` seeds the cursor the first time a schedule is seen (legacy
-        ``last_fired_at`` or ``created_at``).  Only the newest due tick may run;
+        ``baseline`` (legacy ``last_fired_at`` or ``created_at``) seeds the cursor
+        the first time a schedule is seen and also lifts a stale cursor.  Only the newest due tick may run;
         older missed ticks are recorded ``skipped_misfire`` (bounded) so old cron
         ticks are never replayed.  The cursor advances in the same transaction.
         Returns the ids of occurrences created in ``pending``.
         """
         created: list[int] = []
         with self._conn:
-            cur = self.cursor(schedule_id) or baseline.astimezone(UTC)
+            stored = self.cursor(schedule_id)
+            base = baseline.astimezone(UTC)
+            # The cursor may be STALE: after a rollback to a build that kept
+            # its own ``last_fired_at`` in schedules.yaml (and a re-upgrade),
+            # or a restored/copied ledger, the YAML state is newer than the
+            # ledger.  The later of the two wins, so ticks the older build
+            # already ran are never replayed.  A cursor ahead of the baseline
+            # (the normal case) is unchanged.
+            cur = base if stored is None or base > stored else stored
             newest_local = croniter(cron, now.astimezone(tz)).get_prev(datetime)
             newest = newest_local.astimezone(UTC)
             if newest <= cur:
-                if self.cursor(schedule_id) is None:
+                if stored is None or cur > stored:
                     self._set_cursor(schedule_id, cur)
                 return created
             # Older missed ticks (bounded) between the cursor and the newest tick.
