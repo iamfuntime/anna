@@ -28,7 +28,7 @@ import json
 import shutil
 import subprocess
 import time
-from datetime import UTC, date, datetime, timezone
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
 from zoneinfo import ZoneInfo
