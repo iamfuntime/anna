@@ -4,6 +4,67 @@ Verdict: **ready for an isolated, offline trial.** Not verified against any live
 service; that is the point of the trial. Nothing here touches `~/anna`, an installed `uv tool`, systemd, a live bot, real
 credentials, a paid fallback, or `main`.
 
+## Independent final verdict (HEAD `11b688a`)
+
+An independent read-only review of the repairs `fb4865a..11b688a` (`/tmp/anna-reconciliation-review-11b688a.md`, run from
+`git archive` copies with a scrubbed environment, temp `HOME`/`ANNA_HOME`, fake router, no systemd/provider/credential/production
+home) concluded: **approve for the isolated trial.** H1, H2 and M1-M9 could not be reproduced at HEAD. L8 (legacy Slack intake)
+was out of scope and stays deferred. The reviewer **independently reproduced 1904 passed, 1 skipped, exit 0** at `11b688a`.
+
+**Status of this approval.** Approved for the isolated trial only. A live swap, a merge to `main`, a copy of production data and
+any touch of services or accounts are **not approved and not authorized**; nothing in this branch has done any of them.
+
+**Mandatory trial condition: use a fresh, isolated `ANNA_HOME`.** A normal trial starts from a new trial home (section 2) or
+from a copy of main's `schedules.yaml` in a new home. **Do not reuse a trial home whose ledger was created by an earlier build of
+this branch (schema v5 or older) if it holds queued, unsent output** - see N1.
+
+### Remaining reproducible issues (all Low; none blocks a trial from main or a fresh home)
+
+| id | issue | consequence | status |
+| --- | --- | --- | --- |
+| N1 | v5 -> v6 upgrade of an existing branch ledger has no recorded stamps, so the build's own last completion stamp is taken for an older build's and `_supersede` runs (`ledger.py:329-349`, `:614-630`) | **every** `pending` outbox row and queued cron occurrence of that schedule is cancelled/skipped as "superseded" (audited with row ids), not just one tick. Reproduced with a real two-build run (fb4865a then HEAD, same home). Medium if a pre-v6 trial home is reused | **open**; avoid by using a fresh home. Production upgrades from main are unaffected (fresh ledger, cursor seeded directly) |
+| N2 | after a rollback, an in-flight `read_only` run is re-run by recovery and its stale report is posted (`ledger.py:632-660`); a `side_effecting` one ends `unknown` and is not re-run | a report from a tick the older build already superseded can be delivered minutes later; no remote side effect is repeated (the run is declared read-only) | **open**; documented below |
+| N3 | a future `last_fired_at` on **first sight** (no cursor yet, i.e. the upgrade from main) seeds the cursor from it (`ledger.py:569`); the future check lives only in `_adopt` | cursor can be pinned hours ahead, so later ticks do not run until it passes, and correcting the YAML does not unpin it. Needs a bad clock or a hand edit | **open**; the 60 s future-stamp rule protects an *existing* cursor only |
+
+Reviewer nits (N4, none functional): the `cursor_future_stamp_ignored` audit row is written on every poll while the stamp stays in
+the YAML; a crash-window replay writes no second transcript row but does emit a second `delivered_post_recorded` audit row; a
+`memory-import` dry run over an existing DB leaves `memory.sqlite3-shm`/`-wal` beside it (main file byte-identical); the wizard
+plan in a trial home still prints "Web dashboard: disabled (unit installed but stopped)" though no unit is installed;
+`scheduler.py` `_execute_started` has a bare `return` in a `-> bool` function (falsy, behaves correctly); a brand-new home gets a
+`schedules.yaml.bak-pre-ledger-*` copy on first start.
+
+**Not verified by the review:** anything against a real home, systemd, transport or provider; main's full `Scheduler` loop was
+never driven (the rollback evidence uses main's real `ScheduleStore` plus the vendored `MainBuild` mock); L2 and L7 were checked by
+reading and the suite's tests; concurrency of two live daemons on one home; the `settled_unrecorded` 7-day window edge.
+
+### What the upgrade / rollback tests do and do not show
+
+* **Fixture tests (what is tested):** `tests/test_upgrade_rollback_acceptance.py` alternates this build with a *vendored mock* of
+  main `59b946a` (`tests/fixtures/main_59b946a/`, golden `schedules.yaml`; `schedule_types.py` is byte-identical to
+  `git show 59b946a:` apart from the stubbed `validate_model_string` import) on one temp home with a fake clock. The reviewer
+  separately drove main's real `ScheduleStore` through HEAD -> main -> `restore_schedule_fields.py` -> HEAD and saw the same
+  result: main's tick not replayed, main's `state` kept, erased fields restored.
+* **Not tested (live main scheduler):** main's real daemon/`Scheduler` poll loop has never been run against a home that this
+  build also used. The rollback behaviour of a *live* main daemon is inferred from its store code and the mock, not observed.
+* **Acceptance use:** any rollback/retrial rehearsal must use mocks or no transports (no Slack/Telegram/Google, no provider, no
+  systemd). Do not rehearse against a real home.
+* **Stale output across rollback (N2):** if the build is stopped mid-run of a `read_only` schedule, an older build then runs a newer
+  tick, and this build is started again, recovery re-runs the interrupted `read_only` occurrence and may emit its now-stale
+  report. A `side_effecting` interrupted run ends `unknown` and emits nothing. Treat output from the first poll after a rollback
+  as possibly stale.
+
+### User-feedback outcomes preserved in this branch
+
+* `gate_command` and the per-schedule `model` pin from main are preserved (gate skip closes as `skipped_gate`; model validated
+  and carried on the event).
+* Main's features were restored on the reconciliation merge: delivered-post recording in the destination DM, notification leakage
+  guard, Slack file intake, per-run token accounting, outbound sanitization, unknown schedule keys kept.
+* Safer default paths and restart controls: scheduler/vault/socket default under `$ANNA_HOME`; entry points refuse a non-real home
+  that points into `~/anna`; restart disabled for an isolated home under any spelling of a live unit; `anna setup` never touches
+  live units.
+* Configurable memory: `memory.enabled` kill switch (default `true`), documented below.
+* Interruptions are separate from failures: `audit.schedule.interrupted`, own streak, `scheduler.interruption_threshold`.
+
 Evidence at the commit that contains this file (see `git log -1`; run on 2026-10-10, Python 3.13, temp `ANNA_HOME` and
 `HOME`, fake transports, no services): see "Evidence" at the end of `docs/anna-implementation-status.md`
 ("Independent reconciliation review fixes") for the exact commit, suite count and the finding-by-finding disposition of
@@ -50,6 +111,7 @@ Enforced in code (all use the passwd entry for "the real `~/anna`", so overridin
 ## Prerequisites
 
 * Linux, `uv`, Python >= 3.11, a checkout of this branch (the worktree below).
+* A **fresh** `ANNA_HOME` created by `mktemp -d` below. Never reuse an older trial home or a pre-v6 ledger that holds queued output.
 * No credentials are needed for the offline steps. Do **not** create a `.env` in the trial home.
 * Port 18799 free (any unused port works).
 
@@ -148,8 +210,9 @@ due while a run was finishing, or while the daemon was down, still runs once. De
 | first start from main (no ledger) | cursor seeded from `last_fired_at`; nothing main already ran is replayed; `schedules.yaml.bak-pre-ledger-<ts>` is copied once |
 | restart / crash with a due tick, recovery stamps `now` | the tick still runs (newest only); older missed ticks are recorded `skipped_misfire` |
 | rollback to main, main runs, re-upgrade ("retrial") | an external stamp advances the cursor to it (`audit.schedule.cursor_external_stamp`); ticks main ran are not replayed |
-| `last_fired_at` more than 60 s in the future (clock step, hand edit) | ignored and audited (`cursor_future_stamp_ignored`); it can never pin the cursor |
-| ledger-pre-v6 database (never released) | has no recorded stamps, so the first YAML stamp newer than the cursor is treated as external once; at worst one tick is skipped, never repeated |
+| `last_fired_at` more than 60 s in the future (clock step, hand edit), **cursor already exists** | ignored and audited (`cursor_future_stamp_ignored`, once per poll while it stays); the due tick runs and the run's own stamp heals the YAML. Up to +30 s is clamped to now |
+| `last_fired_at` in the future on **first sight** (no cursor yet - the upgrade from main) | **not covered (N3, open):** the cursor is seeded from it and can be pinned ahead (a bad clock or hand edit is required). Check `schedules.yaml` for future stamps before the first start |
+| ledger-pre-v6 database (schema v5 or older from an earlier build of this branch) | **do not reuse (N1, open).** It has no recorded stamps, so the build's own last completion stamp is taken for an older build's and **all** `pending` outbox rows and queued cron occurrences of that schedule are cancelled/skipped as superseded, not just one tick. Use a fresh isolated `ANNA_HOME` |
 
 **Policy for work queued *before* the rollback (M4), conservative on purpose.** When an external stamp advances the cursor, then
 *in the same transaction*: never-started `cron` occurrences due at or before the stamp are closed `skipped_misfire`
@@ -159,6 +222,9 @@ listed in the audit row (`superseded_occurrences`, `superseded_outbox`). Not tou
 (main cannot run those, so nothing was superseded). Work queued *by this build* after its own last stamp (same-build crash,
 `overlap: queue`) is recovered once as before. The cost of the policy: a message that was queued but never sent before the
 rollback is dropped rather than risked as a duplicate of what the older build did; the audit row says so.
+**Exception (N2, open):** `running` rows are left to recovery, which re-pends an interrupted `read_only` run. That run is executed
+and its report posted even though an older build already ran a newer tick, so a stale report can appear after a rollback; a
+`side_effecting` interrupted run ends `unknown` and is not re-run. No remote side effect is repeated in either case.
 
 **Ambiguous remote side effects are never repeated automatically**: a run interrupted mid-flight is `unknown` (side-effecting) and
 never re-run; a send in flight is `uncertain` and never resent. Since an interrupted multi-part post strands its remaining parts,
@@ -250,7 +316,8 @@ copy first and are additive, so an older ledger-era build ignores v6 tables.
 * **Residual after the reconciliation fixes:** the conservative supersede policy can drop a never-sent message queued just before a
   rollback (audited); a `delivered post` row is a best-effort context aid; the isolation guard checks configured paths, not what a
   tool or skill decides to open; a trial that omits `ANNA_HOME` is the real home; `core/MEMORY.md` is outside the memory kill
-  switch; an existing pre-v6 ledger (never released) can skip one tick once.
+  switch; open issues **N1** (reusing a pre-v6 ledger cancels all its queued output, not one tick), **N2** (stale `read_only`
+  report after a rollback) and **N3** (future stamp on first sight pins the cursor) - see "Independent final verdict".
 * **Unreviewed/unknown:** earlier review notices were truncated ("+1 more", "+2 more") on the heartbeat, dashboard and
   ledger commits and could not be recovered. `a12363e` (Google connect) and `20044d7` have had no independent review;
   a read-through in this pass found no defect, but it is not a substitute for one. Re-run reviews against HEAD.

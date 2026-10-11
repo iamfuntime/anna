@@ -651,7 +651,7 @@ Review of `337abb5..fb4865a` found two High and nine Medium defects. Disposition
 | **M9** orphaned `running` row blocks the schedule | Fixed: exceptions after `start_run` close the occurrence as `unknown` (no re-run) and the schedule moves on; a `running`/`claimed` row owned by this process with no live task is recovered at once. T: `test_m9_*` |
 | **L1** narrow guard | Extended to Google credentials/OAuth client, Obsidian paths and the config file; applied to `anna`, `anna ask`, `anna chat`, `anna-admin`, `google_auth`, `anna-web`. Not covered: paths a tool/skill chooses to open at runtime |
 | **L2** interruption cap | Threshold documented exactly (disable after `N + failure_threshold - 1`), validators `>= 1`, timeouts no longer feed the streak, the graceful-shutdown path goes through the cap, interruptions audited as `audit.schedule.interrupted` (not `.fail`). T: `test_l2_*` |
-| **L3** future cursor | A `last_fired_at` > 60 s ahead is ignored and audited, never copied to the cursor. T: `test_l3_*` |
+| **L3** future cursor | **Partly fixed (see N3):** for an existing cursor a `last_fired_at` > 60 s ahead is ignored and audited, not copied to the cursor; on first sight (no cursor) it still seeds it. T: `test_l3_*` |
 | **L4** weak tests | Acceptance rewritten (two builds, golden fixture, fake clock); stale-cursor tests use past stamps; the tautological isolation assertion and the empty-store injection assertion are fixed; kill-switch cases flip the flag from YAML |
 | **L5** destination | The record uses the outbox row's own transport/channel and survives a deleted schedule. T: `test_l5_*` |
 | **L6** durability | `delivery_key` on the row + ledger table `delivered_post_records`; back-fill of messages settled across a crash; no duplicate; "recorded" is audited only on a successful write; pre-v6 history is seeded, not back-filled; prune clears records (rowids are reused). T: `test_l6_*`, `test_pre_migration_*` |
@@ -661,8 +661,32 @@ Review of `337abb5..fb4865a` found two High and nine Medium defects. Disposition
 Ledger schema is now v6 (additive: `schedule_stamps`, `delivered_post_records`); the earlier-version backup `runtime.sqlite3.bak-v5-<ts>` is taken on upgrade.
 Acceptance: `tests/test_upgrade_rollback_acceptance.py` (vendored mock of main in `tests/fixtures/main_59b946a/`, fake clock).
 
-Unresolved limitations: see "Known limitations" in `docs/trial-readiness.md` (supersede may drop one never-sent queued message,
+Unresolved limitations: see "Known limitations" in `docs/trial-readiness.md` (supersede may drop queued never-sent messages,
 audited; runtime paths chosen by tools are outside the isolation guard; file memory is outside the memory kill switch; L8).
+
+### Independent final review at `11b688a` (`/tmp/anna-reconciliation-review-11b688a.md`)
+
+* **Verdict: approve for the isolated trial.** H1, H2, M1-M9 and L1-L7 are repaired (L3 only partly, see N3; L8 not reviewed and
+  deferred). The reviewer **independently reproduced 1904 passed, 1 skipped, exit 0** from a scrubbed `git archive` copy.
+* Not approved/authorized: live swap, merge to `main`, copy of production data, touching services or accounts. Review and this
+  checkpoint were read-only/doc-only; no push, PR, deploy or `main` write.
+* **Remaining (all Low, open):**
+  * **N1** - an existing schema-v5 ledger from an earlier build of this branch has no recorded stamps; the first poll at v6 treats
+    its own stamp as external and cancels *all* `pending` output and queued cron occurrences of that schedule as superseded
+    (audited), not "at worst one tick". Earlier docs claiming a single skipped tick were wrong and are corrected. **A normal trial
+    must use a fresh isolated `ANNA_HOME`; no reuse of a pre-v6 queued ledger.** Production upgrades from main are unaffected.
+  * **N2** - after a rollback, recovery re-runs an in-flight `read_only` occurrence and may post a stale report; `side_effecting`
+    ones end `unknown`. No remote side effect is repeated.
+  * **N3** - a future `last_fired_at` on first sight (upgrade from main) seeds and pins the cursor; the "ignored, never pins the
+    cursor" rule holds only for an existing cursor (correction of the earlier L3 row above).
+  * **Nits (N4):** `cursor_future_stamp_ignored` audit repeats every poll; second `delivered_post_recorded` audit on crash-window
+    replay; `-shm`/`-wal` files after a `memory-import` dry run; wizard plan text still says "unit installed but stopped" in a
+    trial home; bare `return` in `-> bool` `_execute_started`; `bak-pre-ledger-*` copy on a brand-new home.
+* **Test scope:** upgrade/rollback evidence is the fixture acceptance test (vendored mock of main `59b946a`, golden fixture) plus a
+  reviewer run of main's real `ScheduleStore`; a live main scheduler was **not** exercised. Rehearsals must use mocks/no
+  transports.
+* **Feedback outcomes preserved:** `gate_command` and per-schedule `model` kept; main's features restored; safer default paths and
+  restart controls; configurable memory (`memory.enabled`); interruptions counted separately from failures.
 
 ## Deferred milestones
 
