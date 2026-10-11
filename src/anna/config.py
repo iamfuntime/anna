@@ -1377,6 +1377,16 @@ class SchedulerConfig(BaseModel):
     # they are recorded as uncertain and never auto-resent).
     retry_unknown_send_errors: bool = False
 
+    @field_validator("delivery_chunk_chars")
+    @classmethod
+    def _chunk_chars_positive(cls, v: int | None) -> int | None:
+        if v is not None and v <= 0:
+            raise ValueError(
+                "scheduler.delivery_chunk_chars must be a positive integer "
+                "(omit it / use null for the per-transport default)"
+            )
+        return v
+
     @property
     def resolved_state_path(self) -> Path:
         return Path(os.path.expanduser(self.state_path))

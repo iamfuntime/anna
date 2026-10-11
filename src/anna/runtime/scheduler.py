@@ -1476,7 +1476,7 @@ class Scheduler:
         adapter itself would have split it (never at a universal lower cap).
         """
         configured = self._config.scheduler.delivery_chunk_chars
-        if configured is not None:
+        if configured is not None and configured > 0:  # config validation rejects <= 0; never trust a mutated value
             return configured
         return {"slack": SLACK_MAX_CHARS, "telegram": TELEGRAM_MAX_CHARS}.get(transport, 3500)
 

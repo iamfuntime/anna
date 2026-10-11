@@ -348,6 +348,23 @@ def test_split_chunks_respects_limit_and_loses_nothing():
     assert all(len(p) <= 20 for p in parts) and "".join(parts).replace("\n", "") == text.replace("\n", "")
 
 
+@pytest.mark.parametrize("bad", [0, -1, -3500])
+def test_split_chunks_rejects_non_positive_limit_instead_of_hanging(bad):
+    with pytest.raises(ValueError):
+        split_chunks("x" * 50, bad)
+
+
+@pytest.mark.parametrize("bad", [0, -1])
+def test_delivery_chunk_chars_must_be_positive(bad):
+    from pydantic import ValidationError
+
+    from anna.config import SchedulerConfig
+    with pytest.raises(ValidationError, match="delivery_chunk_chars"):
+        SchedulerConfig(delivery_chunk_chars=bad)
+    assert SchedulerConfig(delivery_chunk_chars=None).delivery_chunk_chars is None
+    assert SchedulerConfig(delivery_chunk_chars=1).delivery_chunk_chars == 1
+
+
 # ---- store: cross-process safety, migration, rollback ------------------------------------
 
 async def test_store_mutations_do_not_clobber_other_writers(tmp_path):

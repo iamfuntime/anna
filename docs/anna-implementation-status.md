@@ -116,7 +116,7 @@ turn. The first cross-transport policy correction also uses the event transport
 for voice-only/drip eligibility. Explicit memory MCP tools, extraction jobs,
 legacy import (both now done below), and UI remain.
 
-Commit `b07ea37` mounts `anna_memory` in every worker with explicit
+*(Historical: this described the build at `b07ea37`; durable memory is now opt-in, default `false` - see the 97d0c90 repairs below.)* Commit `b07ea37` mounts `anna_memory` in every worker with explicit
 `memory_remember`, `memory_search`, `memory_correct`, and `memory_forget`
 tools. Successful remember responses are emitted only after the SQLite commit;
 the current inbound provider event ID is stored as provenance. Corrections and
@@ -158,7 +158,7 @@ survives daily rotation and copied checkpoint mtimes.
 Only a successful closeout summary can carry `coverage_version: 1`,
 `coverage_end_sequence`, and `coverage_end_event_id` frontmatter. Periodic
 mechanical excerpts, failed/missing summaries, malformed coverage metadata,
-and legacy checkpoints have no coverage and therefore suppress no raw replay.
+and legacy checkpoints have no *sequence* coverage; later repairs add a separate time boundary for unsequenced main-era lines only (see Unresolved blockers).
 The worker advances a candidate only after a normally completed inbound turn;
 if a newly spawned worker finds older uncovered events, it declines to advance
 coverage rather than hiding them. Inbound events journaled while closeout is
@@ -184,8 +184,8 @@ findings in long-lived modules; no broad formatting-only rewrite was made.
 Migration/rollback: this is an additive transcript/checkpoint format change,
 not a SQLite migration. Existing JSONL and markdown remain readable. Rollback
 is safe because older builds ignore the new JSONL fields and checkpoint
-frontmatter; newer builds treat legacy files as unvalidated and replay their
-bounded raw tail. Isolated manual acceptance: set `ANNA_HOME=$(mktemp -d)`,
+frontmatter; newer builds give legacy files no sequence coverage and replay a
+bounded raw tail, except main-era lines under the legacy boundary. Isolated manual acceptance: set `ANNA_HOME=$(mktemp -d)`,
 send two mocked events, stop/restart the worker, verify the JSONL event IDs and
 sequences are stable, then copy/touch the checkpoint and verify only explicit
 coverage—not its mtime—changes the recovered tail.
@@ -251,7 +251,7 @@ uv run --extra dev pytest -q
 
 The warning is the existing Starlette `TestClient`/httpx deprecation warning.
 
-Migration/rollback: `state/memory.sqlite3` is created automatically with a
+Migration/rollback (when `memory.enabled: true`; with the default `false` the file is never created): `state/memory.sqlite3` is created with a
 version-1 ledger and WAL mode. It is additive; rollback is to stop using the
 store while retaining the database and transcripts. Use a temporary `ANNA_HOME`
 in tests; no real provider or credential action is required.
@@ -755,10 +755,13 @@ additive and preserve pending records across downgrade/restart.
 ## Unresolved blockers
 
 - Exact checkpoint coverage is conservative: new-build checkpoints use explicit
-  sequence coverage only. A *legacy* (main-build, no `coverage_*` keys) newest
-  checkpoint covers events at or before its filename stamp (capped by mtime;
-  future stamps, unreadable/odd names and malformed new-style checkpoints cover
-  nothing). Periodic checkpoints still replay rather than hide text.
+  sequence coverage only (time never hides a sequenced event). Main-era
+  (unsequenced) transcript lines are covered by a durable legacy boundary: the
+  newest exact main-format checkpoint, or the `coverage_legacy_cutoff_ts` marker
+  carried and advanced by explicit-coverage closeouts (see the `4d9bb1f` section
+  of `docs/trial-readiness.md`). Future-stamped, arbitrary-markdown, malformed
+  and coverage-less new-build (`checkpoint_schema: 2`) files cover nothing.
+  Periodic checkpoints still replay rather than hide text.
 - Receiver readiness/liveness and Google `.execute()` thread isolation are
   implemented for the current read-only Google tools. Google shutdown cannot
   make a hung third-party socket exactly-once or forcibly stop its thread; it
@@ -772,6 +775,13 @@ additive and preserve pending records across downgrade/restart.
 See "Live rereview of `97d0c90`" in `docs/trial-readiness.md` for the full table. Summary: Telegram readiness now follows PTB's
 `Updater.running` (the `start_polling` task ends normally); legacy main-format checkpoints cover older events by filename stamp;
 durable sqlite memory is opt-in (default `false`); scheduled posts split at the destination transport's limit; the slow-turn
-watchdog flush fires under consolidated/`periodic_flush_seconds: 0` configs again (voice-only stays consolidated); the scheduler
+watchdog flush fires under consolidated/`periodic_flush_seconds: 0` configs again (only a turn whose reply is actually a voice note stays consolidated; revised after the `4d9bb1f` review); the scheduler
 stamps `last_fired_at` at dispatch so a hard-killed in-flight tick is not re-fired by a rolled-back main (limits documented; no
 hot rollback is supported).
+
+## Live review of `4d9bb1f` - repairs
+
+F1 (watchdog flush vs default voice config, per-turn `voice_reply_expected`), F2/F3/F5 (durable legacy boundary with migration marker,
+exact main-format provenance, time never hides sequenced events, tamper rejection), F6 (`delivery_chunk_chars` must be positive) and F7
+(stale docs) are repaired; F4 (Telegram polling-task liveness) is a documented limitation. Dispositions, tests and limits are in
+`docs/trial-readiness.md` ("Live review of `4d9bb1f`"). Full suite: 1953 passed, 1 skipped.

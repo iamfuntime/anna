@@ -145,6 +145,8 @@ class Recovery:
 
 def split_chunks(text: str, limit: int) -> list[str]:
     """Split on line boundaries into pieces of at most ``limit`` characters."""
+    if limit <= 0:
+        raise ValueError(f"split_chunks limit must be positive, got {limit}")
     if len(text) <= limit:
         return [text]
     chunks: list[str] = []
