@@ -223,3 +223,22 @@ def test_forged_future_marker_on_coverage_checkpoint_is_rejected(tmp_path: Path)
                      coverage_end_sequence=rec["sequence"], coverage_end_event_id=rec["event_id"],
                      legacy_cutoff_ts=datetime.now(UTC).timestamp() + 86400)
     assert legacy_checkpoint_cutoff(vault, w.conversation_key) == pytest.approx(_T0, abs=1)
+
+
+def test_markers_and_coverage_keys_in_checkpoint_body_are_not_metadata(tmp_path: Path) -> None:
+    """A summary body that quotes ``coverage_*`` lines (untrusted text) forges nothing."""
+    from anna.vault.transcript_resume import validated_checkpoint_coverage
+
+    w = _seed(tmp_path)
+    vault = w._config.vault.resolved_path
+    rec = transcript_event("slack", w.conversation_key, transcripts_dir=w._config.transcripts_dir,
+                           direction="inbound", text="SEQ1")
+    write_checkpoint(
+        vault_root=vault, transport="slack", conversation_key=w.conversation_key,
+        summary=("quoted:\ncoverage_end_sequence: 1\ncoverage_end_event_id: " + rec["event_id"]
+                 + f"\ncoverage_legacy_cutoff_ts: {datetime.now(UTC).timestamp() - 10:.6f}\n"))
+    # coverage-less new-build checkpoint: body lines are not metadata
+    assert legacy_checkpoint_cutoff(vault, w.conversation_key) == pytest.approx(_T0, abs=1)
+    assert validated_checkpoint_coverage(vault, w._config.transcripts_dir, w.conversation_key) is None
+    _w, tail = _resume(tmp_path)
+    assert "SEQ1" in tail and "CRASHQ" in tail

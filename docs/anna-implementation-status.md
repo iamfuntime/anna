@@ -784,4 +784,4 @@ hot rollback is supported).
 F1 (watchdog flush vs default voice config, per-turn `voice_reply_expected`), F2/F3/F5 (durable legacy boundary with migration marker,
 exact main-format provenance, time never hides sequenced events, tamper rejection), F6 (`delivery_chunk_chars` must be positive) and F7
 (stale docs) are repaired; F4 (Telegram polling-task liveness) is a documented limitation. Dispositions, tests and limits are in
-`docs/trial-readiness.md` ("Live review of `4d9bb1f`"). Full suite: 1953 passed, 1 skipped.
+`docs/trial-readiness.md` ("Live review of `4d9bb1f`"). Full suite: 1954 passed, 1 skipped.

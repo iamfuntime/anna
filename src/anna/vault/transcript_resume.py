@@ -55,6 +55,18 @@ _COVERAGE_SEQUENCE_RE = re.compile(r"^coverage_end_sequence:\s*(\d+)\s*$", re.MU
 _COVERAGE_EVENT_RE = re.compile(r"^coverage_end_event_id:\s*([0-9a-f]{32})\s*$", re.MULTILINE)
 
 
+def _frontmatter(text: str) -> str:
+    """The leading ``---`` frontmatter block only; "" when absent.
+
+    Checkpoint bodies are LLM-written and may quote untrusted text, so no
+    coverage / provenance key is ever read from outside the frontmatter.
+    """
+    if not text.startswith("---\n"):
+        return ""
+    end = text.find("\n---\n", 4)
+    return text[4:end] if end >= 0 else ""
+
+
 def latest_checkpoint_coverage(vault_root: Path, conv_key: str) -> int | None:
     """Return validated explicit checkpoint coverage, never a file timestamp.
 
@@ -67,8 +79,9 @@ def latest_checkpoint_coverage(vault_root: Path, conv_key: str) -> int | None:
             text = path.read_text(encoding="utf-8")
         except OSError:
             continue
-        sequence = _COVERAGE_SEQUENCE_RE.search(text)
-        event_id = _COVERAGE_EVENT_RE.search(text)
+        front = _frontmatter(text)
+        sequence = _COVERAGE_SEQUENCE_RE.search(front)
+        event_id = _COVERAGE_EVENT_RE.search(front)
         if sequence is not None and event_id is not None:
             value = int(sequence.group(1))
             if value > 0:
@@ -138,7 +151,7 @@ def _legacy_file_cutoff(path: Path, now: float) -> float | None:
 def _marker_cutoff(path: Path, text: str, now: float) -> float | None:
     """The migration marker a coverage-bearing new-build checkpoint carries forward."""
     match = _NEW_STAMP_RE.match(path.name)
-    marker = _LEGACY_MARKER_RE.search(text)
+    marker = _LEGACY_MARKER_RE.search(_frontmatter(text))
     if match is None or marker is None:
         return None
     stamp = _stamp_epoch(match)
@@ -202,7 +215,8 @@ def legacy_checkpoint_cutoff(vault_root: Path, conv_key: str, *, now: float | No
             text = path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
             continue
-        if _COVERAGE_SEQUENCE_RE.search(text) is None or _COVERAGE_EVENT_RE.search(text) is None:
+        front = _frontmatter(text)
+        if _COVERAGE_SEQUENCE_RE.search(front) is None or _COVERAGE_EVENT_RE.search(front) is None:
             continue
         marker = _marker_cutoff(path, text, current)
         if marker is not None:
@@ -228,8 +242,9 @@ def validated_checkpoint_coverage(
             text = path.read_text(encoding="utf-8")
         except OSError:
             continue
-        sequence = _COVERAGE_SEQUENCE_RE.search(text)
-        event_id = _COVERAGE_EVENT_RE.search(text)
+        front = _frontmatter(text)
+        sequence = _COVERAGE_SEQUENCE_RE.search(front)
+        event_id = _COVERAGE_EVENT_RE.search(front)
         if sequence is None or event_id is None:
             continue
         value = int(sequence.group(1))
