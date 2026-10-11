@@ -630,7 +630,7 @@ modules except missing third-party stubs.
   `audit.schedule.complete`) and outbound sanitization. `Schedule` keeps unknown fields (`extra="allow"`).
 * Trial isolation: scheduler/vault/socket defaults follow `$ANNA_HOME`; entry points refuse a non-real home that points into the
   real `~/anna`; restart is disabled for isolated homes for every spelling of a live unit; `anna setup` never touches live units.
-* `memory.enabled` kill switch (default `true`, compatibility).
+* `memory.enabled` opt-in switch (default `false`; changed from `true` after the 97d0c90 rereview).
 
 ## Independent reconciliation review fixes (`/tmp/anna-reconciliation-review-fb4865a.md`)
 

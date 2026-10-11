@@ -835,6 +835,7 @@ class ConversationWorker:
         self._sdk_result_seen = False
         self._coverage_frozen = False
         self._resume_tail_sequences: set[int] = set()
+        self._resume_legacy_cutoff: float | None = None
         self._on_idle_close = on_idle_close
         # Live transport adapters (same dict the router/alerter hold). Used by
         # the anna_slack_alerts MCP server to post through ANNA's own Slack
@@ -2233,6 +2234,9 @@ class ConversationWorker:
         if not ckpt_cfg.resume_from_transcript or self._ephemeral:
             return ""
         try:
+            # One snapshot per resume: the same legacy cutoff decides what the
+            # tail hides and what the closeout coverage gap treats as summarized.
+            self._resume_legacy_cutoff = legacy_checkpoint_cutoff(vault_root, self.conversation_key)
             tail = transcript_tail_since(
                 transcripts_dir=self._config.transcripts_dir,
                 conv_key=self.conversation_key,
@@ -2242,7 +2246,7 @@ class ConversationWorker:
                 covered_through_sequence=validated_checkpoint_coverage(
                     vault_root, self._config.transcripts_dir, self.conversation_key
                 ),
-                covered_through_ts=legacy_checkpoint_cutoff(vault_root, self.conversation_key),
+                covered_through_ts=self._resume_legacy_cutoff,
             )
             # What this session is shown at resume counts as seen by its summary.
             self._resume_tail_sequences = {
@@ -3762,9 +3766,7 @@ class ConversationWorker:
                             sequence,
                             prior,
                             seen_sequences=self._resume_tail_sequences,
-                            covered_through_ts=legacy_checkpoint_cutoff(
-                                self._config.vault.resolved_path, self.conversation_key
-                            ),
+                            covered_through_ts=self._resume_legacy_cutoff,
                         )
                         # Catch-up: older history this session was never shown cannot freeze coverage
                         # forever, but it is NOT claimed as summarized - the checkpoint records how many

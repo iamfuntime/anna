@@ -49,6 +49,7 @@ def _make_worker(
     object.__setattr__(cfg, "anna_home", tmp_path / "anna_home")
     cfg.vault.path = str(tmp_path / "vault")
     cfg.subagents.enabled = subagents_enabled
+    cfg.memory.enabled = True  # durable memory is opt-in; these tests cover the full tool surface
     supervisor = Supervisor(config=cfg)
 
     async def _noop_send(_msg):

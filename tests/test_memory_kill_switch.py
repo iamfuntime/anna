@@ -16,14 +16,15 @@ def _db(w) -> Path:
     return w._config.anna_home / "state" / "memory.sqlite3"
 
 
-def test_default_keeps_memory_enabled_for_compatibility():
+def test_default_is_opt_in_so_main_style_configs_get_no_second_memory_store():
     cfg = AnnaConfig()
-    assert cfg.memory.enabled is True
+    assert cfg.memory.enabled is False
     assert cfg.memory.extraction.enabled is False  # extraction stays opt-in
 
 
 def test_extraction_blocked_by_kill_switch_even_if_enabled():
     cfg = AnnaConfig()
+    cfg.memory.enabled = True
     cfg.memory.extraction.enabled = True
     assert extraction_blocked_reason(cfg) != "memory.enabled is false (memory kill switch)"
     cfg.memory.enabled = False
@@ -275,3 +276,47 @@ def test_stale_queued_jobs_are_expired_not_extracted_after_reenable(tmp_path):
     row = store._conn.execute("SELECT status, source_text, last_error FROM extraction_jobs WHERE source_event_id='old'").fetchone()
     assert row["status"] == "dead" and row["source_text"] is None and "expired" in row["last_error"]
     store.close()
+
+
+# ---- opt-in default: a main-compatible config (no ``memory:`` key) gets nothing -----------------
+
+def test_absent_memory_key_in_yaml_loads_disabled(tmp_path, monkeypatch):
+    from anna.config import load_config
+
+    monkeypatch.setenv("ANNA_HOME", str(tmp_path))
+    (tmp_path / "anna.yaml").write_text("transports:\n  slack:\n    enabled: true\n")
+    assert load_config().memory.enabled is False
+    (tmp_path / "anna.yaml").write_text("memory:\n  enabled: true\n")
+    assert load_config().memory.enabled is True
+
+
+async def test_default_config_worker_has_no_memory_db_tools_injection_or_extraction(tmp_path, sdk_fakes):  # noqa: F811
+    sent: list = []
+    w = _worker(tmp_path, sent, enabled=True)
+    w._config.memory.enabled = AnnaConfig().memory.enabled  # the absent-config default
+    memory_md = w._config.core_dir / "MEMORY.md"
+    memory_md.parent.mkdir(parents=True, exist_ok=True)
+    memory_md.write_text("- file memory stays authoritative\n")
+    before = memory_md.read_bytes()
+    options = w._build_options()
+    assert "anna_memory" not in options.mcp_servers
+    assert not any("anna_memory" in t for t in options.allowed_tools)
+    queries: list[str] = []
+    orig = w._client.query
+
+    async def spy(text, *a, **k):
+        queries.append(text)
+        return await orig(text, *a, **k)
+
+    w._client.query = spy  # type: ignore[method-assign]
+    await w._handle(_event(event_id="slack-1"))
+    assert [m.text for m in sent] == ["ok"]
+    assert not _db(w).exists() and w._memory_store_obj is None
+    assert all("durable-memory" not in q for q in queries)
+    assert memory_md.read_bytes() == before
+
+
+def test_explicit_true_enables_tools_and_db(tmp_path):
+    w = _worker(tmp_path, [])  # helper sets memory.enabled = True explicitly
+    assert w._config.memory.enabled is True
+    assert "anna_memory" in w._build_options().mcp_servers

@@ -88,6 +88,7 @@ async def test_h1_aliased_owner_outbound_transcribed_with_inbound(tmp_path):
 
 def _worker(tmp_path, enabled=True, **kw):
     w = _make_worker(tmp_path, [], **kw)
+    w._config.memory.enabled = True  # opt-in (default false)
     w._config.memory.extraction.enabled = enabled
     w._client = _ImmediateClient([_FakeTextBlock(text="ok")])
     return w
@@ -364,7 +365,7 @@ async def test_l1_insufficient_evidence_candidate_rejected(store):
 
 
 def test_l2_environment_credentials_cannot_evade_opt_in(monkeypatch, tmp_path):
-    c = AnnaConfig(); object.__setattr__(c, "anna_home", tmp_path); c.memory.extraction.enabled = True
+    c = AnnaConfig(); object.__setattr__(c, "anna_home", tmp_path); c.memory.enabled = True; c.memory.extraction.enabled = True
     for var in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK"):
         monkeypatch.setenv(var, "x")
         assert var in (extraction_blocked_reason(c) or "")

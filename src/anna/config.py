@@ -807,17 +807,19 @@ class HeartbeatConfig(BaseModel):
 class MemoryConfig(BaseModel):
     """Durable memory (facts DB, ``anna_memory`` tools, per-turn retrieval).
 
-    ``enabled`` is the master kill switch. The DEFAULT is ``true`` purely for
-    compatibility with existing deployments (memory has always been on); set
-    ``memory.enabled: false`` for a deployment, trial or rollback that must not
-    have it. When false: no memory DB is created or opened (daemon, workers,
+    ``enabled`` is the master switch and is OPT-IN (default ``false``): a
+    deployment whose ``anna.yaml`` predates this store keeps the file-based
+    ``core/MEMORY.md`` flow it had on ``main`` and gets no second memory store,
+    no ``anna_memory`` tools competing for "remember this" requests, and no
+    retrieval/extraction. Set ``memory.enabled: true`` to turn the durable
+    store on. When false: no memory DB is created or opened (daemon, workers,
     dashboard write paths), the ``anna_memory`` MCP server and its tools are not
     offered to the model, no retrieved facts are injected into turns, and no
     extraction is enqueued or run (``extraction.enabled`` is ignored). Existing
     databases are left untouched. Restart-gated like the rest of anna.yaml.
     """
 
-    enabled: bool = True
+    enabled: bool = False
     extraction: MemoryExtractionConfig = Field(default_factory=MemoryExtractionConfig)
 
 

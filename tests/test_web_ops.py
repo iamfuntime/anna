@@ -30,6 +30,7 @@ def home(tmp_path):
 def client(home):
     cfg = AnnaConfig(); object.__setattr__(cfg, "anna_home", home)
     cfg.logging.audit.fsync_on_write = False
+    cfg.memory.enabled = True  # durable memory is opt-in
     return TestClient(create_app(cfg), follow_redirects=False, base_url="http://127.0.0.1:8765")
 
 

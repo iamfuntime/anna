@@ -62,7 +62,7 @@ reading and the suite's tests; concurrency of two live daemons on one home; the 
 * Safer default paths and restart controls: scheduler/vault/socket default under `$ANNA_HOME`; entry points refuse a non-real home
   that points into `~/anna`; restart disabled for an isolated home under any spelling of a live unit; `anna setup` never touches
   live units.
-* Configurable memory: `memory.enabled` kill switch (default `true`), documented below.
+* Configurable memory: durable sqlite memory is **opt-in** (`memory.enabled`, default `false`; absent config = file memory only), documented below.
 * Interruptions are separate from failures: `audit.schedule.interrupted`, own streak, `scheduler.interruption_threshold`.
 
 Evidence at the commit that contains this file (see `git log -1`; run on 2026-10-10, Python 3.13, temp `ANNA_HOME` and
@@ -90,7 +90,7 @@ A trial home must be self-contained. Set all of these explicitly in the trial `a
 | `vault.path` | `$TRIAL_HOME/vault` | the vault holds checkpoints/conversations |
 | `transports.cli.socket_path` | `$TRIAL_HOME/anna.sock` | avoid colliding with the live socket |
 | `web.target_unit` | `""` (disabled, recommended) or a dedicated unit such as `anna-trial.service` | the live units are never restartable from a trial |
-| `memory.enabled` | `false` if the trial must not create/open a memory DB | kill switch; default is `true` for compatibility |
+| `memory.enabled` | `false` if the trial must not create/open a memory DB | opt-in switch; default `false`, so a main-compatible config gets no memory DB, tools, injection or extraction. Set `true` to use durable memory |
 
 Enforced in code (all use the passwd entry for "the real `~/anna`", so overriding `$HOME` does not fool them):
 

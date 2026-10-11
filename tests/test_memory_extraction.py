@@ -292,7 +292,9 @@ def test_sdk_extractor_options_are_tool_free_and_budgeted(tmp_path):
 
 def test_opt_in_and_api_key_billing_gate():
     c = AnnaConfig()
-    assert "false" in extraction_blocked_reason(c)  # off by default
+    assert "false" in extraction_blocked_reason(c)  # off by default (memory itself is opt-in too)
+    c.memory.enabled = True
+    assert "extraction.enabled" in extraction_blocked_reason(c)
     c.memory.extraction.enabled = True
     assert extraction_blocked_reason(c) is None
     c.auth.mode = "api_key"
@@ -384,6 +386,7 @@ def test_admin_cli_dry_run_then_apply(tmp_path, monkeypatch):
     from anna.cli.admin import main
     monkeypatch.setenv("ANNA_HOME", str(tmp_path))
     md = tmp_path / "MEMORY.md"; md.write_text("- likes oolong tea\n")
+    (tmp_path / "anna.yaml").write_text("memory:\n  enabled: true\n")  # opt-in
     runner = CliRunner()
     args = [str(md), "--owner", "seth", "--scope", "private"]
     assert "(dry-run): would_import=1" in runner.invoke(main, ["memory-import", *args]).output
@@ -418,6 +421,7 @@ def sdk_fakes(monkeypatch):
 
 def _worker(tmp_path, sent, enabled=True):
     w = _make_worker(tmp_path, sent)
+    w._config.memory.enabled = True  # opt-in (default false)
     w._config.memory.extraction.enabled = enabled
     w._client = _ImmediateClient([_FakeTextBlock(text="ok")])
     return w

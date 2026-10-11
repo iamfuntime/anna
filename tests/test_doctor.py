@@ -194,7 +194,7 @@ def test_unknown_runs_and_uncertain_outbox_ages_are_reported(tmp_path):
 
 
 def test_memory_counts_queue_and_extraction_runner_honesty(tmp_path):
-    cfg = cfg_for(tmp_path); cfg.memory.extraction.enabled = True
+    cfg = cfg_for(tmp_path); cfg.memory.enabled = True; cfg.memory.extraction.enabled = True
     cfg.state_dir.mkdir(parents=True)
     m = MemoryStore(cfg.state_dir / "memory.sqlite3")
     f = m.remember(owner_id="o", visibility_scope="private", kind="fact", subject="a", content="one")
