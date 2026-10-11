@@ -692,3 +692,61 @@ async def test_flush_buffer_now_sends_and_restamps(tmp_path: Path) -> None:
     # Empty buffer: no second send.
     await worker._flush_buffer_now(_make_event(), buffer)
     assert len(sent) == 1
+
+
+# ---------------------------------------------------------------------------
+# Existing-config semantics of the slow-turn flush (97d0c90 rereview)
+# ---------------------------------------------------------------------------
+
+
+async def _soft_breach(tmp_path: Path, monkeypatch, *, text="Still working on it...", configure=None):
+    sent: list[OutboundMessage] = []
+    worker = _make_worker(tmp_path, sent)
+    worker._config.voice.outbound.enabled = False
+    if configure is not None:
+        configure(worker)
+    clock = FakeClock()
+    wd = _watchdog(clock)
+    wd.note_tool_call("Read")
+    buffer = _FlushBuffer(last_flush=0.0)
+    buffer.pending.append(text)
+    monkeypatch.setattr("anna.runtime.worker.asyncio.sleep", _SleepDriver(clock, step=60.0, max_ticks=1))
+    await _run_watchdog_loop(worker, _make_event(), buffer, wd)
+    return worker, sent, buffer
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("setting", ["consolidate", "flush_interval_0", "default"])
+async def test_slow_turn_flush_fires_under_existing_delivery_configs(tmp_path, monkeypatch, setting) -> None:
+    """main flushed at the soft line regardless of consolidation / drip interval."""
+    def configure(w: ConversationWorker) -> None:
+        if setting == "consolidate":
+            w._consolidate_interactive = True
+        elif setting == "flush_interval_0":
+            w._flush_interval = 0
+
+    worker, sent, buffer = await _soft_breach(tmp_path, monkeypatch, configure=configure)
+    assert [m.text for m in sent] == ["Still working on it..."]
+    assert buffer.pending == []  # cleared: the turn-end send cannot repeat it
+    assert worker._pending_watchdog_reminder is not None
+
+
+@pytest.mark.asyncio
+async def test_slow_turn_flush_never_drips_a_voice_note(tmp_path, monkeypatch) -> None:
+    def configure(w: ConversationWorker) -> None:
+        w._config.voice.outbound.enabled = True
+        w._config.voice.outbound.voice_only = True
+        w._config.voice.outbound.transports = ["slack", "telegram"]
+
+    worker, sent, buffer = await _soft_breach(tmp_path, monkeypatch, configure=configure)
+    assert sent == []
+    assert buffer.pending == ["Still working on it..."]  # stays for the single end-of-turn note
+    assert worker._pending_watchdog_reminder is not None  # telemetry / reminder unaffected
+
+
+@pytest.mark.asyncio
+async def test_slow_turn_flush_still_passes_the_markup_guard(tmp_path, monkeypatch) -> None:
+    leaked = "<function_calls>\n<invoke name=\"Bash\">\n<parameter name=\"command\">ls</parameter>\n</invoke>\n</function_calls>"
+    worker, sent, buffer = await _soft_breach(tmp_path, monkeypatch, text=leaked)
+    assert sent == []
+    assert buffer.pending == []

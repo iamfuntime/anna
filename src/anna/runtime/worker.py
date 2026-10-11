@@ -2923,12 +2923,15 @@ class ConversationWorker:
                     action = watchdog.poll()
                     if action is WatchdogAction.NONE:
                         continue
-                    # A watchdog breach remains observable even when the
-                    # operator intentionally chose consolidated output (or
-                    # voice-only output). Do not override that choice by
-                    # fragmenting the reply; only an active periodic-delivery
-                    # policy permits an intermediate watchdog flush.
-                    if self._periodic_flush_active(event):
+                    # The slow-turn flush is the guard's whole point (the channel
+                    # is dead air), so it fires under every existing delivery
+                    # config - ``consolidate_interactive_turns`` and
+                    # ``periodic_flush_seconds: 0`` included, as on ``main``.
+                    # The one exception is voice-only outbound: a mid-turn flush
+                    # there would become its own voice note (a drip), so the
+                    # turn stays consolidated into the single end-of-turn note.
+                    # Breach telemetry, reminder and alert fire either way.
+                    if not self._voice_only_for_transport(event):
                         await self._flush_buffer_now(event, buffer)
                     if action is WatchdogAction.SOFT:
                         self._pending_watchdog_reminder = soft_reminder(
