@@ -15,6 +15,8 @@ import stat
 from pathlib import Path
 
 import pytest
+
+import anna.config as config_module
 from click.testing import CliRunner
 
 from anna.setup import wizard
@@ -92,6 +94,8 @@ def _telegram_inputs(short_name: str = "Tester", detail: str = "") -> str:
 def patched(monkeypatch, tmp_path):
     """Patch OS boundaries; HOME -> tmp so the systemd unit copy stays in tmp."""
     monkeypatch.setenv("HOME", str(tmp_path))
+    # opt-in: these tests fake systemctl/journalctl, so the wizard may treat tmp/anna as the live home
+    monkeypatch.setattr(config_module, "real_default_home", lambda: tmp_path / "anna")
     monkeypatch.setattr(wizard.shutil, "which", _fake_which({"systemctl", "journalctl"}))
     monkeypatch.setattr(wizard.subprocess, "run", _fake_run())
     monkeypatch.setattr(

@@ -1410,7 +1410,8 @@ class Scheduler:
             text += (f"\n\n[Partial delivery: {sent} of {total} parts of this message were sent"
                      + (f"; part {unconfirmed[0] + 1} may or may not have arrived" if unconfirmed else "")
                      + "; the remaining parts were NOT sent.]")
-        key = f"outbox:{occ}:{idx}:{sent}"
+        # (schedule, tick) not the row id: ids are reused after pruning
+        key = f"outbox:{sid}:{msg["scheduled_for"]}:{idx}:{sent}"
         if transcript_has_delivery_key(self._config, conv_key, key):
             written: str | None = conv_key
         else:

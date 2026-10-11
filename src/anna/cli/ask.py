@@ -35,7 +35,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from anna.config import load_config
+from anna.config import load_config, refuse_foreign_home
 
 # Protocol version this client speaks. Must match the daemon's
 # accepted version on the ``ack`` frame; on mismatch we exit non-zero
@@ -290,6 +290,8 @@ def main() -> int:
     except Exception as exc:
         sys.stderr.write(f"failed to load anna config: {exc}\n")
         return 1
+    if refuse_foreign_home(config, "anna ask"):
+        return 2
 
     socket_path = config.transports.cli.resolved_socket_path
 

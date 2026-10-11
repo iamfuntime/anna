@@ -58,6 +58,34 @@ def require_local_host(request: Request) -> None:
 
 router = APIRouter(tags=["ops"], dependencies=[Depends(require_local_host)])
 
+
+def _memory_enabled_now(request: Request) -> bool:
+    """``memory.enabled`` as of THIS request (kill switch), not as of dashboard start.
+
+    The dashboard is a separate process from the daemon and is not restarted when ``anna.yaml``
+    changes, so the flag is re-read from the file on every request.  Disabling takes effect
+    immediately; re-enabling also needs the dashboard to have been started with it enabled (the
+    start-up value is ANDed in), the conservative direction for a kill switch.  An unreadable YAML
+    fails closed.
+    """
+    cfg = request.app.state.cfg
+    if not cfg.memory.enabled:
+        return False
+    store = request.app.state.config_store
+    if not store.path.exists():
+        return True
+    try:
+        return bool(store.load_validated().memory.enabled)
+    except Exception:  # noqa: BLE001 - cannot prove it is enabled: treat as disabled
+        return False
+
+
+def _effective_cfg(request: Request, enabled: bool) -> Any:
+    cfg = request.app.state.cfg
+    if enabled or not cfg.memory.enabled:
+        return cfg
+    return cfg.model_copy(update={"memory": cfg.memory.model_copy(update={"enabled": False})})
+
 # Banner text comes ONLY from these fixed tables (never from the URL), so a crafted link cannot
 # put attacker-written words into a trusted-looking confirmation banner.
 _FLASH = {
@@ -70,6 +98,7 @@ _FLASH = {
     "select_scope": "Select an owner and scope first.",
     "missing_fields": "Owner, scope and new content are required.",
     "bad_scope": "Unknown owner/scope selection.",
+    "disabled": "Memory is disabled (memory.enabled is false); nothing was read or changed.",
 }
 
 
@@ -82,13 +111,15 @@ def _render(request: Request, name: str, ctx: dict[str, Any], status_code: int =
 
 @router.get("/health", response_class=HTMLResponse)
 async def get_health(request: Request) -> Response:
-    report = await run_in_threadpool(collect, request.app.state.cfg)
+    enabled = await run_in_threadpool(_memory_enabled_now, request)
+    report = await run_in_threadpool(collect, _effective_cfg(request, enabled))
     return _render(request, "health.html", {"active_nav": "health", "report": report})
 
 
 @router.get("/health.json")
 async def get_health_json(request: Request) -> JSONResponse:
-    return JSONResponse(await run_in_threadpool(collect, request.app.state.cfg))
+    enabled = await run_in_threadpool(_memory_enabled_now, request)
+    return JSONResponse(await run_in_threadpool(collect, _effective_cfg(request, enabled)))
 
 
 # ---------------------------------------------------------------- repairs
@@ -170,12 +201,16 @@ def _facts(cfg: Any, owner: str, scope: str, status: str) -> list[dict[str, Any]
 async def get_memory(request: Request, owner: str = "", scope: str = "", status: str = "active",
                      flash: str = "") -> Response:
     cfg = request.app.state.cfg
+    if not await run_in_threadpool(_memory_enabled_now, request):  # kill switch: open nothing, show nothing
+        return _render(request, "memory.html", {"active_nav": "memory", "disabled": True, "scopes": [],
+                                                 "selected": None, "facts": [], "status": "active", "msg": "",
+                                                 "err": ""})
     scopes = await run_in_threadpool(_scopes, cfg)
     selected = None
     facts: list[dict[str, Any]] = []
     err = ""
     msg = _FLASH.get(flash, "") if flash in ("forgot", "corrected") else ""
-    if flash in ("no_active", "no_memory", "not_active", "select_scope", "missing_fields"):
+    if flash in ("no_active", "no_memory", "not_active", "select_scope", "missing_fields", "disabled"):
         err = _FLASH[flash]
     if owner and scope:
         if not any(s["owner_id"] == owner and s["scope"] == scope for s in scopes):
@@ -204,8 +239,8 @@ async def post_memory_forget(request: Request, fact_id: int, owner: Annotated[st
     if not owner or not scope:
         return _back(owner, scope, flash="select_scope")
 
-    if not cfg.memory.enabled:  # kill switch: never create/open the DB from a write route
-        return _back(owner, scope, flash="no_memory")
+    if not await run_in_threadpool(_memory_enabled_now, request):  # kill switch: never open the DB from a write route
+        return _back(owner, scope, flash="disabled")
 
     def _do() -> str:
         store = _store(cfg)
@@ -229,8 +264,8 @@ async def post_memory_correct(request: Request, fact_id: int, owner: Annotated[s
     if not owner or not scope or not content.strip():
         return _back(owner, scope, flash="missing_fields")
 
-    if not cfg.memory.enabled:  # kill switch: never create/open the DB from a write route
-        return _back(owner, scope, flash="no_memory")
+    if not await run_in_threadpool(_memory_enabled_now, request):  # kill switch: never open the DB from a write route
+        return _back(owner, scope, flash="disabled")
 
     def _do() -> str:
         store = _store(cfg)

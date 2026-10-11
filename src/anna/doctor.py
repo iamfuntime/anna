@@ -297,6 +297,10 @@ def _runs_and_outbox(ledger: ReadOnlyDB | str, now: datetime) -> list[Check]:
 
 
 def _memory(config: AnnaConfig, snap: dict[str, Any] | None, now: datetime) -> Check:
+    if not config.memory.enabled:  # kill switch: do not open (or even look for) the memory database
+        return Check("memory", "Memory", DISABLED,
+                     "disabled by memory.enabled: false (no memory database is opened; core/MEMORY.md file memory "
+                     "is a separate mechanism and is unaffected)", "")
     try:
         db = ReadOnlyDB(config.state_dir / "memory.sqlite3")
     except Unavailable:

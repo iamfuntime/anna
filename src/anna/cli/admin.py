@@ -21,7 +21,7 @@ from pathlib import Path
 
 import click
 
-from anna.config import load_config
+from anna.config import load_config, refuse_foreign_home
 from anna.log import audit_event, configure_logging
 from anna.vault.paths import safe_conv_key
 
@@ -38,6 +38,14 @@ def _is_test_run() -> bool:
     an admin command from inside the test suite.
     """
     return "PYTEST_CURRENT_TEST" in os.environ
+
+
+def _guarded_config():  # type: ignore[no-untyped-def]
+    """Load the config; an isolated (trial) home must not reach into the real ``~/anna``."""
+    config = load_config()
+    if refuse_foreign_home(config, "anna-admin"):
+        sys.exit(2)
+    return config
 
 
 def _configure_cli_logging() -> None:
@@ -169,7 +177,7 @@ def merge_checkpoints(
     exists at the destination; the operator must resolve manually.
     """
     _configure_cli_logging()
-    config = load_config()
+    config = _guarded_config()
     vault_root = config.vault.resolved_path
     audit_dir = config.audit_dir
 
@@ -318,21 +326,53 @@ def merge_checkpoints(
 @click.option("--kind", default="fact", show_default=True)
 @click.option("--recursive", is_flag=True, help="Recurse into subdirectories when PATH is a directory.")
 @click.option("--apply", "apply_", is_flag=True, help="Write facts. Default is a dry run.")
-def memory_import(path: Path, owner: str, scope: str, kind: str, recursive: bool, apply_: bool) -> None:
+@click.option("--force", is_flag=True, help="Import even though memory.enabled is false (the facts stay unused until it is re-enabled).")
+def memory_import(path: Path, owner: str, scope: str, kind: str, recursive: bool, apply_: bool, force: bool) -> None:
     """Import bullet items from a legacy MEMORY.md (or a directory of notes).
 
     Idempotent, never edits or deletes the source, and never revives facts the
     user forgot. Owner and scope are mandatory so shared history is not
     attributed to a user. A backup of the memory DB is taken before writing.
+
+    Honours ``memory.enabled``: when it is false nothing is opened or created (not even for a dry
+    run) unless ``--force``. A dry run never creates or migrates the memory DB: it runs against a
+    scratch copy.
     """
+    import shutil
+    import sqlite3
+    import tempfile
     from datetime import datetime, timezone
 
     from anna.runtime.memory import MemoryStore
     from anna.runtime.memory_import import import_legacy
 
     _configure_cli_logging()
-    db = _anna_home() / "state" / "memory.sqlite3"
-    store = MemoryStore(db)
+    try:
+        config = _guarded_config()
+    except SystemExit:
+        raise
+    except Exception as exc:  # noqa: BLE001 - cannot prove the kill switch is off: do nothing
+        click.secho(f"memory-import: cannot read config to check memory.enabled ({exc}); nothing was opened", fg="red")
+        sys.exit(2)
+    if not config.memory.enabled and not force:
+        click.secho("memory-import: memory.enabled is false; nothing was opened or created. "
+                    "Re-run with --force to import anyway (facts stay unused until memory is enabled).", fg="red")
+        sys.exit(2)
+    db = config.state_dir / "memory.sqlite3"
+    scratch: Path | None = None
+    if not apply_:  # dry run: never create, migrate or write the real DB
+        scratch = Path(tempfile.mkdtemp(prefix="anna-memory-dryrun-"))
+        if db.exists():
+            src = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+            dst = sqlite3.connect(scratch / "memory.sqlite3")
+            try:
+                src.backup(dst)
+            finally:
+                src.close(); dst.close()
+        work_db = scratch / "memory.sqlite3"
+    else:
+        work_db = db
+    store = MemoryStore(work_db)
     try:
         if apply_ and db.exists():
             stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
@@ -345,11 +385,13 @@ def memory_import(path: Path, owner: str, scope: str, kind: str, recursive: bool
             sys.exit(2)
     finally:
         store.close()
+        if scratch is not None:
+            shutil.rmtree(scratch, ignore_errors=True)
     mode = "applied" if apply_ else "dry-run"
     click.secho(f"memory-import ({mode}): " + (", ".join(f"{k}={v}" for k, v in sorted(result.items())) or "no items"),
                 fg="green")
     if apply_:
-        audit_event("audit.admin.memory_import", audit_dir=_anna_home() / "audit", actor="operator",
+        audit_event("audit.admin.memory_import", audit_dir=config.audit_dir, actor="operator",
                     fsync_on_write=True, owner=owner, scope=scope, **dict(result))
 
 

@@ -733,7 +733,10 @@ def _confirm_plan(state: WizardState) -> bool:
     click.echo(f"  Vault root  : {state.vault_root}")
     click.echo(f"  Config      : {state.anna_home / 'anna.yaml'}")
     click.echo(f"  Secrets     : {state.anna_home / '.env'} (chmod 600)")
-    click.echo(f"  Service     : systemd user unit 'anna', enabled + started now")
+    if _live_units_blocked(state):
+        click.echo("  Service     : NOT installed (trial ANNA_HOME; the live units are never touched)")
+    else:
+        click.echo(f"  Service     : systemd user unit 'anna', enabled + started now")
     web_state = "enabled (127.0.0.1:8765)" if state.web_enabled else "disabled (unit installed but stopped)"
     click.echo(f"  Web dashboard: {web_state}")
     return click.confirm("\nWrite config and start ANNA?", default=True)
@@ -1009,7 +1012,7 @@ transports:
   # ships NDJSON framing only; the field is kept for forward-compat.
   cli:
     enabled: true
-    socket_path: ~/anna/anna.sock
+    socket_path: {state.anna_home / "anna.sock"}
     idle_gap_minutes: 30
     framing: ndjson
 
@@ -1072,17 +1075,44 @@ web:
   enabled: {web_enabled_yaml}
   host: 127.0.0.1
   port: 8765
-  target_unit: anna.service
+  target_unit: {"anna.service" if not _live_units_blocked(state) else '""'}
 """
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(body, encoding="utf-8")
+
+
+def _live_units_blocked(state: WizardState) -> bool:
+    """True when ``state.anna_home`` is an isolated (trial) home.
+
+    ``systemctl --user`` always reaches the account's REAL user manager, and the bundled units
+    hard-code ``ANNA_HOME=%h/anna``: installing, enabling, starting, restarting or disabling
+    ``anna.service`` / ``anna-web.service`` from a trial home would act on the live services.
+    Overriding ``$HOME`` does not help. So none of those actions runs for an isolated home.
+    """
+    from anna.config import is_isolated_home
+
+    return is_isolated_home(state.anna_home)
+
+
+def _print_manual_units_note(state: WizardState) -> None:
+    click.secho(
+        f"Note: ANNA_HOME={state.anna_home} is not the real ~/anna, so no systemd unit was written, enabled, "
+        "started or disabled (it would act on the LIVE anna.service / anna-web.service). Run the daemon by hand "
+        f"instead:\n  ANNA_HOME={state.anna_home} HOME=<scratch dir> anna",
+        fg="yellow",
+    )
 
 
 def _install_systemd_unit(state: WizardState) -> dict[str, Any] | None:
     """Copy the packaged systemd unit into ~/.config/systemd/user/, then start
     and probe the service. Returns the probe result, or ``None`` if the unit
     file is missing (operator must wire it up manually).
+
+    Never runs for an isolated (trial) ANNA_HOME - see :func:`_live_units_blocked`.
     """
+    if _live_units_blocked(state):
+        _print_manual_units_note(state)
+        return None
     target_dir = Path(os.path.expanduser("~/.config/systemd/user"))
     target_dir.mkdir(parents=True, exist_ok=True)
     # Bundled template — see src/anna/setup/templates/anna.service. Read via
@@ -1120,7 +1150,12 @@ def _install_web_unit(state: WizardState) -> None:
     Failures degrade with a yellow warning rather than aborting the
     wizard; the dashboard is optional surface and the daemon is the
     load-bearing service.
+
+    Never runs for an isolated (trial) ANNA_HOME - see :func:`_live_units_blocked`: disabling the
+    dashboard from a trial would disable the LIVE ``anna-web.service``.
     """
+    if _live_units_blocked(state):
+        return
     target_dir = Path(os.path.expanduser("~/.config/systemd/user"))
     target_dir.mkdir(parents=True, exist_ok=True)
     target = target_dir / "anna-web.service"
@@ -1278,6 +1313,8 @@ def _start_and_probe(state: WizardState) -> dict[str, Any] | None:
     systemctl is unavailable (WSL without systemd, macOS) so the wizard degrades
     to a manual-start hint rather than pretending the service is up.
     """
+    if _live_units_blocked(state):
+        return None
     if not shutil.which("systemctl"):
         click.secho(
             "Note: systemctl --user not available here. Config is written; "

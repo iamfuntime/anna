@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import sys
 
-from anna.config import _resolve_config_path, load_config
+from anna.config import _resolve_config_path, load_config, refuse_foreign_home
 from anna.log import configure_logging, get_logger
 from anna_web import audit as web_audit
 
@@ -28,6 +28,8 @@ def main() -> int:
         # daemon's behavior: write to stderr and exit non-zero so
         # systemd restarts us.
         sys.stderr.write(f"anna-web: failed to load config: {exc}\n")
+        return 2
+    if refuse_foreign_home(cfg, "anna-web", "start"):
         return 2
 
     configure_logging(level=cfg.logging.level, format=cfg.logging.format)

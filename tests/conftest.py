@@ -107,13 +107,14 @@ def _inject_default_origin_header() -> Any:
         httpx.Client.request = original_request  # type: ignore[method-assign]
 
 
-@pytest.fixture(autouse=True)
-def _tests_run_as_the_real_home(monkeypatch: pytest.MonkeyPatch) -> Any:
-    """Most tests build configs under ``tmp_path`` but exercise the dashboard's
-    restart control and daemon boot as if on the real ``~/anna``. Trial-isolation
-    behaviour (restart disabled, foreign-path refusal) is tested explicitly in
-    ``tests/test_trial_isolation.py`` by restoring the real predicate there."""
+@pytest.fixture
+def home_is_the_real_home(monkeypatch: pytest.MonkeyPatch) -> Any:
+    """Opt-in for the few tests that exercise the dashboard's restart control: pretend the test's own
+    ``anna_home`` is the account's real ``~/anna`` (``config.real_default_home``), keeping the real
+    ``is_isolated_home`` predicate in play. Usage: ``home_is_the_real_home(cfg.anna_home)``."""
     import anna.config as _config
 
-    monkeypatch.setattr(_config, "is_isolated_home", lambda _home: False)
-    yield
+    def _use(home: Any) -> None:
+        monkeypatch.setattr(_config, "real_default_home", lambda: home)
+
+    return _use

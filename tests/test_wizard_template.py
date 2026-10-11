@@ -22,10 +22,11 @@ def test_template_is_importable_as_resource():
     assert "WorkingDirectory=%h/anna" in contents
 
 
-def test_install_systemd_unit_writes_template(tmp_path, monkeypatch):
+def test_install_systemd_unit_writes_template(tmp_path, monkeypatch, home_is_the_real_home):
     """_install_systemd_unit must read the bundled template and write
     a verbatim copy to ~/.config/systemd/user/anna.service."""
     monkeypatch.setenv("HOME", str(tmp_path))
+    home_is_the_real_home(tmp_path / "anna")
     # Disable the start-and-probe path; we only care about the write.
     monkeypatch.setattr(wizard, "_start_and_probe", lambda state: None)
 

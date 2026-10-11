@@ -149,6 +149,24 @@ def is_isolated_home(anna_home: Path) -> bool:
 
 
 DEFAULT_RESTART_UNIT = "anna.service"
+# Units that belong to the live installation. An isolated (trial) home may never restart them,
+# however the operator spells the name.
+LIVE_UNITS = frozenset({"anna.service", "anna-web.service"})
+_UNIT_SUFFIXES = (".service", ".socket", ".target", ".timer", ".path", ".mount", ".scope", ".slice")
+
+
+def normalize_unit_name(unit: str | None) -> str | None:
+    """systemd's canonical spelling of a unit name: ``anna`` == ``anna.service``.
+
+    Returns ``None`` for an empty or unusable name (path separators, whitespace, control characters),
+    which callers treat as "restart disabled".
+    """
+    name = (unit or "").strip()
+    if not name or any(c in name for c in "/\\") or any(c.isspace() or ord(c) < 32 for c in name):
+        return None
+    if not name.lower().endswith(_UNIT_SUFFIXES):
+        name += ".service"
+    return name
 
 
 # ---------------------------------------------------------------------------
@@ -680,6 +698,9 @@ class MemoryExtractionConfig(BaseModel):
     min_source_chars: int = 12
     max_candidates_per_job: int = 5
     min_confidence: float = 0.8
+    # Queued jobs older than this are discarded (source text wiped) instead of extracted. Bounds how
+    # much pre-existing text is processed after memory.enabled/extraction.enabled is switched back on.
+    max_job_age_hours: float = 72.0
 
     @field_validator("model")
     @classmethod
@@ -691,7 +712,7 @@ class MemoryExtractionConfig(BaseModel):
         "poll_interval_seconds", "job_timeout_seconds", "max_attempts",
         "backoff_base_seconds", "backoff_max_seconds", "lease_seconds",
         "max_pending", "max_source_chars", "min_source_chars",
-        "max_candidates_per_job",
+        "max_candidates_per_job", "max_job_age_hours",
     )
     @classmethod
     def _positive(cls, v: float, info: Any) -> float:
@@ -1966,39 +1987,63 @@ def _apply_env_overrides(data: dict[str, Any]) -> dict[str, Any]:
 def effective_restart_unit(config: "AnnaConfig") -> str | None:
     """The unit the dashboard may restart, or ``None`` when restart is disabled.
 
-    * ``web.target_unit: ""`` -> disabled.
-    * the default live ``anna.service`` is only allowed from the real
-      ``~/anna``; an isolated ``ANNA_HOME`` must name its own unit.
+    * ``web.target_unit: ""`` (or an unusable name) -> disabled.
+    * the name is normalised first (``anna`` == ``anna.service``), so an alias cannot slip past.
+    * an isolated ``ANNA_HOME`` may not restart the live ``anna.service`` / ``anna-web.service``
+      under any spelling; it must name its own dedicated unit.
     """
-    unit = (config.web.target_unit or "").strip()
-    if not unit:
+    unit = normalize_unit_name(config.web.target_unit)
+    if unit is None:
         return None
-    if unit == DEFAULT_RESTART_UNIT and is_isolated_home(config.anna_home):
+    if unit.lower() in LIVE_UNITS and is_isolated_home(config.anna_home):
         return None
     return unit
 
 
-def foreign_home_paths(config: "AnnaConfig") -> list[tuple[str, Path]]:
-    """State paths of an isolated home that point into the real ``~/anna``.
+def _inside(path: Path, root: Path) -> bool:
+    resolved = Path(os.path.realpath(path))
+    return resolved == root or root in resolved.parents
 
-    A trial with ``ANNA_HOME`` elsewhere must not open the production
-    schedules file, vault or socket (e.g. through an absolute or ``~/anna``
-    value copied into its ``anna.yaml``).
+
+def foreign_home_paths(config: "AnnaConfig") -> list[tuple[str, Path]]:
+    """Paths of an isolated home that point into the real ``~/anna``.
+
+    A trial with ``ANNA_HOME`` elsewhere must not open the production schedules file, vault, socket,
+    Google credentials, Obsidian paths or config (e.g. through an absolute or ``~/anna`` value copied
+    into its ``anna.yaml``, ``$ANNA_CONFIG_PATH`` or the ``./anna.yaml`` development fallback).
     """
     if not is_isolated_home(config.anna_home):
         return []
     real = Path(os.path.realpath(real_default_home()))
-    candidates = [
+    candidates: list[tuple[str, Path | None]] = [
         ("scheduler.state_path", config.scheduler.resolved_state_path),
         ("vault.path", config.vault.resolved_path),
         ("transports.cli.socket_path", config.transports.cli.resolved_socket_path),
+        ("integrations.obsidian.vault_path", config.integrations.obsidian.resolved_vault_path),
+        ("integrations.obsidian.tasknotes_path", config.integrations.obsidian.resolved_tasknotes_path),
+        ("google.oauth_client_file", config.google_oauth_client_path()),
+        ("config file", _resolve_config_path()),
     ]
-    bad = []
-    for label, path in candidates:
-        resolved = Path(os.path.realpath(path))
-        if resolved == real or real in resolved.parents:
-            bad.append((label, path))
-    return bad
+    for account in config.google.accounts:
+        if account.credentials_file:
+            candidates.append((f"google.accounts[{account.slug}].credentials_file",
+                               config.resolve_google_credentials_path(account)))
+    return [(label, path) for label, path in candidates if path is not None and _inside(path, real)]
+
+
+def refuse_foreign_home(config: "AnnaConfig", prog: str, verb: str = "run") -> bool:
+    """Print a refusal and return True when an isolated home reaches into the real ``~/anna``."""
+    import sys
+
+    foreign = foreign_home_paths(config)
+    if not foreign:
+        return False
+    listing = ", ".join(f"{label}={path}" for label, path in foreign)
+    sys.stderr.write(
+        f"{prog}: refusing to {verb}: ANNA_HOME={config.anna_home} is not the real ~/anna "
+        f"but these settings point into it: {listing}. Set them to paths under ANNA_HOME.\n"
+    )
+    return True
 
 
 def load_config(path: Path | None = None) -> AnnaConfig:

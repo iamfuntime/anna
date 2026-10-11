@@ -35,7 +35,7 @@ from typing import Any
 
 from anna.agents.registry import SubAgentRegistry
 from anna.auth import ensure_isolated_config_dir
-from anna.config import AnnaConfig, foreign_home_paths, load_config
+from anna.config import AnnaConfig, load_config, refuse_foreign_home
 from anna.log import configure_logging, get_logger
 from anna.runtime.alerter import AdminAlerter
 from anna.runtime.router import ConversationRouter
@@ -585,15 +585,9 @@ def run_daemon() -> int:
         sys.stderr.write(f"anna: failed to load config: {exc}\n")
         return 2
 
-    foreign = foreign_home_paths(config)
-    if foreign:
-        # Trial/test homes must be self-contained: refuse to open the live
-        # ~/anna schedules, vault or socket from another ANNA_HOME.
-        listing = ", ".join(f"{label}={path}" for label, path in foreign)
-        sys.stderr.write(
-            f"anna: refusing to start: ANNA_HOME={config.anna_home} is not the real ~/anna "
-            f"but these settings point into it: {listing}. Set them to paths under ANNA_HOME.\n"
-        )
+    # Trial/test homes must be self-contained: refuse to open the live
+    # ~/anna schedules, vault, socket, credentials or config from another ANNA_HOME.
+    if refuse_foreign_home(config, "anna", "start"):
         return 2
 
     configure_logging(level=config.logging.level, format=config.logging.format)

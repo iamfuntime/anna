@@ -236,7 +236,8 @@ class MemoryExtractionRunner:
         budget = cfg.max_jobs_per_day - self._store.jobs_started_since(now - timedelta(days=1))
         jobs: list[ExtractionJob] = []
         while len(jobs) < min(cfg.concurrency, max(budget, 0)):
-            job = self._store.claim_extraction(lease_seconds=cfg.lease_seconds, max_attempts=cfg.max_attempts)
+            job = self._store.claim_extraction(lease_seconds=cfg.lease_seconds, max_attempts=cfg.max_attempts,
+                                               max_age_seconds=cfg.max_job_age_hours * 3600)
             if job is None:
                 break
             jobs.append(job)

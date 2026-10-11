@@ -127,6 +127,9 @@ def create_app(cfg: AnnaConfig) -> FastAPI:
     # construction — gates are restart-applied like all anna.yaml
     # config, so per-request recomputation would buy nothing.
     templates.env.globals["integration_nav"] = web_integrations.nav_entries(cfg)
+    # Memory nav hidden when the dashboard STARTED with memory.enabled=false; the /memory routes
+    # additionally re-read the flag on every request (see ops_routes._memory_enabled_now).
+    templates.env.globals["memory_nav"] = cfg.memory.enabled
     app.state.templates = templates
 
     # Vendored frontend assets (htmx.min.js + anna.css + app.js).

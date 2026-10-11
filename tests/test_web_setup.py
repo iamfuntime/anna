@@ -127,9 +127,11 @@ def _which_with(present: set[str]):
 
 
 @pytest.fixture
-def tmp_home(monkeypatch, tmp_path):
-    """Anchor ``%h`` (HOME) to tmp_path so the unit file lands in tmp."""
+def tmp_home(monkeypatch, tmp_path, home_is_the_real_home):
+    """Anchor ``%h`` (HOME) to tmp_path so the unit file lands in tmp (systemctl is faked in these tests,
+    so ``tmp_path/anna`` may stand in for the real home)."""
     monkeypatch.setenv("HOME", str(tmp_path))
+    home_is_the_real_home(tmp_path / "anna")
     return tmp_path
 
 
@@ -220,7 +222,8 @@ def _base_state(tmp_path: Path, *, web_enabled: bool) -> wizard.WizardState:
     )
 
 
-def test_write_anna_yaml_default_keeps_web_enabled_true(tmp_path):
+def test_write_anna_yaml_default_keeps_web_enabled_true(tmp_path, home_is_the_real_home):
+    home_is_the_real_home(tmp_path / "anna")
     state = _base_state(tmp_path, web_enabled=True)
     yaml_path = tmp_path / "anna.yaml"
     wizard._write_anna_yaml(state, yaml_path)

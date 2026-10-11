@@ -25,7 +25,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from anna.config import AnnaConfig, GoogleAccountConfig, load_config
+from anna.config import AnnaConfig, GoogleAccountConfig, load_config, refuse_foreign_home
 from anna.tools.google_auth import (
     GoogleAuthError,
     TokenMissingError,
@@ -243,6 +243,8 @@ def main(argv: list[str] | None = None) -> int:
         config = load_config()
     except Exception as exc:
         _print_err(f"failed to load anna.yaml: {exc}")
+        return 2
+    if refuse_foreign_home(config, "anna google"):
         return 2
     if not config.google.enabled:
         _print_warn(

@@ -45,7 +45,9 @@
              ("repairs", "/repairs", "Repairs"),
              ("memory", "/memory", "Memory"),
            ] %}
+        {% if key != 'memory' or memory_nav | default(true) %}
         <li><a href="{{ href }}"{% if current == key %} aria-current="page"{% endif %}>{{ label }}</a></li>
+        {% endif %}
         {% endfor %}
         {# Config-gated integration nav (anna_web/integrations.py) —
            e.g. Tasks renders ONLY while its gate passes for cfg.

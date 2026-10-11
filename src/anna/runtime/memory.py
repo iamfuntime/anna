@@ -351,8 +351,14 @@ class MemoryStore:
             )
         return True
 
-    def claim_extraction(self, *, lease_seconds: float, max_attempts: int) -> ExtractionJob | None:
-        """Claim one due job; reclaims jobs whose lease expired (crash recovery)."""
+    def claim_extraction(self, *, lease_seconds: float, max_attempts: int,
+                         max_age_seconds: float | None = None) -> ExtractionJob | None:
+        """Claim one due job; reclaims jobs whose lease expired (crash recovery).
+
+        With ``max_age_seconds``, pending jobs queued longer ago than that are expired first (status
+        ``dead``, source text wiped, never extracted): text captured while memory was switched off or
+        the daemon was down must not be processed long after the fact.
+        """
         now_dt = datetime.now(UTC)
         now = now_dt.isoformat()
         stale = (now_dt - timedelta(seconds=lease_seconds)).isoformat()
@@ -363,6 +369,12 @@ class MemoryStore:
                 "UPDATE extraction_jobs SET status='dead', source_text=NULL, claim_token=NULL, updated_at=?, "
                 "last_error=COALESCE(last_error,'lease expired after max attempts') "
                 "WHERE status='running' AND claimed_at<? AND attempts>=?", (now, stale, max_attempts))
+            if max_age_seconds is not None:
+                self._conn.execute(
+                    "UPDATE extraction_jobs SET status='dead', source_text=NULL, claim_token=NULL, updated_at=?, "
+                    "last_error='expired: older than memory.extraction.max_job_age_hours' "
+                    "WHERE status='pending' AND created_at<?",
+                    (now, (now_dt - timedelta(seconds=max_age_seconds)).isoformat()))
             row = self._conn.execute(
                 "SELECT * FROM extraction_jobs WHERE (status='pending' AND next_attempt_at<=?) "
                 "OR (status='running' AND claimed_at<?) ORDER BY id LIMIT 1", (now, stale)).fetchone()

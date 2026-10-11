@@ -847,7 +847,7 @@ class RuntimeLedger:
                 "((q.kind='run' AND q.target_id=o.id) OR (q.kind='outbox' AND q.target_id IN "
                 "(SELECT id FROM schedule_outbox WHERE occurrence_id=o.id))))", (cutoff,))]
             for oid in doomed:
-                for table in ("heartbeat_receipts", "schedule_outbox", "schedule_runs"):
+                for table in ("heartbeat_receipts", "schedule_outbox", "schedule_runs", "delivered_post_records"):
                     self._conn.execute(f"DELETE FROM {table} WHERE occurrence_id=?", (oid,))
                 self._conn.execute("DELETE FROM schedule_occurrences WHERE id=?", (oid,))
             counts["occurrences"] = len(doomed)
@@ -1042,7 +1042,10 @@ class RuntimeLedger:
                 (g["occurrence_id"], g["msg_index"])).fetchall()
             sent = [r for r in rows if r["status"] == "sent"]
             out.append({"occurrence_id": g["occurrence_id"], "msg_index": g["msg_index"],
-                        "schedule_id": rows[0]["schedule_id"], "transport": rows[0]["transport"],
+                        "schedule_id": rows[0]["schedule_id"],
+                        "scheduled_for": self._conn.execute("SELECT scheduled_for FROM schedule_occurrences WHERE id=?",
+                                                            (g["occurrence_id"],)).fetchone()[0],
+                        "transport": rows[0]["transport"],
                         "channel": rows[0]["channel"], "chunk_count": rows[0]["chunk_count"],
                         "sent_parts": len(sent), "text": "".join(r["text"] for r in sent),
                         "partial": len(sent) < rows[0]["chunk_count"],

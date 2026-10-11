@@ -109,9 +109,10 @@ def test_settings_nav_highlights_settings(anna_home: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_settings_includes_restart_control(anna_home: Path) -> None:
+def test_settings_includes_restart_control(anna_home: Path, home_is_the_real_home) -> None:
     """/settings embeds the idle restart partial exactly as /config does:
     same POST target, same confirm guard, same swap wiring."""
+    home_is_the_real_home(anna_home)
     body = _client(anna_home).get("/settings").text
 
     assert 'data-restart-partial="idle"' in body
