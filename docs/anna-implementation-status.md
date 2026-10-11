@@ -626,17 +626,43 @@ modules except missing third-party stubs.
 * Merged `origin/main` (normal merge, no rebase). Preserved: schedule `gate_command` (consulted after claim, before the
   run; a skip closes the occurrence as `skipped_gate`, advances `last_fired_at`, touches neither `last_status` nor
   `consecutive_failures`), per-schedule `model` pin (validated, carried on `InboundEvent.model`), delivered-post recording
-  in the destination DM (now per *sent* outbox chunk, `audit.schedule.delivered_post_recorded`), notification leakage
-  guard, Slack file intake, per-run token accounting (`usage` on `audit.schedule.complete`) and outbound sanitization.
-  `Schedule` now keeps unknown fields (`extra="allow"`).
-* Stale ledger cursor: `materialize` uses the later of ledger cursor and `last_fired_at`/`created_at`.
-* Restart/crash interruptions (`kind="interrupted"`) do not count toward auto-disable; `scheduler.interruption_threshold`
-  (default 5 in a row) re-arms the breaker for poison jobs.
-* Trial isolation: scheduler/vault/socket defaults follow `$ANNA_HOME`; daemon refuses to boot if a non-real home points
-  into the real `~/anna`; dashboard Restart disabled for isolated homes unless a dedicated `web.target_unit` is set.
-* `memory.enabled` kill switch (default `true`, compatibility). Not covered: the offline `anna memory-import` CLI still
-  opens the DB because the operator invokes it explicitly.
-* Tests: `tests/test_reconcile_main.py`, `tests/test_trial_isolation.py`, `tests/test_memory_kill_switch.py`.
+  in the destination DM, notification leakage guard, Slack file intake, per-run token accounting (`usage` on
+  `audit.schedule.complete`) and outbound sanitization. `Schedule` keeps unknown fields (`extra="allow"`).
+* Trial isolation: scheduler/vault/socket defaults follow `$ANNA_HOME`; entry points refuse a non-real home that points into the
+  real `~/anna`; restart is disabled for isolated homes for every spelling of a live unit; `anna setup` never touches live units.
+* `memory.enabled` kill switch (default `true`, compatibility).
+
+## Independent reconciliation review fixes (`/tmp/anna-reconciliation-review-fb4865a.md`)
+
+Review of `337abb5..fb4865a` found two High and nine Medium defects. Disposition (all with regression tests; "T" = test file):
+
+| # | disposition |
+| --- | --- |
+| **H1** completion-time stamps dropped due ticks | Fixed by provenance, not by a cursor max: the ledger records every `last_fired_at` it writes (`schedule_stamps`, ledger v6, written *before* the YAML) and only a stamp newer than all of them (older build / hand edit) may lift the cursor (`audit.schedule.cursor_external_stamp`). An external stamp is also adopted *before* this build overwrites it (recovery, completion, gate skip, shutdown stamps all go through registering wrappers; a source-scan test pins that). T: `test_review_reconcile.py` (crash recovery keeps the due tick, completion window, external stamp prevents replay, adopt-before-overwrite, recovery does not erase an older build's stamp) |
+| **H2** `target_unit: anna` bypass | Fixed: unit names are normalised as systemd reads them; an isolated home denies `anna.service` and `anna-web.service` under any spelling; names with `/`/whitespace disable restart. T: `test_trial_isolation.py` (10 aliases) |
+| **M1** `anna setup` in a trial home | Fixed: no unit written/enabled/started/disabled for an isolated home; wizard writes `socket_path` under the trial home and `target_unit: ""`. T: `test_trial_isolation.py` (subprocess patched to raise) |
+| **M2** suite-wide `is_isolated_home=False` | Fixed: autouse stub removed; the 3 restart-control tests and the wizard/unit tests opt in with the `home_is_the_real_home` fixture; the real passwd-based `real_default_home` is now asserted. T: `test_trial_isolation.py` |
+| **M3** `memory.enabled=false` gaps | Fixed (a) dashboard page shows "disabled", no facts; (b) distinct `disabled` flash; (c) flag re-read per request (flip needs no dashboard restart; unreadable YAML fails closed); (d) `anna doctor`/`/health` report `disabled` without opening the DB; (e) `memory-import` refuses (even dry run) unless `--force`, dry run never creates/migrates a DB; (f) queued extraction jobs older than `memory.extraction.max_job_age_hours` (72) are expired unread; (g) `core/MEMORY.md` is **not** covered and documented as such. Injection test now seeds a matching fact. T: `test_memory_kill_switch.py` |
+| **M4** stale pending / outbox after a rollback | Fixed with a documented conservative policy (docs/trial-readiness.md "Policy for work queued before the rollback"): on adopting an external stamp, never-started cron occurrences and still-`pending` outbox rows at or before it are superseded; same-build recovery is untouched. T: `test_review_reconcile.py`, acceptance |
+| **M5** rollback erases ledger-era fields | Cannot be fixed on main; documented, and `scripts/restore_schedule_fields.py` (dry-run default, add-only, `--overwrite-defaults`) restores them from the pre-rollback copy. T: acceptance |
+| **M6** docs | Rewritten: exact isolated commands and backups (YAML + `.backup` of the ledger), safe-rollback cautions, trial commands use `HOME` + `ANNA_HOME`, trial `anna.yaml` complete, `interruption_threshold` / `max_job_age_hours` in `anna.yaml.example`, `memory-import` and dashboard notes |
+| **M7** per-chunk delivered posts | Fixed: one transcript row per settled message with the full text. T: `test_review_reconcile.py::test_m7_*` |
+| **M8** interrupted send truncates silently | Fixed: `audit.schedule.delivery_interrupted` + admin notice for crash recovery, mid-send cancel and ambiguous failures; the part that landed is recorded with a "Partial delivery" marker; *mark delivered* / *resend* release the held-back parts, *abandon* keeps them cancelled. Nothing is ever resent automatically. T: `test_m8_*` |
+| **M9** orphaned `running` row blocks the schedule | Fixed: exceptions after `start_run` close the occurrence as `unknown` (no re-run) and the schedule moves on; a `running`/`claimed` row owned by this process with no live task is recovered at once. T: `test_m9_*` |
+| **L1** narrow guard | Extended to Google credentials/OAuth client, Obsidian paths and the config file; applied to `anna`, `anna ask`, `anna chat`, `anna-admin`, `google_auth`, `anna-web`. Not covered: paths a tool/skill chooses to open at runtime |
+| **L2** interruption cap | Threshold documented exactly (disable after `N + failure_threshold - 1`), validators `>= 1`, timeouts no longer feed the streak, the graceful-shutdown path goes through the cap, interruptions audited as `audit.schedule.interrupted` (not `.fail`). T: `test_l2_*` |
+| **L3** future cursor | A `last_fired_at` > 60 s ahead is ignored and audited, never copied to the cursor. T: `test_l3_*` |
+| **L4** weak tests | Acceptance rewritten (two builds, golden fixture, fake clock); stale-cursor tests use past stamps; the tautological isolation assertion and the empty-store injection assertion are fixed; kill-switch cases flip the flag from YAML |
+| **L5** destination | The record uses the outbox row's own transport/channel and survives a deleted schedule. T: `test_l5_*` |
+| **L6** durability | `delivery_key` on the row + ledger table `delivered_post_records`; back-fill of messages settled across a crash; no duplicate; "recorded" is audited only on a successful write; pre-v6 history is seeded, not back-filled; prune clears records (rowids are reused). T: `test_l6_*`, `test_pre_migration_*` |
+| **L7** telemetry | `audit.schedule.complete` keeps all keys (`recorded_conv_key` is `null` because delivery has not happened) and gains `delivery` and `destination_conv_key`; model/token/cost/duration unchanged. T: `test_l7_*` |
+| **L8** Slack file intake | **Deferred**, identical to main: scheme check, unbounded buffer without `Content-Length`, byte-length filename truncation. Not changed on this branch so the fix lands once, on main |
+
+Ledger schema is now v6 (additive: `schedule_stamps`, `delivered_post_records`); the earlier-version backup `runtime.sqlite3.bak-v5-<ts>` is taken on upgrade.
+Acceptance: `tests/test_upgrade_rollback_acceptance.py` (vendored mock of main in `tests/fixtures/main_59b946a/`, fake clock).
+
+Unresolved limitations: see "Known limitations" in `docs/trial-readiness.md` (supersede may drop one never-sent queued message,
+audited; runtime paths chosen by tools are outside the isolation guard; file memory is outside the memory kill switch; L8).
 
 ## Deferred milestones
 

@@ -5,13 +5,16 @@ and **no production files**. Nothing here touches `~/anna`, the production servi
 
 ```bash
 export FEATURE_WORKTREE=/home/funtime/orca/workspaces/anna/anna-reliability
-export TRIAL_HOME="$HOME/anna-google-trial"          # NOT ~/anna
+export TRIAL_ROOT="$(mktemp -d "$HOME/anna-google-trial.XXXX")"   # NOT ~/anna
+export TRIAL_HOME="$TRIAL_ROOT/anna"
+# Every command below, the daemon included, runs with BOTH HOME=$TRIAL_ROOT and ANNA_HOME=$TRIAL_HOME, so nothing under the
+# real ~/.claude, ~/.config or ~/anna is read or written. (`uv` needs its cache: set UV_CACHE_DIR if it complains.)
 ```
 
 ## 0. Offline / mock first (no network, no Google)
 
 ```bash
-ANNA_HOME="$(mktemp -d)" uv run --directory "$FEATURE_WORKTREE" --extra dev \
+ANNA_HOME="$(mktemp -d)" HOME="$(mktemp -d)" uv run --directory "$FEATURE_WORKTREE" --extra dev \
   pytest -q tests/test_google_connect.py tests/test_doctor.py tests/test_web_ops.py tests/test_heartbeat.py
 ```
 These drive Google's real `InstalledAppFlow` against a loopback socket with the token exchange and the identity lookup
@@ -20,13 +23,16 @@ mocked. Do not continue until they pass.
 ## 1. Create the trial home (no bot collision)
 
 ```bash
-mkdir -p "$TRIAL_HOME/state" && chmod 700 "$TRIAL_HOME" "$TRIAL_HOME/state"
+mkdir -p "$TRIAL_HOME/state" && chmod 700 "$TRIAL_ROOT" "$TRIAL_HOME" "$TRIAL_HOME/state"
 cat > "$TRIAL_HOME/anna.yaml" <<EOF
 transports:
   slack: {enabled: false}
   telegram: {enabled: false}
   cli: {enabled: true, socket_path: $TRIAL_HOME/anna.sock}
-web: {enabled: true, port: 8799}
+scheduler: {state_path: $TRIAL_HOME/schedules.yaml}
+vault: {path: $TRIAL_HOME/vault}
+web: {enabled: true, port: 8799, target_unit: ""}
+memory: {enabled: false}
 google: {enabled: true, accounts: []}
 heartbeat: {enabled: false}
 EOF
@@ -35,20 +41,20 @@ chmod 600 "$TRIAL_HOME/anna.yaml"
 Do **not** create a `.env` with Slack/Telegram/Anthropic keys in this home.
 Check the offline report first:
 ```bash
-ANNA_HOME="$TRIAL_HOME" uv run --directory "$FEATURE_WORKTREE" anna doctor
+HOME="$TRIAL_ROOT" ANNA_HOME="$TRIAL_HOME" uv run --directory "$FEATURE_WORKTREE" anna doctor
 ```
 Expect `unknown` for the daemon/SDK/Google rows (nothing is verified yet) and `disabled` for transports.
 
 ## 2. Start the trial dashboard (and, optionally, the trial daemon)
 
 ```bash
-ANNA_HOME="$TRIAL_HOME" uv run --directory "$FEATURE_WORKTREE" python -m anna_web      # http://127.0.0.1:8799/google
+HOME="$TRIAL_ROOT" ANNA_HOME="$TRIAL_HOME" uv run --directory "$FEATURE_WORKTREE" python -m anna_web      # http://127.0.0.1:8799/google
 # optional, second terminal; needed for Verify and cache invalidation. All chat transports are disabled, so no bot polling:
-ANNA_HOME="$TRIAL_HOME" uv run --directory "$FEATURE_WORKTREE" anna
+HOME="$TRIAL_ROOT" ANNA_HOME="$TRIAL_HOME" uv run --directory "$FEATURE_WORKTREE" anna
 ```
 Without the daemon, Connect still saves a token; Verify and "drop cached session" simply wait (the page says so).
-Use the isolation settings in `docs/trial-readiness.md` ("Isolation rules"): explicit `scheduler.state_path`, `vault.path`,
-`web.target_unit: ""`. The daemon refuses to start if those point into the real `~/anna`, and the dashboard Restart buttons are
+The trial `anna.yaml` above already carries the isolation settings from `docs/trial-readiness.md` ("Isolation rules"): explicit
+`scheduler.state_path`, `vault.path`, `web.target_unit: ""`, `memory.enabled: false`. The daemon refuses to start if those point into the real `~/anna`, and the dashboard Restart buttons are
 disabled in a trial home. Nothing restarts the daemon for you: adding an account or changing services edits `anna.yaml` and shows "restart required".
 
 ## 3. Live test prerequisites (only with the owner's explicit go-ahead; this guide never runs them)
@@ -58,8 +64,8 @@ disabled in a trial home. Nothing restarts the daemon for you: adding an account
   (External, *Testing*, your account added as a test user) and **one Desktop app OAuth client**. ANNA does **not** register
   this for you and does **not** make the app Google-verified: expect the "unverified app" warning, and note that in Testing
   mode refresh tokens expire after 7 days.
-* Download the client JSON into your home folder, then import it once:
-  `ANNA_HOME="$TRIAL_HOME" uv run --directory "$FEATURE_WORKTREE" python -m anna.setup.google_auth import-client ~/Downloads/client_secret_XXXX.json`
+* Download the client JSON somewhere readable, then import it once (use an absolute path: `~` now means the trial `HOME`):
+  `HOME="$TRIAL_ROOT" ANNA_HOME="$TRIAL_HOME" uv run --directory "$FEATURE_WORKTREE" python -m anna.setup.google_auth import-client /absolute/path/to/client_secret_XXXX.json`
   (or use the Import form on `/google`). Every mailbox shares this client.
 * Browser on the same machine as the dashboard. Over SSH, set `google.oauth_callback_port: 49321` in the trial `anna.yaml` and
   forward both ports: `ssh -L 8799:127.0.0.1:8799 -L 49321:127.0.0.1:49321 you@host`. With the default random callback port the
@@ -72,7 +78,7 @@ Verify. A different Google account than the configured email is refused and noth
 
 * Dashboard `/google`: **Revoke at Google** (asks Google to cancel the grant) or **Remove locally** (token file only; the grant
   at Google stays valid until revoked, see https://myaccount.google.com/permissions).
-* `rm -rf "$TRIAL_HOME"` deletes the shared client copy, tokens, ledger and config of the trial.
+* `rm -rf "$TRIAL_ROOT"` deletes the shared client copy, tokens, ledger and config of the trial.
 * In Google Cloud delete the OAuth client / project if you no longer want it.
 * Stop the trial processes (Ctrl-C). The feature branch itself is unchanged by any of this.
 

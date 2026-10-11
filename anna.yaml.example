@@ -342,6 +342,13 @@ scheduler:
   # AdminAlerter.warn(). The schedule stays in state_path with enabled:
   # false until the operator re-enables it.
   failure_threshold: 3
+  # Restart/crash INTERRUPTIONS never count toward failure_threshold, until
+  # the same schedule is interrupted this many times IN A ROW (no completed run
+  # or timeout between). The Nth and every later consecutive interruption then
+  # counts as one failure, so a poison job that keeps killing the daemon is
+  # still disabled: after interruption_threshold + failure_threshold - 1
+  # consecutive interruptions (5 + 3 - 1 = 7 by default). Must be >= 1.
+  interruption_threshold: 5
 
 # ============================================================
 # google: read-only (phase 1) Gmail + Calendar across multiple accounts.
@@ -585,6 +592,9 @@ subagents:
 # host is bound to 127.0.0.1 by design — remote access is the
 # operator's reverse-proxy problem (Caddy, Tailscale, SSH tunnel).
 # Port 8765 sits clear of the common 3000/5000/8000/8080 dev range.
+# Names are normalised as systemd reads them (`anna` == `anna.service`). An
+# isolated ANNA_HOME may never restart anna.service OR anna-web.service,
+# whatever the spelling.
 # target_unit is the systemd user unit the in-dashboard Restart
 # button acts on; pinned here at config time, never accepted from
 # a request body, so there is no path for a crafted POST to
@@ -751,7 +761,13 @@ memory:
   # Master kill switch. DEFAULT true only for compatibility with existing
   # deployments (memory has always been on). false = no memory DB is created or
   # opened, no anna_memory tools are offered, no facts are injected into turns,
-  # and no extraction is enqueued or run (extraction.enabled is ignored).
+  # and no extraction is enqueued or run (extraction.enabled is ignored). The
+  # dashboard re-reads this flag on every request (disabling needs no restart),
+  # `anna doctor` reports "disabled" without opening the DB, and
+  # `anna-admin memory-import` refuses (even for a dry run) unless --force.
+  # NOT covered: core/MEMORY.md (file memory) and memory_md_append are a
+  # separate mechanism; extraction jobs already queued stay in the DB (see
+  # extraction.max_job_age_hours) and an existing memory.sqlite3 is left as is.
   enabled: true
   extraction:
     # OPT-IN. Each qualifying interactive user message may cost one small,
@@ -768,6 +784,10 @@ memory:
     concurrency: 1
     max_attempts: 3
     min_confidence: 0.8
+    # Queued jobs older than this are discarded (their stored text wiped)
+    # instead of extracted, so text captured before memory/extraction was
+    # switched off is not processed long after re-enabling.
+    max_job_age_hours: 72
 
 # ============================================================
 # Built-in read-only Gmail + Calendar heartbeat (opt-in, no LLM)
