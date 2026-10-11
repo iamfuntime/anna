@@ -43,6 +43,9 @@ class _FakeVoice:
         assert isinstance(self._transcript, str)
         return self._transcript
 
+    def voice_inbound_active(self, conv_key: str) -> bool:
+        return conv_key in self.mark_calls and conv_key not in self.clear_calls
+
     def mark_voice_inbound(self, *, conv_key: str) -> None:
         self.mark_calls.append(conv_key)
 
@@ -170,6 +173,7 @@ async def test_plain_text_passes_through_unchanged(tmp_path: Path) -> None:
     assert inbound.text == "just typing"
     assert voice.transcribe_calls == []
     assert voice.mark_calls == []
+    assert inbound.voice_reply_expected is False
     # A text inbound clears any prior voice mark for this conv_key.
     assert voice.clear_calls == [inbound.conversation_key]
 
@@ -196,6 +200,7 @@ async def test_transcribe_failure_yields_polite_error(tmp_path: Path) -> None:
     assert "couldn't transcribe" in inbound.text
     assert inbound.text.startswith("[voice transcript]:")
     assert voice.mark_calls == []
+    assert inbound.voice_reply_expected is False
 
 
 async def test_mark_voice_inbound_called_on_success(tmp_path: Path) -> None:
@@ -206,5 +211,6 @@ async def test_mark_voice_inbound_called_on_success(tmp_path: Path) -> None:
     inbound = await adapter._to_inbound_event(update)
 
     assert voice.mark_calls == [inbound.conversation_key]
+    assert inbound.voice_reply_expected is True
     assert inbound.raw.get("voice_mime_type") == "audio/ogg"
     assert "voice_audio_path" in inbound.raw

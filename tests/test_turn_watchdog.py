@@ -16,6 +16,7 @@ breach is prepended to ANNA's next turn.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -568,9 +569,6 @@ async def test_watchdog_loop_soft_breach_flushes_and_stashes_reminder(
     the operator and stashes the soft forcing reminder for the next turn."""
     sent: list[OutboundMessage] = []
     worker = _make_worker(tmp_path, sent)
-    # The test exercises a text-delivery watchdog flush, not voice-only
-    # delivery (which intentionally remains consolidated).
-    worker._config.voice.outbound.enabled = False
     worker._flush_interval = 30
 
     clock = FakeClock()
@@ -611,7 +609,6 @@ async def test_watchdog_loop_hard_breach_records_and_alerts_once(
     alerter = _RecordingAlerter()
     sent: list[OutboundMessage] = []
     worker = _make_worker(tmp_path, sent, alerter=alerter)
-    worker._config.voice.outbound.enabled = False
     worker._flush_interval = 30
 
     clock = FakeClock()
@@ -699,10 +696,11 @@ async def test_flush_buffer_now_sends_and_restamps(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def _soft_breach(tmp_path: Path, monkeypatch, *, text="Still working on it...", configure=None):
+async def _soft_breach(
+    tmp_path: Path, monkeypatch, *, text="Still working on it...", configure=None, event=None
+):
     sent: list[OutboundMessage] = []
     worker = _make_worker(tmp_path, sent)
-    worker._config.voice.outbound.enabled = False
     if configure is not None:
         configure(worker)
     clock = FakeClock()
@@ -711,7 +709,7 @@ async def _soft_breach(tmp_path: Path, monkeypatch, *, text="Still working on it
     buffer = _FlushBuffer(last_flush=0.0)
     buffer.pending.append(text)
     monkeypatch.setattr("anna.runtime.worker.asyncio.sleep", _SleepDriver(clock, step=60.0, max_ticks=1))
-    await _run_watchdog_loop(worker, _make_event(), buffer, wd)
+    await _run_watchdog_loop(worker, event or _make_event(), buffer, wd)
     return worker, sent, buffer
 
 
@@ -731,17 +729,55 @@ async def test_slow_turn_flush_fires_under_existing_delivery_configs(tmp_path, m
     assert worker._pending_watchdog_reminder is not None
 
 
-@pytest.mark.asyncio
-async def test_slow_turn_flush_never_drips_a_voice_note(tmp_path, monkeypatch) -> None:
-    def configure(w: ConversationWorker) -> None:
-        w._config.voice.outbound.enabled = True
-        w._config.voice.outbound.voice_only = True
-        w._config.voice.outbound.transports = ["slack", "telegram"]
+def _voice_in_event() -> InboundEvent:
+    return dataclasses.replace(_make_event(), voice_reply_expected=True)
 
-    worker, sent, buffer = await _soft_breach(tmp_path, monkeypatch, configure=configure)
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["slack", "telegram"])
+async def test_default_voice_config_text_in_turn_flushes(tmp_path, monkeypatch, transport) -> None:
+    """Default AnnaConfig (voice outbound enabled, voice_only, both transports):
+    a TEXT-in turn still produces text-out, so the slow-turn flush must fire."""
+    event = dataclasses.replace(_make_event(), transport=transport)
+    worker, sent, buffer = await _soft_breach(tmp_path, monkeypatch, event=event)
+    voice = worker._config.voice.outbound
+    assert voice.enabled and voice.voice_only and transport in voice.transports
+    assert [m.text for m in sent] == ["Still working on it..."]
+    assert buffer.pending == []
+
+
+@pytest.mark.asyncio
+async def test_voice_in_turn_never_drips_a_voice_note(tmp_path, monkeypatch) -> None:
+    """A voice-in turn on a voice-only transport stays consolidated."""
+    worker, sent, buffer = await _soft_breach(tmp_path, monkeypatch, event=_voice_in_event())
     assert sent == []
     assert buffer.pending == ["Still working on it..."]  # stays for the single end-of-turn note
     assert worker._pending_watchdog_reminder is not None  # telemetry / reminder unaffected
+
+
+@pytest.mark.asyncio
+async def test_voice_in_turn_flushes_when_voice_only_is_off(tmp_path, monkeypatch) -> None:
+    def configure(w: ConversationWorker) -> None:
+        w._config.voice.outbound.voice_only = False
+
+    worker, sent, buffer = await _soft_breach(
+        tmp_path, monkeypatch, event=_voice_in_event(), configure=configure
+    )
+    assert [m.text for m in sent] == ["Still working on it..."]
+
+
+@pytest.mark.asyncio
+async def test_notification_only_guard_still_suppresses_text_in_flush(tmp_path, monkeypatch) -> None:
+    from anna.runtime.worker import _NotificationOnlyTurn
+
+    def configure(w: ConversationWorker) -> None:
+        w._notification_turn = _NotificationOnlyTurn(turn_id="t1", sources=["subagent:x"])
+
+    worker, sent, buffer = await _soft_breach(tmp_path, monkeypatch, configure=configure)
+    assert sent == []  # the guard short-circuits first
+    assert buffer.pending == []
+    assert worker._notification_turn.suppressed_sends == 1
+    assert worker._pending_watchdog_reminder is not None
 
 
 @pytest.mark.asyncio

@@ -462,6 +462,9 @@ class TelegramAdapter(ChannelAdapter):
             is_thread=False,
             raw=raw,
             human_origin=True,
+            voice_reply_expected=(
+                self._voice is not None and self._voice.voice_inbound_active(conv_key)
+            ),
         )
 
     # ------------------------------------------------------------------

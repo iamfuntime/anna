@@ -53,6 +53,9 @@ class _FakeVoice:
         assert isinstance(self._transcript, str)
         return self._transcript
 
+    def voice_inbound_active(self, conv_key: str) -> bool:
+        return conv_key in self.mark_calls and conv_key not in self.clear_calls
+
     def mark_voice_inbound(self, *, conv_key: str) -> None:
         self.mark_calls.append(conv_key)
 
@@ -207,6 +210,7 @@ async def test_transcribe_failure_yields_polite_error(
     assert inbound.text.startswith("[voice transcript]:")
     # Failed transcribe must not mark voice-inbound for the outbound path.
     assert voice.mark_calls == []
+    assert inbound.voice_reply_expected is False
 
 
 async def test_mark_voice_inbound_called_on_success(
@@ -219,6 +223,7 @@ async def test_mark_voice_inbound_called_on_success(
     inbound = await adapter._to_inbound_event(_voice_event())
 
     assert voice.mark_calls == [inbound.conversation_key]
+    assert inbound.voice_reply_expected is True
     # The audio path + mime are stashed on raw for the outbound TTS path.
     assert inbound.raw.get("voice_mime_type") == "audio/webm"
     assert "voice_audio_path" in inbound.raw

@@ -2760,19 +2760,23 @@ class ConversationWorker:
         }
 
     def _voice_only_for_transport(self, event: InboundEvent) -> bool:
-        """True when this transport would send replies as voice-only.
+        """True when THIS turn's reply would be sent as voice-only.
 
-        Decision F: when voice-only outbound is configured for this
-        transport, the turn stays consolidated to a single voice note at
-        turn end (same as the scheduler path), so the timed drip is not
-        started. We gate on the static config — ``voice.outbound.enabled``,
-        ``voice_only``, and this transport being in the outbound allowlist —
-        which is the condition under which an intermediate drip could be
-        fragmented into its own voice note.
+        Decision F: a voice-in turn on a voice-only transport stays
+        consolidated to a single voice note at turn end (same as the
+        scheduler path), so neither the timed drip nor the slow-turn flush
+        runs: an intermediate send would become its own voice note.  The
+        static config (``voice.outbound.enabled``, ``voice_only``, transport
+        in the allowlist) only says voice-out is *possible*; the adapters
+        synthesize only when the most recent inbound was voice ("text-in
+        still produces text-out"), which they report per turn in
+        ``event.voice_reply_expected``.  Text-in turns therefore flush and
+        drip normally under the default voice config.
         """
         voice_out = self._config.voice.outbound
         return (
-            voice_out.enabled
+            event.voice_reply_expected
+            and voice_out.enabled
             and voice_out.voice_only
             and (event.reply_transport or event.transport) in voice_out.transports
         )

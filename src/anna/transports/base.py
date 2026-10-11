@@ -217,6 +217,12 @@ class InboundEvent:
     model: str | None = field(
         default=None, compare=False, hash=False, repr=False
     )
+    # Set by transport adapters when this turn's reply may go out as a voice
+    # note: the inbound was a successfully transcribed voice message, so the
+    # adapter's outbound path will synthesize. Text-in turns leave it False
+    # (text-in still produces text-out), which lets the worker flush slow-turn
+    # narration as text without it becoming a voice drip.
+    voice_reply_expected: bool = field(default=False, compare=False, hash=False, repr=False)
 
 
 @dataclass(frozen=True)
