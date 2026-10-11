@@ -17,7 +17,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from anna.config import validate_model_string
 
@@ -87,6 +87,12 @@ class Schedule(BaseModel):
     (the default, and the value for every legacy entry) keeps today's
     behavior exactly: the fire runs on ``runtime.model``.
     """
+
+    # Unknown keys are kept and written back: a newer or older ANNA (or an
+    # operator hand edit) may carry fields this version does not model, and a
+    # rollback/upgrade round trip through the store must not silently erase
+    # them. Known fields are still validated.
+    model_config = ConfigDict(extra="allow")
 
     id: str
     natural_language: str | None = None
