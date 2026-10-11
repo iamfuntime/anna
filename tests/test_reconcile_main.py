@@ -218,10 +218,10 @@ async def _interrupt_once(sched, store, minutes_ago: int) -> None:
 async def test_repeated_restart_interruptions_never_auto_disable(tmp_path):
     cfg, store, router, adapter, sched = await build(tmp_path)
     cfg.scheduler.failure_threshold = 3
-    for i in range(5):
+    for i in range(4):  # one below interruption_threshold (5)
         await _interrupt_once(sched, store, i + 10)
     got = store.get("s1")
-    assert len([o for o in sched._ledger.recent("s1", 100) if o.exec_status == "unknown"]) == 5
+    assert len([o for o in sched._ledger.recent("s1", 100) if o.exec_status == "unknown"]) == 4
     assert got.enabled and got.state.consecutive_failures == 0
 
 
@@ -237,3 +237,16 @@ async def test_real_failures_still_auto_disable_and_interruptions_do_not_reset_t
     await sched._handle_failure(got, reason="boom2", kind="fail")
     await sched._handle_failure(got, reason="boom3", kind="fail")
     assert not store.get("s1").enabled  # genuine failures still trip the breaker
+
+
+async def test_poison_job_interrupting_every_run_still_trips_the_breaker(tmp_path):
+    cfg, store, router, adapter, sched = await build(tmp_path)
+    cfg.scheduler.interruption_threshold = 3
+    cfg.scheduler.failure_threshold = 2
+    for i in range(10):
+        if not store.get("s1").enabled:
+            break
+        await _interrupt_once(sched, store, i + 10)
+    got = store.get("s1")
+    assert not got.enabled  # interruptions 3,4 counted as failures -> disabled at failure_threshold
+    assert got.state.consecutive_failures == 2

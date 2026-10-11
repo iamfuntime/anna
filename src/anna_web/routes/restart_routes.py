@@ -47,6 +47,7 @@ def _idle_context(request: Request) -> dict:
     return {
         "state": "idle",
         "unit": manager.target_unit,
+        "disabled": getattr(manager, "disabled", False) is True,
         "method": None,
         "job_id": None,
         "error": None,
@@ -80,6 +81,7 @@ def _error_context(request: Request, result: RestartResult) -> dict:
     return {
         "state": "idle",
         "unit": manager.target_unit,
+        "disabled": getattr(manager, "disabled", False) is True,
         "method": result.method,
         "job_id": None,
         "error": result.error,
@@ -137,6 +139,14 @@ async def post_restart(request: Request) -> Response:
     templates = request.app.state.templates
 
     result = await manager.restart()
+
+    if getattr(manager, "disabled", False) is True:
+        return templates.TemplateResponse(
+            request,
+            "restart_button.html",
+            _error_context(request, result),
+            status_code=403,
+        )
 
     if result.ok:
         web_audit.emit(

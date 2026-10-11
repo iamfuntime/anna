@@ -1339,6 +1339,16 @@ class Scheduler:
         """
         return f"{transport}:dm:{channel}"
 
+    def _interrupted_streak(self, schedule_id: str) -> int:
+        """Newest-first count of runs that ended interrupted, up to the first real outcome."""
+        streak = 0
+        for occ in self._ledger.recent(schedule_id, 50):
+            if occ.exec_status in ("unknown", "blocked"):
+                streak += 1
+            elif occ.exec_status in ("succeeded", "failed", "timeout", "partial", "auth_required"):
+                break
+        return streak
+
     async def _handle_failure(
         self,
         schedule: Schedule,
@@ -1347,6 +1357,9 @@ class Scheduler:
         kind: str,
     ) -> None:
         when = datetime.now(UTC)
+        if kind == "interrupted" and self._interrupted_streak(schedule.id) >= self._config.scheduler.interruption_threshold:
+            reason = f"{reason} (interrupted {self._config.scheduler.interruption_threshold}+ runs in a row)"
+            kind = "fail"
         new_count = await self._store.mark_failed(
             schedule.id, reason=reason, when=when, kind=kind
         )

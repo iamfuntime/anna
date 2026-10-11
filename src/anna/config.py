@@ -118,6 +118,39 @@ def _resolve_anna_home() -> Path:
     return Path(os.path.expanduser(os.environ.get("ANNA_HOME", "~/anna")))
 
 
+def _home_path(name: str) -> str:
+    """Default path ``<ANNA_HOME>/<name>`` as a string (evaluated per instance)."""
+    return str(_resolve_anna_home() / name)
+
+
+def real_default_home() -> Path:
+    """The account's real ``~/anna``, resolved from the passwd entry.
+
+    Deliberately NOT ``expanduser("~/anna")``: a trial run overrides ``$HOME``,
+    and the point of this helper is to recognise the production home no matter
+    what the environment says.
+    """
+    try:
+        import pwd
+
+        base = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    except (ImportError, KeyError):  # non-POSIX / no passwd entry
+        base = Path(os.path.expanduser("~"))
+    return base / "anna"
+
+
+def _same_path(a: Path, b: Path) -> bool:
+    return os.path.realpath(a) == os.path.realpath(b)
+
+
+def is_isolated_home(anna_home: Path) -> bool:
+    """True when ``anna_home`` is not the account's real ``~/anna`` (a trial/test home)."""
+    return not _same_path(anna_home, real_default_home())
+
+
+DEFAULT_RESTART_UNIT = "anna.service"
+
+
 # ---------------------------------------------------------------------------
 # Sub-models
 # ---------------------------------------------------------------------------
@@ -476,7 +509,7 @@ class CLITransportConfig(BaseModel):
     # Owner-only Unix-domain socket the daemon binds and `anna chat` /
     # `anna ask` connect to. Resolved against the operator's home via
     # os.path.expanduser when consumed.
-    socket_path: str = "~/anna/anna.sock"
+    socket_path: str = Field(default_factory=lambda: _home_path("anna.sock"))
     # Per-CLI idle close, distinct from sessions.dm_gap_hours (8h) and
     # sessions.thread_gap_hours (1h). 30m lands between the two existing
     # gaps — long enough that stepping away for coffee doesn't tear the
@@ -506,7 +539,8 @@ class TransportsConfig(BaseModel):
 
 
 class VaultConfig(BaseModel):
-    path: str = "~/anna/vault"
+    # Defaults follow $ANNA_HOME so a temp-home trial never touches ~/anna/vault.
+    path: str = Field(default_factory=lambda: _home_path("vault"))
 
     @property
     def resolved_path(self) -> Path:
@@ -1257,11 +1291,17 @@ class SchedulerConfig(BaseModel):
     """
 
     enabled: bool = True
-    state_path: str = "~/anna/schedules.yaml"
+    # Defaults follow $ANNA_HOME so a temp-home trial never opens ~/anna/schedules.yaml.
+    state_path: str = Field(default_factory=lambda: _home_path("schedules.yaml"))
     default_timeout_seconds: int = 300
     max_concurrent: int = 3
     poll_interval_seconds: int = 30
     failure_threshold: int = 3
+    # Restart/crash interruptions are infrastructure, not job failures, and do
+    # NOT count toward ``failure_threshold``. A job that interrupts this many
+    # runs IN A ROW with no completed run between (a poison job crashing the
+    # daemon) is however counted as a failure so the breaker still trips.
+    interruption_threshold: int = 5
 
     # Durable runtime ledger (state/runtime.sqlite3): occurrences, runs, outbox.
     # Defaults preserve legacy behavior: one catch-up run after downtime,
@@ -1317,7 +1357,11 @@ class WebDashboardConfig(BaseModel):
     * ``target_unit`` — the systemd user unit the Restart button
       acts on. Pinned at config time, never accepted from a request
       body, so there is no path for a crafted POST to restart an
-      arbitrary unit.
+      arbitrary unit. The default ``anna.service`` is the LIVE service:
+      when ``$ANNA_HOME`` is not the real ``~/anna`` (a trial home) the
+      Restart button is disabled unless ``target_unit`` names a different,
+      explicitly configured unit (see :func:`effective_restart_unit`).
+      An empty string disables the button outright.
 
     See Inbox/2026-06-02-ANNA-Web-Dashboard-Plan.md for the full
     design.
@@ -1338,7 +1382,7 @@ class WebDashboardConfig(BaseModel):
         json_schema_extra={"warn_if_non_loopback": True},
     )
     port: int = 8765
-    target_unit: str = "anna.service"
+    target_unit: str = DEFAULT_RESTART_UNIT
 
     @field_validator("port")
     @classmethod
@@ -1904,6 +1948,44 @@ def _apply_env_overrides(data: dict[str, Any]) -> dict[str, Any]:
             visibility.setdefault("consolidate_scheduled_turns", bool_val)
 
     return data
+
+
+def effective_restart_unit(config: "AnnaConfig") -> str | None:
+    """The unit the dashboard may restart, or ``None`` when restart is disabled.
+
+    * ``web.target_unit: ""`` -> disabled.
+    * the default live ``anna.service`` is only allowed from the real
+      ``~/anna``; an isolated ``ANNA_HOME`` must name its own unit.
+    """
+    unit = (config.web.target_unit or "").strip()
+    if not unit:
+        return None
+    if unit == DEFAULT_RESTART_UNIT and is_isolated_home(config.anna_home):
+        return None
+    return unit
+
+
+def foreign_home_paths(config: "AnnaConfig") -> list[tuple[str, Path]]:
+    """State paths of an isolated home that point into the real ``~/anna``.
+
+    A trial with ``ANNA_HOME`` elsewhere must not open the production
+    schedules file, vault or socket (e.g. through an absolute or ``~/anna``
+    value copied into its ``anna.yaml``).
+    """
+    if not is_isolated_home(config.anna_home):
+        return []
+    real = Path(os.path.realpath(real_default_home()))
+    candidates = [
+        ("scheduler.state_path", config.scheduler.resolved_state_path),
+        ("vault.path", config.vault.resolved_path),
+        ("transports.cli.socket_path", config.transports.cli.resolved_socket_path),
+    ]
+    bad = []
+    for label, path in candidates:
+        resolved = Path(os.path.realpath(path))
+        if resolved == real or real in resolved.parents:
+            bad.append((label, path))
+    return bad
 
 
 def load_config(path: Path | None = None) -> AnnaConfig:

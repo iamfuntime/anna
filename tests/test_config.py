@@ -8,6 +8,7 @@ import pytest
 import yaml
 
 from anna.config import (
+    _resolve_anna_home,
     AnnaConfig,
     CheckpointConfig,
     IdentityAliasEntry,
@@ -48,7 +49,7 @@ def test_scheduler_defaults_when_block_omitted() -> None:
     raw = {"auth": {"mode": "max"}}
     cfg = AnnaConfig.model_validate(raw)
     assert cfg.scheduler.enabled is True
-    assert cfg.scheduler.state_path == "~/anna/schedules.yaml"
+    assert cfg.scheduler.state_path == str(_resolve_anna_home() / "schedules.yaml")
     assert cfg.scheduler.default_timeout_seconds == 300
     assert cfg.scheduler.max_concurrent == 3
     assert cfg.scheduler.poll_interval_seconds == 30
@@ -309,7 +310,7 @@ def test_cli_transport_defaults_when_block_omitted() -> None:
     raw = {"auth": {"mode": "max"}}
     cfg = AnnaConfig.model_validate(raw)
     assert cfg.transports.cli.enabled is True
-    assert cfg.transports.cli.socket_path == "~/anna/anna.sock"
+    assert cfg.transports.cli.socket_path == str(_resolve_anna_home() / "anna.sock")
     assert cfg.transports.cli.idle_gap_minutes == 30
     assert cfg.transports.cli.framing == "ndjson"
 
