@@ -609,6 +609,22 @@ class Scheduler:
         self._ledger.note_stamp(schedule_id, when)
         await self._store.mark_dispatched(schedule_id, when=when)
 
+    async def _stamp_run_start(self, schedule: Schedule, when: datetime) -> None:
+        """Write the dispatch-time ``last_fired_at`` BEFORE any side effect, as ``main`` does.
+
+        An older build knows nothing of the ledger: after a HARD kill (SIGKILL/OOM/power loss) of a run
+        in flight, the only thing a rolled-back ``main`` sees is ``last_fired_at``.  With completion-only
+        stamps that is still the previous run's, so main finds the interrupted tick due and runs it a
+        second time (duplicate side effects).  The stamp is recorded in the ledger first (like every stamp
+        of this build) so it is never mistaken for an older build's and never moves the cursor; the
+        completion / failure stamp overwrites it as before.  A failure to write it only costs that
+        rollback protection, never the run.
+        """
+        try:
+            await self._mark_dispatched(schedule.id, when=when)
+        except Exception as exc:  # noqa: BLE001
+            self._log.warning("scheduler.run_start_stamp_failed", schedule_id=schedule.id, error=str(exc)[:200])
+
     async def _mark_failed(self, schedule_id: str, *, reason: str, when: datetime, kind: str) -> int:
         self._adopt_external(schedule_id)
         self._ledger.note_stamp(schedule_id, when)
@@ -867,6 +883,7 @@ class Scheduler:
                 await self._skip_for_gate(schedule, occurrence_id, gate)
                 return
             started_at = datetime.now(UTC)
+            await self._stamp_run_start(schedule, started_at)
             try:
                 run_id = self._ledger.start_run(occurrence_id, owner=self._owner)
             except PermissionError:

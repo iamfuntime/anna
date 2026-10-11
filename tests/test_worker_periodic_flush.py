@@ -431,12 +431,10 @@ async def test_voice_only_never_drips(tmp_path: Path, clock: _FakeClock) -> None
     assert [m.text for m in sent] == ["spoken\nreply"]
 
 
-@pytest.mark.asyncio
-async def test_disabled_interval_never_drips(tmp_path: Path, clock: _FakeClock) -> None:
-    """``periodic_flush_seconds == 0`` reproduces today's behavior: no timer,
-    so a long gap still consolidates to one message at turn end."""
+async def _run_disabled_interval_turn(tmp_path: Path, clock: _FakeClock, *, watchdog: bool) -> list[OutboundMessage]:
     sent: list[OutboundMessage] = []
     worker = _make_worker(tmp_path, sent, flush_seconds=0)
+    worker._turn_watchdog_cfg.enabled = watchdog
 
     gates = {"hold": asyncio.Event()}
     worker._client = _GappedClient(
@@ -455,8 +453,24 @@ async def test_disabled_interval_never_drips(tmp_path: Path, clock: _FakeClock) 
         gates["hold"].set()
 
     await asyncio.gather(worker._handle(_make_event()), _driver())
+    return sent
 
+
+@pytest.mark.asyncio
+async def test_disabled_interval_never_drips(tmp_path: Path, clock: _FakeClock) -> None:
+    """``periodic_flush_seconds == 0`` has no drip timer: with the slow-turn
+    watchdog off a long gap still consolidates to one message at turn end."""
+    sent = await _run_disabled_interval_turn(tmp_path, clock, watchdog=False)
     assert [m.text for m in sent] == ["one\ntwo"]
+
+
+@pytest.mark.asyncio
+async def test_disabled_interval_slow_turn_watchdog_still_flushes_once(tmp_path: Path, clock: _FakeClock) -> None:
+    """Existing-config semantics (as on ``main``): the slow-turn watchdog flushes the
+    pending narration even with the drip disabled; the final send carries only what
+    came after, so nothing is delivered twice."""
+    sent = await _run_disabled_interval_turn(tmp_path, clock, watchdog=True)
+    assert [m.text for m in sent] == ["one", "two"]
 
 
 # ---------------------------------------------------------------------------

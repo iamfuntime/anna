@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 from pathlib import Path
 
 from anna.vault.transcript_resume import (
@@ -390,7 +390,7 @@ _MAIN_FRONTMATTER = (
     "transport: slack\nconversation_key: slack:dm:USP2QLB41\ncheckpoint_kind: {kind}\n---\n\n"
     "# Checkpoint\n\nsummary\n"
 )
-_STAMP = datetime(2026, 9, 1, 12, 0, 0, tzinfo=timezone.utc).timestamp()
+_STAMP = datetime(2026, 9, 1, 12, 0, 0, tzinfo=UTC).timestamp()
 
 
 def _plant(vault: Path, name: str, text: str | None = None, kind: str = "closeout") -> Path:

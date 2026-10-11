@@ -4,6 +4,33 @@ Verdict: **ready for an isolated, offline trial.** Not verified against any live
 service; that is the point of the trial. Nothing here touches `~/anna`, an installed `uv tool`, systemd, a live bot, real
 credentials, a paid fallback, or `main`.
 
+## Live rereview of `97d0c90`: blockers and regressions, dispositions (this section supersedes the verdict below where they differ)
+
+The operator's live ANNA rereview of `97d0c90` found three blockers and four smaller regressions (the written report was not
+available to this repair; the pasted summary was used). Each was reproduced with synthetic data only (mock Telegram SDK modelled on
+python-telegram-bot's real `Updater` semantics, synthetic main-format checkpoints/transcripts, a temp `ANNA_HOME`, the vendored
+main-build mock; no network, bot, provider, systemd, production home or vault). Evidence: the named tests; the full suite is
+recorded in the final report of the repair. **Nothing here is a claim about the live service**, which was not touched.
+
+| finding | root cause (reproduced) | disposition |
+| --- | --- | --- |
+| **B1** Telegram health "down" while healthy -> watchdog restarts + alerts every ~15 min | PTB's `Updater.start_polling()` is a *setup* coroutine that **returns** once polling is up; `health_check` treated the finished `_updater_task` as a dead receiver. The old test fake parked forever and hid it | **fixed.** Readiness is `Updater.running` (a crashed setup task still counts as down); startup waits briefly and still raises on a setup failure. `tests/test_telegram_health.py` (PTB-faithful fake; 8 watchdog cycles, no restart, no alert; a genuinely stopped updater still restarts after 3) |
+| **B2** new sessions replay up to 8 already-checkpointed legacy exchanges as "unsaved tail" until transcripts age out (30 d) | a checkpoint with no `coverage_*` keys (everything `main` wrote) was treated as covering nothing | **fixed, conservatively.** The *newest* checkpoint, only if it carries no `coverage_*` key, covers events with a parseable `ts` at or before its **filename stamp** (`YYYY-MM-DD-HHMMSS`, optional `-<uuid>`, or older `HHMM`), capped by file mtime, ignored if the stamp is in the future or the name/file is unreadable. Events newer than the stamp, events without a `ts`, a malformed new-style checkpoint, a missing checkpoint: all still replayed. New-build checkpoints keep exact sequence coverage and never use time. One snapshot per resume feeds both the tail and the closeout coverage gap. Tests: `test_transcript_resume.py` (formats, mtime cap, future stamp, malformed), `test_worker_resume_context.py` |
+| **B3** second sqlite memory store + `anna_memory` tools enabled without a config change, redirecting "remember" requests | `memory.enabled` defaulted to `true` | **fixed.** Durable memory is **opt-in: default `false`**. An absent `memory:` key now means no DB, no tools, no injection, no extraction, `core/MEMORY.md` untouched; `memory.enabled: true` turns it on. `anna.yaml.example` and these docs updated. **Behaviour change for anyone who relied on the old default:** set `memory.enabled: true` explicitly. Tests: `test_memory_kill_switch.py` (absent-config worker, explicit true) |
+| **R1** scheduled Slack posts over 3500 chars split although ~10 of 96 live monthly posts arrive whole on `main` | a universal `scheduler.delivery_chunk_chars = 3500` | **fixed.** Default is now transport-specific: split only at the destination's own limit (Slack 3900, Telegram 4096 - where the adapters split on `main`). An int in `scheduler.delivery_chunk_chars` is still an explicit cap for all transports. Full-text DM context and idempotence unchanged (`test_review_reconcile.py`, `test_scheduler_ledger.py`). The Slack adapter can still split a part again after mrkdwn conversion, as on `main` |
+| **R2** "Still working on it" slow-turn flush no longer fires under existing config | this branch gated the watchdog flush on `_periodic_flush_active` (so `consolidate_interactive_turns: true` or `periodic_flush_seconds: 0` silenced it); `main` flushes unconditionally | **fixed.** The watchdog flush fires under those configs as on `main`; the only exception is **voice-only outbound** (a flush would become its own voice note), where the turn stays consolidated. The flush still goes through `_guarded_send` (markup/sanitize/notification guards) and clears the buffer, so the final send cannot repeat it. Telemetry/reminder/alert unchanged. Tests: `test_turn_watchdog.py` (consolidate, interval 0, default, voice-only, markup guard), `test_worker_periodic_flush.py` |
+| **R3** hard-kill rollback re-fires in-flight jobs; clean stop is fine | this build stamped `last_fired_at` only at *completion*; a SIGKILL mid-run leaves the previous run's stamp, which is all a rolled-back `main` can see, so it finds the interrupted tick due and runs it again | **mitigated, with limits (below).** The scheduler now also writes the dispatch-time stamp *before* `start_run`, as `main` does (ledger-recorded first, so it is an own stamp and never moves the cursor). Proven both ways with the two-build mock: without the stamp main re-fires the tick, with it main waits for the next cron tick, clean stop was already fine (`tests/test_hard_kill_rollback.py`) |
+
+**R3 limits - read before any rollback.** The old build cannot be made to honour the ledger retroactively; the mitigation only
+makes the one signal it does read (`last_fired_at`) correct earlier. Still true: (a) a hard kill in the instants between the claim
+and the stamp (gate command included; no side effect has run yet) can still be re-fired by main; (b) a rolled-back main will
+*skip* an interrupted tick it never saw complete, exactly as it would after its own crash - the run's outcome is `unknown` in the
+ledger and shows on `/repairs` after re-upgrade; (c) unsent outbox parts are not delivered by main (they are cancelled as
+superseded on re-upgrade); (d) **there is no supported hot rollback**: the runbook below (stop the daemon cleanly, back up both
+stores, run main, restore fields, re-upgrade) remains the only procedure, and a hard kill during or right before a rollback needs
+the operator to read `/repairs` for `unknown` runs. This is a documented limitation, not a claim that rollback is safe under
+arbitrary crashes.
+
 ## Independent final verdict (HEAD `11b688a`)
 
 An independent read-only review of the repairs `fb4865a..11b688a` (`/tmp/anna-reconciliation-review-11b688a.md`, run from

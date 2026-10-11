@@ -754,8 +754,11 @@ additive and preserve pending records across downgrade/restart.
 
 ## Unresolved blockers
 
-- Exact checkpoint coverage is deliberately conservative for now: legacy and
-  bounded checkpoints do not suppress transcript replay.
+- Exact checkpoint coverage is conservative: new-build checkpoints use explicit
+  sequence coverage only. A *legacy* (main-build, no `coverage_*` keys) newest
+  checkpoint covers events at or before its filename stamp (capped by mtime;
+  future stamps, unreadable/odd names and malformed new-style checkpoints cover
+  nothing). Periodic checkpoints still replay rather than hide text.
 - Receiver readiness/liveness and Google `.execute()` thread isolation are
   implemented for the current read-only Google tools. Google shutdown cannot
   make a hung third-party socket exactly-once or forcibly stop its thread; it
@@ -763,3 +766,12 @@ additive and preserve pending records across downgrade/restart.
 - Memory persistence/retrieval and explicit fact tools are implemented, but
   extraction jobs, source import, durable tasks/runs/outbox, heartbeat, and
   repair UX remain.
+
+## Rereview of 97d0c90 (live ANNA) - repairs
+
+See "Live rereview of `97d0c90`" in `docs/trial-readiness.md` for the full table. Summary: Telegram readiness now follows PTB's
+`Updater.running` (the `start_polling` task ends normally); legacy main-format checkpoints cover older events by filename stamp;
+durable sqlite memory is opt-in (default `false`); scheduled posts split at the destination transport's limit; the slow-turn
+watchdog flush fires under consolidated/`periodic_flush_seconds: 0` configs again (voice-only stays consolidated); the scheduler
+stamps `last_fired_at` at dispatch so a hard-killed in-flight tick is not re-fired by a rolled-back main (limits documented; no
+hot rollback is supported).
