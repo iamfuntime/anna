@@ -250,3 +250,97 @@ async def test_poison_job_interrupting_every_run_still_trips_the_breaker(tmp_pat
     got = store.get("s1")
     assert not got.enabled  # interruptions 3,4 counted as failures -> disabled at failure_threshold
     assert got.state.consecutive_failures == 2
+
+
+# ---------------------------------------------------------------------------
+# Built-in heartbeat / extraction stay opt-in; no double-post
+# ---------------------------------------------------------------------------
+
+from anna.config import AnnaConfig  # noqa: E402
+from anna.runtime.schedule_store import ScheduleValidationError  # noqa: E402
+
+
+def test_builtin_heartbeat_and_extraction_default_off():
+    cfg = AnnaConfig()
+    assert cfg.heartbeat.enabled is False
+    assert cfg.memory.extraction.enabled is False
+    assert cfg.heartbeat.allowed_destinations == []
+
+
+async def test_builtin_heartbeat_schedule_refused_until_opted_in_and_agent_heartbeat_untouched(tmp_path):
+    cfg, store, router, adapter, sched = await _build(tmp_path, gate_command=_py("raise SystemExit(10)"))
+    hb = Schedule.model_validate({**_make_schedule().model_dump(), "id": "builtin", "job_kind": "google_heartbeat"})
+    with pytest.raises(ScheduleValidationError, match="opt-in"):
+        await store.create(hb)
+    assert store.get("builtin") is None
+    # the pre-existing gated agent heartbeat is exactly as before
+    agent = store.get("heartbeat")
+    assert agent.job_kind == "agent_prompt" and agent.gate_command
+    # the agent heartbeat still posts exactly once and is recorded once (no second writer)
+    router.reply = "Synthetic: one alert."
+    await sched._guarded_fire(agent)
+    assert [m.text for m in adapter.sent] == ["Synthetic: one alert."]
+
+
+# ---------------------------------------------------------------------------
+# Mocked upgrade -> rollback -> retrial acceptance (synthetic fixtures only)
+# ---------------------------------------------------------------------------
+
+from anna.runtime.schedule_types import ScheduleDestination  # noqa: E402
+from anna.runtime.scheduler import Scheduler  # noqa: E402
+
+ACCEPT_DM = "UACCEPT01"
+
+
+def _fleet(n: int = 15) -> list[Schedule]:
+    created = now_utc() - timedelta(days=3)
+    out = [
+        Schedule(id="heartbeat", cron="* * * * *", prompt="check", created_at=created,
+                 destination=ScheduleDestination(transport="slack", channel=ACCEPT_DM),
+                 gate_command=_py("raise SystemExit(10)"), model="sonnet",
+                 state=_fired(0.2), from_newer_build={"keep": True})
+    ]
+    for i in range(n - 1):
+        out.append(Schedule(id=f"job{i}", cron="* * * * *", prompt="x", created_at=created,
+                            destination=ScheduleDestination(transport="slack", channel="CDEST"),
+                            state=_fired(0.2)))
+    return out
+
+
+async def test_upgrade_rollback_retrial_acceptance(tmp_path):
+    cfg, store, router, adapter, sched = await build(tmp_path, schedule=False)
+    for s in _fleet():
+        await store.create(s)
+
+    # 1. UPGRADE: first start with an empty ledger. Everything was just fired by the old build.
+    await sched._poll_once(); await settle(sched)
+    assert router.events == [] and adapter.sent == []
+    saved = yaml.safe_load(Path(cfg.scheduler.state_path).read_text())["schedules"]
+    hb = next(s for s in saved if s["id"] == "heartbeat")
+    assert hb["gate_command"] and hb["model"] and hb["from_newer_build"] == {"keep": True}
+
+    # 2. The heartbeat becomes due: the gate wakes it, the pinned model reaches the worker,
+    #    and the post is recorded once in the destination DM transcript.
+    await store.mark_dispatched("heartbeat", when=now_utc() - timedelta(minutes=5))
+    with sched._ledger._conn:
+        sched._ledger._set_cursor("heartbeat", now_utc() - timedelta(minutes=5))
+    await sched._poll_once(); await settle(sched)
+    assert [e.model for e in router.events] == [store.get("heartbeat").model]
+    assert [m.text for m in adapter.sent] == ["all done"]
+    rows = [l for p in cfg.transcripts_dir.rglob("*.jsonl") for l in p.read_text().splitlines()]
+    assert len(rows) == 1 and "schedule:heartbeat" in rows[0] and ACCEPT_DM in rows[0]
+
+    # 3. ROLLBACK to a build without the ledger (it advances last_fired_at only), then RETRIAL:
+    #    the ledger cursors are now stale for ALL 15 schedules. Nothing may replay.
+    for s in store.list():
+        await store.mark_dispatched(s.id, when=now_utc())
+        with sched._ledger._conn:
+            sched._ledger._set_cursor(s.id, now_utc() - timedelta(hours=3))
+    events_before, sent_before = len(router.events), len(adapter.sent)
+    retrial = Scheduler(config=cfg, store=store, router=router, adapters={"slack": adapter}, alerter=FakeAlerter())
+    await retrial._poll_once(); await settle(retrial)
+    assert len(router.events) == events_before and len(adapter.sent) == sent_before
+    assert len(store.list()) == 15 and all(s.enabled for s in store.list())
+    # the gate/model/extra fields survive the whole round trip
+    final = store.get("heartbeat")
+    assert final.gate_command and final.model and final.model_extra["from_newer_build"] == {"keep": True}
