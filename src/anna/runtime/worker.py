@@ -64,6 +64,7 @@ from anna.vault.transcript_resume import (
     latest_ts,
     render_delivered_posts,
     render_tail_block,
+    legacy_checkpoint_cutoff,
     transcript_tail_since,
     uncovered_sequences_before,
     validated_checkpoint_coverage,
@@ -2241,6 +2242,7 @@ class ConversationWorker:
                 covered_through_sequence=validated_checkpoint_coverage(
                     vault_root, self._config.transcripts_dir, self.conversation_key
                 ),
+                covered_through_ts=legacy_checkpoint_cutoff(vault_root, self.conversation_key),
             )
             # What this session is shown at resume counts as seen by its summary.
             self._resume_tail_sequences = {
@@ -3760,6 +3762,9 @@ class ConversationWorker:
                             sequence,
                             prior,
                             seen_sequences=self._resume_tail_sequences,
+                            covered_through_ts=legacy_checkpoint_cutoff(
+                                self._config.vault.resolved_path, self.conversation_key
+                            ),
                         )
                         # Catch-up: older history this session was never shown cannot freeze coverage
                         # forever, but it is NOT claimed as summarized - the checkpoint records how many

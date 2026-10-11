@@ -76,6 +76,62 @@ def latest_checkpoint_coverage(vault_root: Path, conv_key: str) -> int | None:
     return None
 
 
+_LEGACY_STAMP_RE = re.compile(
+    r"^(\d{4})-(\d{2})-(\d{2})-(\d{2})(\d{2})(\d{2})?(?:-[0-9a-f]{32})?\.md$"
+)
+_COVERAGE_KEY_RE = re.compile(r"^coverage_[a-z_]+:", re.MULTILINE)
+_FUTURE_SKEW_SECONDS = 300.0
+
+
+def legacy_checkpoint_cutoff(vault_root: Path, conv_key: str, *, now: float | None = None) -> float | None:
+    """Epoch cutoff covered by a NEWEST checkpoint written without coverage metadata.
+
+    Builds before the explicit-coverage ledger (``main``) wrote checkpoints
+    with no ``coverage_*`` keys and resumed by "events newer than the
+    checkpoint". Without this fallback every new session replays up to
+    ``tail_max_turns`` exchanges those checkpoints already summarized until
+    the transcripts age out.
+
+    Deliberately conservative:
+
+    * only the single newest checkpoint counts, and only when it carries no
+      ``coverage_*`` key at all (a malformed *new-style* checkpoint covers
+      nothing rather than being guessed at);
+    * the cutoff is the wall-clock stamp in the file name (``YYYY-MM-DD-HHMMSS``,
+      optionally ``-<uuid>``, or the older minute-only ``HHMM``), never the
+      file mtime alone — it is capped by the mtime so a copied/restored file
+      cannot hide newer events, and a stamp in the future is ignored;
+    * an unreadable file or unparseable name yields None (replay, never hide).
+
+    Events lacking a parseable ``ts`` are never covered by this cutoff.
+    """
+    recent = list_recent_checkpoints(vault_root=vault_root, conversation_key=conv_key, limit=1)
+    if not recent:
+        return None
+    path = recent[0]
+    match = _LEGACY_STAMP_RE.match(path.name)
+    if match is None:
+        return None
+    try:
+        text = path.read_text(encoding="utf-8")
+        mtime = path.stat().st_mtime
+    except OSError:
+        return None
+    if _COVERAGE_KEY_RE.search(text):
+        return None
+    year, month, day, hour, minute, second = match.groups()
+    try:
+        stamp = datetime(
+            int(year), int(month), int(day), int(hour), int(minute), int(second or 0), tzinfo=UTC
+        ).timestamp()
+    except ValueError:
+        return None
+    current = datetime.now(UTC).timestamp() if now is None else now
+    if stamp > current + _FUTURE_SKEW_SECONDS:
+        return None
+    return min(stamp, mtime)
+
+
 def validated_checkpoint_coverage(
     vault_root: Path,
     transcripts_dir: Path,
@@ -133,6 +189,7 @@ def uncovered_sequences_before(
     covered_through_sequence: int | None,
     *,
     seen_sequences: set[int] | frozenset[int] = frozenset(),
+    covered_through_ts: float | None = None,
 ) -> list[int]:
     """Whether a new worker would skip durable history before ``sequence``.
 
@@ -161,6 +218,12 @@ def uncovered_sequences_before(
                 continue
             if not isinstance(obj, dict):
                 continue
+            if covered_through_ts is not None:
+                ts = _parse_ts(obj.get("ts"))
+                if ts is not None and ts <= covered_through_ts:
+                    if isinstance(obj.get("sequence"), int):
+                        file_max = max(file_max, obj["sequence"])
+                    continue  # already summarized by a legacy checkpoint
             event_sequence = obj.get("sequence")
             if not isinstance(event_sequence, int):
                 gap.append(-1)  # legacy line without a sequence: cannot be ordered, counts as unseen
@@ -246,6 +309,7 @@ def transcript_tail_since(
     max_tokens: int,
     *,
     covered_through_sequence: int | None = None,
+    covered_through_ts: float | None = None,
 ) -> list[dict]:
     """Return explicitly uncovered transcript lines, bounded.
 
@@ -253,7 +317,9 @@ def transcript_tail_since(
     each line as JSON (skipping malformed lines defensively), and keeps
     only events whose stable ``sequence`` is above
     ``covered_through_sequence``. Legacy JSONL events without a sequence are
-    never filtered. ``since_mtime`` is retained only for callers of the old
+    never filtered, except by ``covered_through_ts`` (see
+    :func:`legacy_checkpoint_cutoff`) which drops events whose parseable ``ts``
+    is at or before a legacy checkpoint. ``since_mtime`` is retained only for callers of the old
     standalone helper; runtime recovery must pass explicit coverage instead.
 
     The surviving lines are then trimmed from the END to at most
@@ -266,6 +332,7 @@ def transcript_tail_since(
         transcripts_dir,
         conv_key,
         covered_through_sequence=covered_through_sequence,
+        covered_through_ts=covered_through_ts,
         since_mtime=since_mtime,
         max_turns=max_turns,
         max_tokens=max_tokens,
@@ -281,6 +348,7 @@ def _recent_lines(
     conv_key: str,
     *,
     covered_through_sequence: int | None = None,
+    covered_through_ts: float | None = None,
     since_mtime: float | None = None,
     max_turns: int | None = None,
     max_tokens: int | None = None,
@@ -323,6 +391,10 @@ def _recent_lines(
                 continue
             if not isinstance(obj, dict):
                 continue
+            if covered_through_ts is not None:
+                ts = _parse_ts(obj.get("ts"))
+                if ts is not None and ts <= covered_through_ts:
+                    continue
             sequence = obj.get("sequence")
             if covered_through_sequence is not None and isinstance(sequence, int):
                 if sequence <= covered_through_sequence:

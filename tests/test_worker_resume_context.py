@@ -252,32 +252,48 @@ def test_stale_checkpoint_older_than_lines_yields_tail(tmp_path: Path) -> None:
     assert "newer than stale checkpoint" in prompt
 
 
-def test_legacy_checkpoint_never_claims_transcript_coverage(tmp_path: Path) -> None:
-    # Filesystem mtime is not an event-coverage cursor. A legacy checkpoint
-    # cannot prove it captured these transcript lines, so replay them.
+def test_legacy_checkpoint_covers_older_events_by_filename_stamp(tmp_path: Path) -> None:
+    # A main-build checkpoint (no coverage keys) summarized everything written
+    # before it; its filename stamp (not a restorable mtime) is the cutoff.
     worker = _make_worker(tmp_path)
     vault_root = worker._config.vault.resolved_path
-
-    ckpt = _plant_checkpoint(vault_root, "2026-05-31-0900", "covers everything")
-    _set_mtime(ckpt, 9_000_000.0)
-
+    _plant_checkpoint(vault_root, "2026-05-31-090000", "covers everything")
+    stamp = datetime(2026, 5, 31, 9, 0, 0, tzinfo=timezone.utc).timestamp()
     _plant_transcript(
         worker._config.transcripts_dir,
         "2026-05-31",
         [
-            _line(8_000_000.0, "inbound", "already checkpointed"),
-            _line(8_000_001.0, "outbound", "already saved reply"),
+            _line(stamp - 100, "inbound", "already checkpointed"),
+            _line(stamp - 99, "outbound", "already saved reply"),
+            _line(stamp + 100, "inbound", "genuinely uncovered question"),
+            _line(stamp + 101, "outbound", "genuinely uncovered answer"),
         ],
     )
-
     prompt = worker._assemble_system_prompt(
-        anna_home=worker._config.anna_home,
-        vault_root=vault_root,
-        format_rule="(no rule)",
+        anna_home=worker._config.anna_home, vault_root=vault_root, format_rule="(no rule)",
     )
     assert "# Recent checkpoints (resume context)" in prompt
     assert TAIL_HEADING in prompt
-    assert "already checkpointed" in prompt
+    assert "already checkpointed" not in prompt
+    assert "already saved reply" not in prompt
+    assert "genuinely uncovered question" in prompt
+    assert "genuinely uncovered answer" in prompt
+
+
+def test_legacy_checkpoint_covering_everything_has_no_tail(tmp_path: Path) -> None:
+    worker = _make_worker(tmp_path)
+    vault_root = worker._config.vault.resolved_path
+    _plant_checkpoint(vault_root, "2026-05-31-090000", "covers everything")
+    stamp = datetime(2026, 5, 31, 9, 0, 0, tzinfo=timezone.utc).timestamp()
+    _plant_transcript(
+        worker._config.transcripts_dir,
+        "2026-05-31",
+        [_line(stamp - 10 * i, "inbound" if i % 2 else "outbound", f"old {i}") for i in range(1, 17)],
+    )
+    prompt = worker._assemble_system_prompt(
+        anna_home=worker._config.anna_home, vault_root=vault_root, format_rule="(no rule)",
+    )
+    assert TAIL_HEADING not in prompt
 
 
 def test_budget_respects_turn_and_token_caps(tmp_path: Path) -> None:
