@@ -101,23 +101,34 @@ async def test_h1_external_stamp_still_prevents_replay(tmp_path):
     assert len(rec) == 1 and rec[0]["own_stamp"] is None
 
 
-async def test_h1_own_stamp_after_external_advance_does_not_lift_again(tmp_path):
+async def test_h1_external_stamp_is_adopted_before_our_own_stamp_overwrites_it(tmp_path):
     await _past_tick_gap()
     cfg, store, router, adapter, sched = await build(
         tmp_path, schedule=make_schedule(created=now_utc() - timedelta(days=1)))
     led = sched._ledger
     with led._conn:
-        led._set_cursor("s1", _tick() - timedelta(minutes=3))
-    led.note_stamp("s1", now_utc() - timedelta(minutes=2))
-    await store.mark_dispatched("s1", when=now_utc())  # written by an outside actor, newer than ours
+        led._set_cursor("s1", _tick() - timedelta(minutes=2))
+    # an older build stamped the previous tick (> cursor); then THIS build completes something and stamps `now`
+    await store.mark_dispatched("s1", when=_tick() - timedelta(minutes=1) + timedelta(milliseconds=100))
+    await sched._mark_fired("s1", when=now_utc())
+    assert led.cursor("s1") == _tick() - timedelta(minutes=1) + timedelta(milliseconds=100)   # adopted first
     await sched._poll_once(); await settle(sched)
-    assert router.events == []  # external: treated as "already ran"
+    assert len(router.events) == 1                                      # only the genuinely new tick runs, once
+    assert [o.scheduled_for for o in led.recent("s1")] == [iso(_tick())]
+
+
+async def test_h1_recovery_stamp_does_not_erase_an_older_builds_stamp(tmp_path):
+    """The recovery pass stamps last_fired_at before materialize runs; the external stamp must survive that."""
     await _past_tick_gap()
+    cfg, store, router, adapter, sched = await build(
+        tmp_path, schedule=make_schedule(created=now_utc() - timedelta(days=1)))
+    led = sched._ledger
     with led._conn:
-        led._set_cursor("s1", _tick() - timedelta(minutes=1))
-    await sched._mark_fired("s1", when=now_utc())  # our own, later stamp
+        led._set_cursor("s1", _tick() - timedelta(minutes=5))
+    _dead_running(sched, _tick() - timedelta(minutes=5))
+    await store.mark_dispatched("s1", when=_tick() + timedelta(milliseconds=100))   # older build ran THIS tick
     await sched._poll_once(); await settle(sched)
-    assert len(router.events) == 1
+    assert router.events == []                                           # no duplicate of the older build's run
 
 
 # ---------------------------------------------------------------------------------------- L3
@@ -377,3 +388,105 @@ async def test_m9_a_live_task_of_this_process_is_never_treated_as_an_orphan(tmp_
     for t in list(sched._inflight):
         t.cancel()
     await asyncio.gather(*list(sched._inflight), return_exceptions=True)
+
+
+# ---------------------------------------------------------------------------------------- stamp registration
+
+def test_every_last_fired_at_write_goes_through_the_stamp_registering_wrappers():
+    """A stamp the ledger build writes without registering would be mistaken for an older build's (H1)."""
+    import re
+
+    import anna.runtime.scheduler as mod
+
+    src = Path(mod.__file__).read_text()
+    direct = re.findall(r"self\._store\.mark_(fired|dispatched|failed)\(", src)
+    assert len(direct) == 3  # exactly the three wrapper bodies; everything else calls _mark_*
+
+
+# ---------------------------------------------------------------------------------------- L2
+
+from anna.config import SchedulerConfig  # noqa: E402
+
+
+@pytest.mark.parametrize("field", ["interruption_threshold", "failure_threshold"])
+@pytest.mark.parametrize("bad", [0, -1])
+def test_l2_thresholds_below_one_are_rejected(field, bad):
+    with pytest.raises(ValueError, match="at least 1"):
+        SchedulerConfig(**{field: bad})
+
+
+async def _interrupt(sched, minutes_ago, *, detail=None):
+    """One dead-owner run recovered by a poll (kind=interrupted); optionally relabel as a timeout."""
+    with sched._ledger._conn:
+        occ = sched._ledger._insert_occurrence(
+            schedule_id="s1", scheduled_for=now_utc() - timedelta(minutes=minutes_ago), trigger="cron",
+            job_kind="agent_prompt", run_safety="side_effecting", status="pending", detail=None)
+    sched._ledger.claim(occ, owner="999999-x-dead", lease_seconds=-1)
+    sched._ledger.start_run(occ, owner="999999-x-dead")
+    sched._ledger._conn.execute("UPDATE schedule_occurrences SET lease_expires_at=? WHERE id=?",
+                                (iso(now_utc() - timedelta(seconds=1)), occ))
+    sched._ledger._conn.commit()
+    await sched._poll_once(); await settle(sched)
+    return occ
+
+
+async def test_l2_timeouts_do_not_feed_the_interruption_streak(tmp_path):
+    cfg, store, router, adapter, sched = await build(tmp_path, schedule=_dm_schedule())
+    cfg.scheduler.interruption_threshold = 2
+    cfg.scheduler.failure_threshold = 10
+    for i in range(3):  # three timeouts that ended unknown: counted failures already, not interruptions
+        occ = sched._ledger.create_manual(schedule_id="s1", job_kind="agent_prompt", run_safety="side_effecting")
+        sched._ledger.claim(occ, owner=sched._owner, lease_seconds=60)
+        run = sched._ledger.start_run(occ, owner=sched._owner)
+        sched._ledger.finish_run(occ, run, status="unknown", side_effects="possible", error="x", detail="timeout: x")
+    assert sched._interrupted_streak("s1") == 0
+    await _interrupt(sched, 5)                      # one restart after a run of timeouts
+    assert store.get("s1").state.consecutive_failures == 0  # not converted into a failure early
+
+
+async def test_l2_streak_resets_after_a_completed_run(tmp_path):
+    cfg, store, router, adapter, sched = await build(tmp_path, schedule=_dm_schedule())
+    cfg.scheduler.interruption_threshold = 3
+    cfg.scheduler.failure_threshold = 10
+    await _interrupt(sched, 9); await _interrupt(sched, 8)
+    assert sched._interrupted_streak("s1") == 2
+    occ = sched._ledger.create_manual(schedule_id="s1", job_kind="agent_prompt", run_safety="side_effecting")
+    sched._ledger.claim(occ, owner=sched._owner, lease_seconds=60)
+    run = sched._ledger.start_run(occ, owner=sched._owner)
+    sched._ledger.finish_run(occ, run, status="succeeded", side_effects="none")
+    assert sched._interrupted_streak("s1") == 0
+    await _interrupt(sched, 7)
+    assert store.get("s1").state.consecutive_failures == 0
+
+
+async def test_l2_threshold_and_disable_point_are_exactly_as_documented(tmp_path):
+    cfg, store, router, adapter, sched = await build(tmp_path, schedule=_dm_schedule())
+    cfg.scheduler.interruption_threshold = 2
+    cfg.scheduler.failure_threshold = 3
+    failures = []
+    for i in range(6):
+        if not store.get("s1").enabled:
+            break
+        await _interrupt(sched, 30 - i)
+        failures.append(store.get("s1").state.consecutive_failures)
+    # interruptions 1 is free; the 2nd, 3rd, 4th count 1,2,3 -> disabled at 2 + 3 - 1 = 4 consecutive interruptions
+    assert failures == [0, 1, 2, 3] and not store.get("s1").enabled
+
+
+async def test_l2_interruptions_are_audited_apart_from_failures(tmp_path):
+    cfg, store, router, adapter, sched = await build(tmp_path, schedule=_dm_schedule())
+    await _interrupt(sched, 5)
+    audits = _read_audit_records(cfg.audit_dir)
+    assert _events(audits, "audit.schedule.interrupted") and not _events(audits, "audit.schedule.fail")
+
+
+async def test_prune_drops_delivered_post_records_so_reused_ids_start_clean(tmp_path):
+    cfg, store, router, adapter, sched = await build(tmp_path, schedule=_dm_schedule())
+    occ = _enqueue(sched, "hello there")
+    await sched._deliver_due()
+    led = sched._ledger
+    assert led._conn.execute("SELECT COUNT(*) FROM delivered_post_records WHERE occurrence_id=?", (occ,)).fetchone()[0] == 1
+    led._conn.execute("UPDATE schedule_occurrences SET finished_at=?", (iso(now_utc() - timedelta(days=400)),))
+    led._conn.commit()
+    led.prune(now=now_utc(), retention_days=30, text_retention_days=30)
+    assert led._conn.execute("SELECT COUNT(*) FROM delivered_post_records").fetchone()[0] == 0

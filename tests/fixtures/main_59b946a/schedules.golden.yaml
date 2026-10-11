@@ -1,0 +1,56 @@
+# GOLDEN schedules.yaml as origin/main 59b946a writes it (the file you upgrade FROM). Placeholders:
+# @AGO:<minutes>@ is replaced with an ISO time that many minutes before the test's clock.
+version: 1
+schedules:
+- id: heartbeat
+  natural_language: null
+  cron: '* * * * *'
+  timezone: America/New_York
+  prompt: check the inbox
+  destination: {transport: slack, channel: UGOLDEN01}
+  timeout_seconds: 300
+  enabled: true
+  ephemeral: true
+  gate_command: [/bin/true]
+  model: sonnet
+  created_at: '@AGO:4320@'
+  state: {last_fired_at: '@AGO:1@', last_status: complete, consecutive_failures: 0}
+- id: report
+  natural_language: every minute (fixture)
+  cron: '* * * * *'
+  timezone: UTC
+  prompt: post the daily report
+  destination: {transport: slack, channel: CGOLDEN02}
+  timeout_seconds: 600
+  enabled: true
+  ephemeral: false
+  gate_command: null
+  model: null
+  created_at: '@AGO:4320@'
+  state: {last_fired_at: '@AGO:1@', last_status: complete, consecutive_failures: 0}
+- id: flaky
+  natural_language: null
+  cron: '* * * * *'
+  timezone: UTC
+  prompt: sync the thing
+  destination: {transport: slack, channel: CGOLDEN03}
+  timeout_seconds: 300
+  enabled: true
+  ephemeral: false
+  gate_command: null
+  model: null
+  created_at: '@AGO:4320@'
+  state: {last_fired_at: '@AGO:1@', last_status: fail, consecutive_failures: 1}
+- id: paused
+  natural_language: null
+  cron: '* * * * *'
+  timezone: UTC
+  prompt: disabled by the operator
+  destination: {transport: slack, channel: CGOLDEN04}
+  timeout_seconds: 300
+  enabled: false
+  ephemeral: false
+  gate_command: null
+  model: null
+  created_at: '@AGO:4320@'
+  state: {last_fired_at: null, last_status: null, consecutive_failures: 0}

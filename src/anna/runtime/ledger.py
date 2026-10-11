@@ -568,20 +568,7 @@ class RuntimeLedger:
             stored = self.cursor(schedule_id)
             cur = baseline.astimezone(UTC) if stored is None else stored
             if stored is not None and last_fired_at is not None:
-                lf = last_fired_at.astimezone(UTC) if last_fired_at.tzinfo else last_fired_at.replace(tzinfo=UTC)
-                own = self.own_stamp(schedule_id)
-                if lf > now + FUTURE_STAMP_TOLERANCE:
-                    self.notes.append({"schedule_id": schedule_id, "kind": "future_stamp_ignored",
-                                       "last_fired_at": iso(lf)})
-                elif lf > stored and (own is None or lf > own + STAMP_EPSILON):
-                    cur = min(lf, now)
-                    self._set_cursor(schedule_id, cur)
-                    note: dict[str, Any] = {"schedule_id": schedule_id, "kind": "external_stamp", "cursor": iso(cur),
-                                            "previous_cursor": iso(stored), "last_fired_at": iso(lf),
-                                            "own_stamp": iso(own) if own else None}
-                    if job_kind != "google_heartbeat":
-                        note.update(self._supersede(schedule_id, cur))
-                    self.notes.append(note)
+                cur = self._adopt(schedule_id, stored, last_fired_at, now, job_kind) or cur
             newest_local = croniter(cron, now.astimezone(tz)).get_prev(datetime)
             newest = newest_local.astimezone(UTC)
             if newest <= cur:
@@ -610,6 +597,38 @@ class RuntimeLedger:
             if occ is not None and status == "pending":
                 created.append(occ)
         return created
+
+    def adopt_external_stamp(self, schedule_id: str, last_fired_at: datetime | None, *, now: datetime,
+                             job_kind: str = "agent_prompt") -> bool:
+        """Adopt an older build's ``last_fired_at`` NOW (see ``materialize``); True if the cursor moved.
+
+        The scheduler calls this before it writes a stamp of its own and at the start of every poll: a
+        stamp this build writes overwrites the YAML value, so an external one must be adopted before that.
+        """
+        stored = self.cursor(schedule_id)
+        if stored is None or last_fired_at is None:
+            return False
+        with self._conn:
+            return self._adopt(schedule_id, stored, last_fired_at, now, job_kind) is not None
+
+    def _adopt(self, schedule_id: str, stored: datetime, last_fired_at: datetime, now: datetime,
+               job_kind: str) -> datetime | None:
+        lf = last_fired_at.astimezone(UTC) if last_fired_at.tzinfo else last_fired_at.replace(tzinfo=UTC)
+        own = self.own_stamp(schedule_id)
+        if lf > now + FUTURE_STAMP_TOLERANCE:
+            self.notes.append({"schedule_id": schedule_id, "kind": "future_stamp_ignored", "last_fired_at": iso(lf)})
+            return None
+        if lf > stored and (own is None or lf > own + STAMP_EPSILON):
+            cur = min(lf, now)
+            self._set_cursor(schedule_id, cur)
+            note: dict[str, Any] = {"schedule_id": schedule_id, "kind": "external_stamp", "cursor": iso(cur),
+                                    "previous_cursor": iso(stored), "last_fired_at": iso(lf),
+                                    "own_stamp": iso(own) if own else None}
+            if job_kind != "google_heartbeat":
+                note.update(self._supersede(schedule_id, cur))
+            self.notes.append(note)
+            return cur
+        return None
 
     def _supersede(self, schedule_id: str, upto: datetime) -> dict[str, Any]:
         """Close work this build queued BEFORE an older build ran the schedule (rollback window).

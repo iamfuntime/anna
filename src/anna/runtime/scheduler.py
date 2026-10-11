@@ -469,6 +469,10 @@ class Scheduler:
                         kind=done["kind"], target_id=done["target_id"], action=done["action"],
                         outcome=done["outcome"], detail=done["detail"], requested_by=done["requested_by"])
         await self._apply_controls()
+        if load_ok:
+            for known in self._store.list():
+                self._adopt_external(known.id)  # before recovery / completion stamps overwrite it
+            self._emit_ledger_notes()
         for rec in self._ledger.recover_expired(now=now, max_run_attempts=cfg.max_run_attempts,
                                                 owner_alive=owner_alive, own_owner=self._owner,
                                                 own_active=frozenset(self._active_fires)):
@@ -574,11 +578,7 @@ class Scheduler:
         except Exception as exc:
             self._log.warning("scheduler.materialize_failed", schedule_id=schedule.id, error=str(exc))
             return
-        for note in self._ledger.drain_notes():
-            kind = note.pop("kind")
-            audit_event(f"audit.schedule.cursor_{kind}", audit_dir=self._audit_dir, actor="anna",
-                        fsync_on_write=self._fsync, level="WARNING", **note)
-            self._log.warning(f"scheduler.cursor_{kind}", schedule_id=schedule.id)
+        self._emit_ledger_notes()
         for occ_id in created:
             audit_event("audit.schedule.occurrence", audit_dir=self._audit_dir, actor="anna",
                         fsync_on_write=self._fsync, schedule_id=schedule.id, occurrence_id=occ_id)
@@ -586,17 +586,34 @@ class Scheduler:
     # The ledger records every ``last_fired_at`` this build writes (BEFORE the write), so
     # ``materialize`` can tell its own completion-time stamps from ones an older build wrote.
 
+    def _adopt_external(self, schedule_id: str) -> None:
+        """Adopt an older build's ``last_fired_at`` BEFORE this build overwrites it with its own stamp."""
+        found = self._store.get(schedule_id)
+        if found is not None:
+            self._ledger.adopt_external_stamp(schedule_id, found.state.last_fired_at, now=now_utc(),
+                                              job_kind=getattr(found, "job_kind", "agent_prompt"))
+
     async def _mark_fired(self, schedule_id: str, *, when: datetime) -> None:
+        self._adopt_external(schedule_id)
         self._ledger.note_stamp(schedule_id, when)
         await self._store.mark_fired(schedule_id, status="complete", when=when)
 
     async def _mark_dispatched(self, schedule_id: str, *, when: datetime) -> None:
+        self._adopt_external(schedule_id)
         self._ledger.note_stamp(schedule_id, when)
         await self._store.mark_dispatched(schedule_id, when=when)
 
     async def _mark_failed(self, schedule_id: str, *, reason: str, when: datetime, kind: str) -> int:
+        self._adopt_external(schedule_id)
         self._ledger.note_stamp(schedule_id, when)
         return await self._store.mark_failed(schedule_id, reason=reason, when=when, kind=kind)
+
+    def _emit_ledger_notes(self) -> None:
+        for note in self._ledger.drain_notes():
+            kind = note.pop("kind")
+            audit_event(f"audit.schedule.cursor_{kind}", audit_dir=self._audit_dir, actor="anna",
+                        fsync_on_write=self._fsync, level="WARNING", **note)
+            self._log.warning(f"scheduler.cursor_{kind}", schedule_id=note["schedule_id"])
 
     def _spawn(self, schedule: Schedule, occurrence_id: int) -> asyncio.Task[None]:
         self._spawned.add(occurrence_id)
@@ -894,12 +911,11 @@ class Scheduler:
             if schedule.id not in self._deleted:
                 # SHUTDOWN of side-effecting work: say plainly that the outcome is unknown.
                 self._audit_shutdown(schedule, occurrence_id, status)
-                await self._store.mark_failed(schedule.id, reason=f"shutdown: {status}",
-                                              when=datetime.now(UTC), kind="interrupted")
+                await self._handle_failure(schedule, reason=f"shutdown: {status}", kind="interrupted")
             raise
         except _TurnTimeout as exc:
             self._ledger.finish_run(occurrence_id, run_id, status=exc.status, side_effects=exc.side_effects,
-                                    error=exc.detail, detail=exc.detail)
+                                    error=exc.detail, detail=f"timeout: {exc.detail}")
             await self._handle_failure(
                 schedule, reason=f"timeout after {schedule.timeout_seconds}s ({exc.status}: {exc.detail})",
                 kind="timeout")
@@ -1444,10 +1460,10 @@ class Scheduler:
         """Newest-first count of runs that ended interrupted, up to the first real outcome."""
         streak = 0
         for occ in self._ledger.recent(schedule_id, 50):
-            if occ.exec_status in ("unknown", "blocked"):
+            if occ.exec_status in ("unknown", "blocked") and not (occ.detail or "").startswith("timeout:"):
                 streak += 1
-            elif occ.exec_status in ("succeeded", "failed", "timeout", "partial", "auth_required"):
-                break
+            elif occ.exec_status in ("succeeded", "failed", "timeout", "partial", "auth_required", "unknown", "blocked"):
+                break  # a completed run, or a timeout (already a counted failure): the streak ends
         return streak
 
     async def _handle_failure(
@@ -1463,7 +1479,8 @@ class Scheduler:
             kind = "fail"
         new_count = await self._mark_failed(schedule.id, reason=reason, when=when, kind=kind)
         audit_event(
-            "audit.schedule.fail",
+            # restarts are not failures: anything counting audit.schedule.fail counts real failures only
+            "audit.schedule.interrupted" if kind == "interrupted" else "audit.schedule.fail",
             audit_dir=self._audit_dir,
             actor="anna",
             fsync_on_write=self._fsync,

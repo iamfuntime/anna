@@ -1332,10 +1332,23 @@ class SchedulerConfig(BaseModel):
     poll_interval_seconds: int = 30
     failure_threshold: int = 3
     # Restart/crash interruptions are infrastructure, not job failures, and do
-    # NOT count toward ``failure_threshold``. A job that interrupts this many
-    # runs IN A ROW with no completed run between (a poison job crashing the
-    # daemon) is however counted as a failure so the breaker still trips.
+    # NOT count toward ``failure_threshold``. A job whose runs are interrupted
+    # ``interruption_threshold`` times IN A ROW (no completed or timed-out run
+    # between; a poison job that keeps taking the daemon down) has its Nth and every
+    # later consecutive interruption counted as ONE failure each, so the breaker
+    # still trips: disable happens at the (interruption_threshold + failure_threshold - 1)th
+    # consecutive interruption (default 5 + 3 - 1 = 7). Default 5: a few restarts
+    # (deploys, OOM, a bad night) must never disable a healthy job, while a run that
+    # dies five times with nothing finishing in between is the job, not the host.
+    # Timeouts are not interruptions (they already count as failures).
     interruption_threshold: int = 5
+
+    @field_validator("interruption_threshold", "failure_threshold")
+    @classmethod
+    def _at_least_one(cls, v: int, info: Any) -> int:
+        if v < 1:
+            raise ValueError(f"scheduler.{info.field_name} must be at least 1")
+        return v
 
     # Durable runtime ledger (state/runtime.sqlite3): occurrences, runs, outbox.
     # Defaults preserve legacy behavior: one catch-up run after downtime,
