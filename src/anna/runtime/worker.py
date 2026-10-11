@@ -14,8 +14,9 @@ import re
 import time
 import uuid
 from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as dataclass_replace
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
@@ -224,6 +225,190 @@ def _should_suppress_markup(text: str, *, tool_used: bool = False) -> bool:
     return not tool_used
 
 
+# ---------------------------------------------------------------------------
+# Outbound text filters (2026-09-15 / 2026-09-16 incidents)
+#
+# Three leaks reached Slack inside 48 hours, all of them things the prompt
+# layer was already told not to do. Prompt rules are advisory; these are
+# structural, so the failure mode stops being possible rather than
+# stops being likely. Each filter is a pure module-level function so it can be
+# unit-tested without an SDK, a worker, or an event loop (see
+# tests/test_worker_outbound_sanitize.py).
+# ---------------------------------------------------------------------------
+
+# 2026-09-16 DELEGATE FOOTER LEAK. Sub-agents close their report with an
+# MLD-lite footer (MISTAKES / FRICTION / WISHES). ANNA is supposed to relay a
+# delegate result in her own words and drop that footer; instead a whole
+# delegate report body shipped to Slack with the footer attached. The footer
+# is written by several different sub-agents and its exact shape varies —
+# ``*MISTAKES* — …``, ``**FRICTION** - …``, ``MISTAKES: …``, ``WISHES — …``,
+# sometimes under a ``---`` rule — so the marker is matched structurally
+# rather than by literal string: line-anchored, optional Markdown emphasis or
+# ATX-heading wrappers, the BARE uppercase word, optional closing wrappers,
+# then either end-of-line or a ``:``/``-``/em-dash/en-dash separator. The
+# uppercase requirement is load-bearing: "mistakes" in a sentence is prose.
+_DELEGATE_FOOTER_RE = re.compile(
+    r"^[ \t]*(?:\*{1,2}|_{1,2}|#{1,6}[ \t]*)?"
+    r"(MISTAKES|FRICTION|WISHES)"
+    r"(?:\*{1,2}|_{1,2})?"
+    r"[ \t]*(?::|-|—|–|$)",
+    re.MULTILINE,
+)
+
+# A horizontal rule the footer is often introduced by. Matched only when it is
+# the LAST thing before the cut point, so the rule goes with the footer it
+# belongs to instead of dangling at the end of the relayed text.
+_TRAILING_RULE_RE = re.compile(r"(?:\r?\n|\A)[ \t]*(?:-{3,}|\*{3,}|_{3,})[ \t]*\s*\Z")
+
+
+def strip_delegate_footer(text: str) -> str:
+    """Cut a sub-agent's MLD-lite footer (and its rule) off relayed text.
+
+    2026-09-16: a delegate report shipped verbatim to Slack, footer included.
+    Cuts from the FIRST footer marker to end of text — the footer is always
+    terminal, and a marker appearing mid-report means the report already
+    contains footer-shaped headings we do not want to relay either.
+
+    FALSE-POSITIVE GUARD, the whole reason this is safe to run on every
+    outbound message: at least TWO DISTINCT markers of the three must be
+    present before anything is cut. One heading-shaped line is how ordinary
+    prose reads (``*MISTAKES* happen``, "a note on WISHES:"), and silently
+    truncating a genuine reply at it would be a far worse bug than the leak
+    this fixes. Returns ``text`` unchanged when the guard does not trip.
+    Never raises on ``None``/empty.
+    """
+    if not text:
+        return text or ""
+    matches = list(_DELEGATE_FOOTER_RE.finditer(text))
+    if len({m.group(1) for m in matches}) < 2:
+        return text
+    head = text[: matches[0].start()]
+    return _TRAILING_RULE_RE.sub("", head).rstrip()
+
+
+# 2026-09-15 QUIET-SENTINEL LEAK. The sentinel is a SCHEDULER protocol token:
+# a scheduled skill returns it to opt out of posting, and the scheduler
+# wrapper strips it. On the INTERACTIVE path nothing stripped it, so it
+# reached Seth's DM as 18 literal characters three times in one day.
+#
+# The literal itself stays in :mod:`anna.runtime.scheduler` (its canonical
+# home, re-exported in that module's ``__all__`` and imported by name across
+# the tests). It is read here through a lazy, cached function-level import
+# rather than a module-level one because the dependency runs the OTHER way:
+# ``scheduler`` does ``from anna.runtime.worker import ...`` at module scope,
+# so a module-level import back would be a hard cycle (worker would import
+# scheduler before defining the TURN_* names scheduler wants). Deferring to
+# first call is acyclic and keeps ONE copy of the literal. Follow-up once
+# scheduler.py is free of unrelated work: promote the constant to a shared
+# module and import it normally from both sides.
+@lru_cache(maxsize=1)
+def _quiet_sentinel_patterns() -> tuple[str, re.Pattern[str], re.Pattern[str]]:
+    """The sentinel literal plus its own-line and inline match patterns."""
+    from anna.runtime.scheduler import QUIET_SENTINEL
+
+    escaped = re.escape(QUIET_SENTINEL)
+    return (
+        QUIET_SENTINEL,
+        # Sentinel alone on its line: take the line's newline with it so the
+        # surrounding paragraph does not gain a blank line where it sat.
+        re.compile(rf"^[ \t]*{escaped}[ \t]*(?:\r?\n|\Z)", re.MULTILINE),
+        # Sentinel mid-sentence: collapse to a single space so the words on
+        # either side do not run together.
+        re.compile(rf"[ \t]*{escaped}[ \t]*"),
+    )
+
+
+_BLANK_RUN_RE = re.compile(r"\n{3,}")
+
+
+def strip_quiet_sentinel(text: str) -> str:
+    """Remove every ``[[ANNA_NO_OUTPUT]]`` occurrence from outbound text.
+
+    2026-09-15: the sentinel reached a DM as literal characters three times,
+    because only the scheduler wrapper knew to strip it. Tolerates surrounding
+    whitespace and collapses the blank lines the removal leaves behind, so a
+    reply that was nothing BUT the sentinel comes back empty (the caller then
+    drops the send rather than posting a placeholder). Never raises on
+    ``None``/empty.
+    """
+    if not text:
+        return text or ""
+    sentinel, own_line_re, inline_re = _quiet_sentinel_patterns()
+    if sentinel not in text:
+        return text
+    cleaned = own_line_re.sub("", text)
+    cleaned = inline_re.sub(" ", cleaned)
+    return _BLANK_RUN_RE.sub("\n\n", cleaned).strip()
+
+
+def _sanitize_outbound(text: str) -> tuple[str, list[str]]:
+    """Run every outbound filter; return the cleaned text and which ones fired.
+
+    The filter NAMES are returned (not just the cleaned text) so the audit row
+    on a dropped send can say WHICH structural leak was caught — "we dropped
+    an empty message" is not a finding, "we dropped a message that was nothing
+    but a quiet sentinel" is.
+    """
+    if not text:
+        return text or "", []
+    fired: list[str] = []
+    cleaned = strip_delegate_footer(text)
+    if cleaned != text:
+        fired.append("delegate_footer")
+    after_sentinel = strip_quiet_sentinel(cleaned)
+    if after_sentinel != cleaned:
+        fired.append("quiet_sentinel")
+    return after_sentinel, fired
+
+
+# 2026-09-16 UNCAPPED TERMINAL REPORT. Appended when a notification-terminal
+# report is truncated. Deliberately one short marker rather than a sentence:
+# the operator needs to know the text was cut, not to be told about it.
+_TRUNCATION_MARKER = " […]"
+# Sentence end: closing punctuation, any quote/bracket that trails it, then
+# whitespace. ``end(1)`` is the index just past the punctuation, so the cut
+# keeps the full sentence.
+_SENTENCE_END_RE = re.compile(r"([.!?])[\"')\]]*\s")
+
+
+def _truncate_notification_terminal(text: str, max_chars: int) -> str:
+    """Clip a notification-terminal report to ``max_chars``, on a boundary.
+
+    2026-09-16: a delegate completion report went out uncapped at roughly 4.5k
+    characters, crossed the Slack transport's own ``SLACK_MAX_CHARS = 3900``
+    split point, and rendered as TWO messages with a list item orphaned at the
+    top of the second. The count-in-window cap bounds how MANY reports go out,
+    not how big one is, so a single completion could still do this.
+
+    Cut point preference: last newline, else last sentence end, else last word
+    boundary — never mid-word — and the chosen boundary must land in the LATTER
+    HALF of the budget so we never throw away most of a report chasing a
+    prettier cut. A run of text with no whitespace at all (one giant token) is
+    hard-sliced, because there is no boundary to honor. The marker is charged
+    against the budget so the result is ALWAYS ``<= max_chars``: that is the
+    guarantee the Slack split point needs. ``max_chars <= 0`` means no cap.
+    """
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    budget = max_chars - len(_TRUNCATION_MARKER)
+    if budget <= 0:
+        return _TRUNCATION_MARKER.strip()
+    window = text[:budget]
+    floor = budget // 2
+    cut = window.rfind("\n")
+    if cut < floor:
+        sentence_cut = -1
+        for match in _SENTENCE_END_RE.finditer(window):
+            sentence_cut = match.end(1)
+        cut = max(cut, sentence_cut)
+    if cut < floor:
+        cut = max(cut, window.rfind(" "), window.rfind("\t"))
+    if cut <= 0:
+        # No boundary anywhere: a single unbroken token. Slice it.
+        cut = budget
+    return window[:cut].rstrip() + _TRUNCATION_MARKER
+
+
 SendCallback = Callable[[OutboundMessage], Awaitable[None]]
 IdleCloseCallback = Callable[[str], Awaitable[None]]
 
@@ -368,6 +553,139 @@ class _DeliveredPostsInjection:
     post_count: int
     omitted: int
     sources: list[str]
+
+
+# ---------------------------------------------------------------------------
+# Per-turn token accounting
+# ---------------------------------------------------------------------------
+#
+# The four fields the Anthropic API bills on. Names match the SDK's ``usage``
+# dict verbatim (see ``.claude-runtime/projects/*/**.jsonl``) so the audit row
+# can be summed straight out of the log with no rename table.
+TURN_USAGE_FIELDS: tuple[str, ...] = (
+    "input_tokens",
+    "output_tokens",
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+)
+
+# Dollar cost of the turn. NOT a key of the SDK's per-message ``usage`` dict:
+# it arrives once, as a float attribute on the closing ``ResultMessage``,
+# already summed by the CLI over every API call the turn made (main loop AND
+# sub-agents). Kept out of ``TURN_USAGE_FIELDS`` so the int-only usage-dict
+# extraction path stays int-only.
+TURN_COST_FIELD = "total_cost_usd"
+
+# Every numeric spend key a turn publishes onto ``turn_meta`` and the audit
+# row. Consumers that fold one turn into a running multi-turn total (the
+# scheduler's per-run tally) iterate THIS, not ``TURN_USAGE_FIELDS``.
+TURN_SPEND_FIELDS: tuple[str, ...] = (*TURN_USAGE_FIELDS, TURN_COST_FIELD)
+
+
+class _TurnUsage:
+    """Running token total for ONE turn, scraped off the SDK message stream.
+
+    Every ``AssistantMessage`` is a distinct API response and carries its own
+    ``usage`` dict, so a turn that ran N tool calls bills N+1 times. Summing
+    per-message usage is therefore the only correct turn total — reading the
+    last message alone undercounts by every tool round-trip. Sub-agent
+    assistant messages (``parent_tool_use_id`` set) DO count toward the token
+    total (they are real spend on this turn's behalf) but never overwrite
+    ``model``, which stays the resolved MAIN-LOOP model id.
+
+    ``ResultMessage.usage`` is used only as a fallback for a turn where no
+    assistant message carried usage — folding it in on top of the per-message
+    sum would double-count, since the CLI already aggregates it.
+    """
+
+    def __init__(self) -> None:
+        self.model: str | None = None
+        self.totals: dict[str, float] = dict.fromkeys(TURN_USAGE_FIELDS, 0)
+        # Float, and sourced from the ResultMessage rather than the per-message
+        # usage dict, so it rides along with the counters but is folded in by a
+        # separate path (see ``observe_result``). 0.0 when the SDK omits it.
+        self.totals[TURN_COST_FIELD] = 0.0
+        self._from_messages = False
+
+    @staticmethod
+    def _usage_ints(usage: Any) -> dict[str, int]:
+        """Extract the billable integer fields from an SDK ``usage`` dict."""
+        if not isinstance(usage, dict):
+            return {}
+        out: dict[str, int] = {}
+        for key in TURN_USAGE_FIELDS:
+            value = usage.get(key)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            out[key] = int(value)
+        return out
+
+    def observe_assistant(self, msg: Any) -> None:
+        """Fold one ``AssistantMessage`` into the turn total."""
+        model = getattr(msg, "model", None)
+        if (
+            isinstance(model, str)
+            and model
+            and getattr(msg, "parent_tool_use_id", None) is None
+        ):
+            self.model = model
+        fields = self._usage_ints(getattr(msg, "usage", None))
+        if not fields:
+            return
+        self._from_messages = True
+        for key, value in fields.items():
+            self.totals[key] += value
+
+    def observe_result(self, msg: Any) -> None:
+        """Fold the closing ``ResultMessage`` in (model id and cost always;
+        tokens only when no assistant message carried usage)."""
+        if self.model is None:
+            model_usage = getattr(msg, "model_usage", None)
+            if isinstance(model_usage, dict):
+                for name in model_usage:
+                    if isinstance(name, str) and name:
+                        self.model = name
+                        break
+        # Cost is ALWAYS taken from here, unconditionally: it is a whole-turn
+        # total the CLI already computed rather than a per-message field, so
+        # there is nothing on the assistant messages to double-count against.
+        cost = getattr(msg, "total_cost_usd", None)
+        if not isinstance(cost, bool) and isinstance(cost, (int, float)):
+            self.totals[TURN_COST_FIELD] = round(
+                self.totals[TURN_COST_FIELD] + float(cost), 6
+            )
+        if self._from_messages:
+            return
+        for key, value in self._usage_ints(getattr(msg, "usage", None)).items():
+            self.totals[key] += value
+
+    def as_audit_fields(self) -> dict[str, Any]:
+        """Additive audit-row keys: ``model``, the four token counters and
+        ``total_cost_usd``."""
+        return {"model": self.model, **self.totals}
+
+    def publish(self, turn_meta: dict[str, Any] | None) -> None:
+        """Accumulate this turn's usage into a caller-owned ``turn_meta``.
+
+        Additive (``+=``) rather than assignment so the scheduled-reply
+        regeneration path, which reuses the same dict for a second drain,
+        reports the COMBINED spend of both attempts.
+        """
+        if turn_meta is None:
+            return
+        for key, value in self.totals.items():
+            previous = turn_meta.get(key)
+            base = (
+                previous
+                if isinstance(previous, (int, float)) and not isinstance(previous, bool)
+                else 0
+            )
+            summed = base + value
+            # Re-round the float (cost) each fold so repeated accumulation
+            # across retries cannot drift into 1e-17 tails.
+            turn_meta[key] = round(summed, 6) if isinstance(summed, float) else summed
+        if self.model:
+            turn_meta["model"] = self.model
 
 
 @dataclass
@@ -625,6 +943,15 @@ class ConversationWorker:
         )
         self._notification_terminal_window: int = (
             config.runtime.visibility.notification_terminal_window_seconds
+        )
+        # CHARACTER cap on one terminal report (2026-09-16). Sibling of the
+        # count-in-window cap above and cached for the same no-hot-reload
+        # reason: the flood cap bounds how MANY reports ship, this one bounds
+        # how BIG each is, so a single 4.5k-char delegate report can no longer
+        # cross the Slack transport's own split point and render as two
+        # messages with an orphaned list item. ``0`` means no cap.
+        self._notification_terminal_max_chars: int = (
+            config.runtime.visibility.notification_terminal_max_chars
         )
         # Flood cap, per worker, as a COUNT IN A WINDOW: monotonic timestamps of
         # terminal reports actually delivered, pruned on the send path. A
@@ -2615,7 +2942,10 @@ class ConversationWorker:
             )
 
     def _emit_turn_telemetry(
-        self, event: InboundEvent, watchdog: TurnWatchdog
+        self,
+        event: InboundEvent,
+        watchdog: TurnWatchdog,
+        usage: _TurnUsage | None = None,
     ) -> None:
         """Write the per-interactive-turn telemetry audit row.
 
@@ -2624,9 +2954,19 @@ class ConversationWorker:
         flags. WARNING level when the turn breached (soft or hard) so it stays
         visible in journald, INFO otherwise. Exception-isolated: telemetry must
         never break turn teardown.
+
+        ``usage``, when passed, adds the turn's resolved model id, its four
+        billable token counters (summed across every assistant message in the
+        turn), its ``total_cost_usd`` (from the closing ResultMessage; 0.0 when
+        absent) plus a ``duration_s`` alias of ``duration_seconds``. Purely
+        ADDITIVE — every pre-existing key keeps its name and meaning, so a log
+        parser written against the old row still works.
         """
         telemetry = watchdog.telemetry()
         breached = telemetry["soft_breached"] or telemetry["hard_breached"]
+        extra: dict[str, Any] = {"duration_s": telemetry["duration_seconds"]}
+        if usage is not None:
+            extra.update(usage.as_audit_fields())
         try:
             audit_event(
                 "audit.turn.telemetry",
@@ -2637,6 +2977,7 @@ class ConversationWorker:
                 level="WARNING" if breached else "INFO",
                 transport=self.transport,
                 **telemetry,
+                **extra,
             )
         except Exception as exc:  # noqa: BLE001 — never break turn teardown
             self._log.warning(
@@ -2726,6 +3067,60 @@ class ConversationWorker:
                 name=f"worker.markup_alert.{conv_key}",
             )
 
+    def _emit_outbound_sanitized(
+        self,
+        before: str,
+        after: str,
+        filters_fired: list[str],
+        *,
+        conv_key: str,
+    ) -> None:
+        """Audit + log a send dropped because sanitation emptied it.
+
+        Fires only when the outbound text was non-empty BEFORE the filters and
+        empty after, i.e. the message was nothing but leaked protocol text: a
+        bare ``[[ANNA_NO_OUTPUT]]`` (2026-09-15) or a delegate report that was
+        footer and nothing else (2026-09-16). One row per dropped send, naming
+        WHICH filters fired and both char counts, so "ANNA went quiet" is
+        explainable from the audit log without re-deriving it from the
+        transcript. No admin alert: unlike leaked tool-call markup this is the
+        guard working as designed on text that was never postable, and an
+        alert per occurrence would rebuild the noise we are removing.
+
+        Wrapped in try/except like its neighbours — bookkeeping must never
+        crash turn teardown.
+        """
+        try:
+            audit_event(
+                "audit.reply.outbound_sanitized",
+                audit_dir=self._config.audit_dir,
+                actor="anna",
+                conv_key=conv_key,
+                fsync_on_write=self._config.logging.audit.fsync_on_write,
+                level="WARNING",
+                transport=self.transport,
+                filters=list(filters_fired),
+                before_chars=len(before),
+                after_chars=len(after),
+                preview=before[:280],
+            )
+        except Exception as exc:  # noqa: BLE001 — never break turn teardown
+            self._log.warning(
+                "worker.reply.outbound_sanitized_audit_failed",
+                error=str(exc),
+                conv_key=conv_key,
+                transport=self.transport,
+            )
+        self._log.warning(
+            "worker.reply.outbound_sanitized_dropped",
+            conv_key=conv_key,
+            transport=self.transport,
+            filters=list(filters_fired),
+            before_chars=len(before),
+            after_chars=len(after),
+            preview=before[:280],
+        )
+
     def _notification_turn_for(
         self, event: InboundEvent
     ) -> _NotificationOnlyTurn | None:
@@ -2775,12 +3170,23 @@ class ConversationWorker:
 
         * ``disabled`` — the config flag is off (or the cap is 0). Exactly the
           pre-2026-08-30 behavior: everything suppressed.
-        * ``empty`` — the turn ended on a tool call with no closing report, or
-          produced no text at all. Stay silent; never post a placeholder.
+        * ``empty`` — the turn ended on a tool call with no closing report,
+          produced no text at all, or sanitized away to nothing (a report that
+          was only a quiet sentinel / only a delegate footer). Stay silent;
+          never post a placeholder.
         * ``rate_limited`` — the flood cap tripped. Falls back to suppression
           and audits its own distinct event so a storm is visible as a storm and
           not as N ordinary suppressions.
         * ``delivered`` — ship it.
+
+        2026-09-16 amendment: this path also SANITIZES (delegate footer, quiet
+        sentinel) and CHARACTER-CAPS the report at
+        ``notification_terminal_max_chars``. The cap lives here and NOWHERE
+        else — a machine-triggered report nobody sized is a different thing
+        from an interactive reply whose length the operator asked for, and
+        ``_guarded_send`` deliberately applies no cap at all. Uncapped, one
+        delegate report crossed the Slack transport's ``SLACK_MAX_CHARS``
+        split point and arrived as two messages with an orphaned list item.
 
         The window is pruned here, on the send path, rather than by a timer:
         the list only ever holds at most ``_notification_terminal_max`` live
@@ -2791,6 +3197,21 @@ class ConversationWorker:
             ledger.note_delivery("disabled", "")
             return False
         if not terminal_text:
+            ledger.note_delivery("empty", "")
+            return False
+        # Sanitize, THEN cap (2026-09-15 / 2026-09-16). Order matters twice
+        # over: filtering first means the cap measures what will actually ship
+        # rather than text a filter is about to remove, and both run BEFORE the
+        # flood-window bookkeeping so a report that sanitizes away to nothing
+        # does not burn one of the window's delivery slots.
+        clean_text, _filters_fired = _sanitize_outbound(terminal_text)
+        clean_text = _truncate_notification_terminal(
+            clean_text, self._notification_terminal_max_chars
+        )
+        if not clean_text.strip():
+            # Nothing left to say — the same silence a turn that ended on a
+            # tool call gets, recorded under the same existing outcome so the
+            # audit log has one meaning for "there was no report".
             ledger.note_delivery("empty", "")
             return False
         now = time.monotonic()
@@ -2809,7 +3230,12 @@ class ConversationWorker:
         # a slot free. Recording the intent is the conservative direction — a
         # send that then fails costs us one slot, not an uncapped burst.
         self._notification_terminal_sends.append(now)
-        ledger.note_delivery("delivered", terminal_text)
+        # The POST-filter, post-truncation text goes on the ledger, because
+        # ``delivered_text`` is both what the caller sends and what the audit
+        # row reports. Recording the raw text here is how the 2026-09-16 row
+        # claimed to have delivered 4.5k characters of footer-bearing report
+        # that the transport then split in two.
+        ledger.note_delivery("delivered", clean_text)
         return True
 
     def _emit_notification_terminal_rate_limited(
@@ -2958,11 +3384,18 @@ class ConversationWorker:
         # on, keeping the regenerated reply consistent with the primary
         # scheduled-dispatch path (terminal-only, no mid-turn narration).
         terminal_chunks: list[str] = []
+        # Regeneration burns real tokens on the caller's behalf, so its usage
+        # accumulates onto the SAME ``turn_meta`` the first attempt published:
+        # ``audit.schedule.complete`` must report the combined spend of both
+        # drains, not just the re-run.
+        regen_usage = _TurnUsage()
+        regen_started_at = time.monotonic()
         turn_queue = self._begin_turn()
         try:
             await self._client.query(correction_prompt)  # type: ignore[attr-defined]
             async for msg in self._turn_messages(turn_queue):
                 if AssistantMessage is not None and isinstance(msg, AssistantMessage):
+                    regen_usage.observe_assistant(msg)
                     for block in msg.content:
                         if TextBlock is not None and isinstance(block, TextBlock):
                             reply_chunks.append(block.text)
@@ -2978,6 +3411,7 @@ class ConversationWorker:
                                     int(event.turn_meta.get("tool_call_count", 0)) + 1
                                 )
                 if ResultMessage is not None and isinstance(msg, ResultMessage):
+                    regen_usage.observe_result(msg)
                     break
         except Exception as exc:
             self._log.error(
@@ -2988,6 +3422,15 @@ class ConversationWorker:
             )
             return None
         finally:
+            # Publish inside the finally so a mid-drain failure still reports
+            # the tokens already burned. ``publish`` is additive, and
+            # ``duration_s`` grows by this attempt's wall time.
+            regen_usage.publish(event.turn_meta)
+            if event.turn_meta is not None:
+                elapsed = round(time.monotonic() - regen_started_at, 3)
+                previous = event.turn_meta.get("duration_s")
+                base = previous if isinstance(previous, (int, float)) else 0.0
+                event.turn_meta["duration_s"] = round(base + elapsed, 3)
             await self._end_turn(turn_queue)
 
         if self._consolidate_scheduled:
@@ -3033,6 +3476,41 @@ class ConversationWorker:
         if ledger is not None and ledger.suppressing:
             ledger.note_suppressed(msg.text)
             return
+        # Outbound sanitation (2026-09-15 quiet-sentinel leak, 2026-09-16
+        # delegate-footer leak). Applied BEFORE the markup check and BEFORE the
+        # send so the check judges, and the transport receives, the SAME text.
+        # ``OutboundMessage`` is a frozen-by-convention dataclass shared with
+        # the transports, so the cleaned text is a REPLACEMENT message rather
+        # than an in-place mutation of the caller's object.
+        #
+        # Deliberately NO character cap here. ANNA's operating rules make
+        # interactive reply length uncapped on purpose: a long answer to a long
+        # question is the product working. The cap added on 2026-09-16 belongs
+        # to the notification-terminal path alone (see
+        # :meth:`_decide_notification_terminal`), where the text is a machine-
+        # triggered report nobody asked for at that length.
+        cleaned_text, filters_fired = _sanitize_outbound(msg.text)
+        if filters_fired:
+            if msg.text.strip() and not cleaned_text.strip():
+                # The message was ENTIRELY leaked protocol text. Drop it: a
+                # placeholder ("(no response)") in its place was itself part of
+                # the 2026-07-30 noise, and there is nothing here to relay.
+                self._emit_outbound_sanitized(
+                    msg.text,
+                    cleaned_text,
+                    filters_fired,
+                    conv_key=msg.conversation_key,
+                )
+                return
+            self._log.info(
+                "worker.reply.outbound_sanitized",
+                conv_key=msg.conversation_key,
+                transport=self.transport,
+                filters=filters_fired,
+                before_chars=len(msg.text),
+                after_chars=len(cleaned_text),
+            )
+            msg = dataclass_replace(msg, text=cleaned_text)
         if _should_suppress_markup(msg.text, tool_used=tool_used):
             await self._emit_markup_suppressed(
                 msg.text, conv_key=msg.conversation_key
@@ -3260,6 +3738,12 @@ class ConversationWorker:
         # scheduler's no-tool-call backstop reads it to tell a real run from
         # a turn that only narrated (2026-07-29 oem-slide-restock-watch).
         tool_call_count = 0
+        # Per-turn token accounting (Fable spend attribution). Summed across
+        # EVERY assistant message in the turn, then published two ways: into
+        # ``event.turn_meta`` for the scheduler's ``audit.schedule.complete``
+        # row, and into ``audit.turn.telemetry`` for interactive turns.
+        turn_usage = _TurnUsage()
+        turn_started_at = time.monotonic()
         loop = asyncio.get_running_loop()
         buffer = _FlushBuffer(last_flush=loop.time())
         # Timed-drip timer (Inbox/2026-06-04 plan). Started ONLY for an
@@ -3331,6 +3815,13 @@ class ConversationWorker:
 
             try:
                 async for msg in self._turn_messages(turn_queue):
+                    # Token accounting first, before any branch below can
+                    # ``continue``/``break`` past it, so the total covers every
+                    # billed message in the turn — not just the last one.
+                    if AssistantMessage is not None and isinstance(msg, AssistantMessage):
+                        turn_usage.observe_assistant(msg)
+                    elif ResultMessage is not None and isinstance(msg, ResultMessage):
+                        turn_usage.observe_result(msg)
                     # Mid-turn operator message. The harness surfaces a real
                     # person's message INSIDE a running turn by appending a text
                     # block to the user message that carries a tool result. That
@@ -3555,7 +4046,7 @@ class ConversationWorker:
                     )
             if watchdog is not None:
                 watchdog.mark_ended()
-                self._emit_turn_telemetry(event, watchdog)
+                self._emit_turn_telemetry(event, watchdog, turn_usage)
             # ALWAYS clear, even on exception, cancellation, or early
             # return inside the try-block above. The clear callable is
             # itself exception-isolated — defense-in-depth keeps a
@@ -3603,6 +4094,15 @@ class ConversationWorker:
             # down keeps bumping the same dict.
             if event.turn_meta is not None:
                 event.turn_meta["tool_call_count"] = tool_call_count
+                # Same channel, second payload: the turn's token spend and the
+                # resolved model, so the scheduler can stamp them onto
+                # ``audit.schedule.complete``. Published BEFORE the future
+                # resolves; the regeneration path below accumulates onto the
+                # same dict so a retried turn reports combined spend.
+                turn_usage.publish(event.turn_meta)
+                event.turn_meta["duration_s"] = round(
+                    time.monotonic() - turn_started_at, 3
+                )
             # Scheduled-turn narration consolidation (2026-07-12
             # weekly-synthesis incident). Under ``consolidate_scheduled_turns``
             # (default on), the future resolves with ONLY the turn's TERMINAL

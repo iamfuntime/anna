@@ -37,6 +37,9 @@ from anna.runtime.delivered_posts import record_delivered_post
 from anna.runtime.schedule_store import ScheduleStore
 from anna.runtime.schedule_types import Schedule
 from anna.runtime.worker import (
+    TURN_COST_FIELD,
+    TURN_SPEND_FIELDS,
+    TURN_USAGE_FIELDS,
     _contains_unparsed_toolcall_markup,
     _matched_markers,
 )
@@ -132,6 +135,38 @@ def _gate_reason(stdout: str) -> str:
             if isinstance(value, str) and value:
                 return value[:GATE_REASON_MAX_CHARS]
     return text[:GATE_REASON_MAX_CHARS]
+
+
+def _accumulate_turn_usage(
+    total: dict[str, object], meta: dict[str, object] | None
+) -> None:
+    """Fold one fire's ``turn_meta`` token counts and cost into a per-run tally.
+
+    A scheduled run is not always one turn: the no-tool-call backstop fires a
+    second time into a fresh ``meta``, and the worker's markup-regeneration
+    path adds a third drain. Spend-per-job means the SUM of every drain the run
+    paid for, so each attempt accumulates here rather than overwriting.
+    Non-numeric / missing values are skipped (fail open — telemetry must never
+    break a scheduled run), and ``model`` takes the most recent non-empty id.
+    ``total_cost_usd`` is a float and sums the same way the counters do.
+    """
+    if not meta:
+        return
+    for key in TURN_SPEND_FIELDS:
+        value = meta.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        previous = total.get(key)
+        base = (
+            previous
+            if isinstance(previous, (int, float)) and not isinstance(previous, bool)
+            else 0
+        )
+        summed = base + value
+        total[key] = round(summed, 6) if isinstance(summed, float) else summed
+    model = meta.get("model")
+    if isinstance(model, str) and model:
+        total["model"] = model
 
 
 class Scheduler:
@@ -510,12 +545,17 @@ class Scheduler:
             )
             self._log.info("scheduler.fire", schedule_id=schedule.id)
 
+            # Per-run token tally, accumulated across every attempt this run
+            # makes (first fire + no-tool-call retry). Stamped onto
+            # ``audit.schedule.complete`` so Fable spend per job is one grep.
+            usage_total: dict[str, object] = {}
             try:
                 meta: dict[str, object] = {}
                 reply = await asyncio.wait_for(
                     self.fire(schedule.id, turn_meta=meta),
                     timeout=schedule.timeout_seconds,
                 )
+                _accumulate_turn_usage(usage_total, meta)
                 # No-tool-call backstop (2026-07-29 incident:
                 # oem-slide-restock-watch resolved in 2.5s with zero tool
                 # calls and the bare text "I'll read the skill file first",
@@ -551,6 +591,7 @@ class Scheduler:
                         self.fire(schedule.id, turn_meta=meta),
                         timeout=schedule.timeout_seconds,
                     )
+                    _accumulate_turn_usage(usage_total, meta)
                     if self._is_no_tool_call_prose(reply, meta):
                         await self._handle_no_tool_call_abort(
                             schedule, first_reply=first_reply, retry_reply=reply
@@ -589,7 +630,11 @@ class Scheduler:
                     f"suppressing post"
                 )
                 await self._record_success(
-                    schedule, reply, started_at=started_at, suppressed=True
+                    schedule,
+                    reply,
+                    started_at=started_at,
+                    suppressed=True,
+                    usage=usage_total,
                 )
                 return
 
@@ -607,7 +652,11 @@ class Scheduler:
                     reply_len=len(reply),
                 )
                 await self._record_success(
-                    schedule, reply, started_at=started_at, suppressed=True
+                    schedule,
+                    reply,
+                    started_at=started_at,
+                    suppressed=True,
+                    usage=usage_total,
                 )
                 return
 
@@ -624,7 +673,11 @@ class Scheduler:
                     markers=_matched_markers(reply),
                 )
                 await self._record_success(
-                    schedule, reply, started_at=started_at, suppressed=True
+                    schedule,
+                    reply,
+                    started_at=started_at,
+                    suppressed=True,
+                    usage=usage_total,
                 )
                 return
 
@@ -642,6 +695,8 @@ class Scheduler:
             # heartbeat alert 17s after it landed in their DM, and the DM's
             # worker spawned with no record of it). Reached ONLY on the real
             # send path — every suppression branch above returned already.
+            # ``reply`` here is the SAME string ``_send_to_destination`` just
+            # handed the adapter, so the transcript row is what was delivered.
             recorded_conv_key = self._record_delivered_post(schedule, reply)
 
             await self._record_success(
@@ -649,6 +704,7 @@ class Scheduler:
                 reply,
                 started_at=started_at,
                 recorded_conv_key=recorded_conv_key,
+                usage=usage_total,
             )
 
     @staticmethod
@@ -735,6 +791,7 @@ class Scheduler:
         started_at: datetime,
         suppressed: bool = False,
         recorded_conv_key: str | None = None,
+        usage: dict[str, object] | None = None,
     ) -> None:
         """Record a successful fire: mark_fired (resets failures, sets
         last_fired_at + last_status="complete"), audit, and log.
@@ -746,12 +803,29 @@ class Scheduler:
         transcript the delivered post was appended to (see
         :meth:`_record_delivered_post`), or ``None`` when nothing was
         recorded — always ``None`` for a suppressed run.
+
+        ``usage`` carries the run's token spend (see
+        :func:`_accumulate_turn_usage`) and is stamped onto the audit row as
+        ADDITIVE keys — ``model`` plus the four billable counters plus a
+        ``duration_s`` alias of the long-standing ``duration_seconds``. Every
+        pre-existing key keeps its name and value, so old log parsers are
+        unaffected. Defaults to ``None`` (keyword-only) so any caller that
+        does not track usage still works.
         """
         completed_at = datetime.now(timezone.utc)
         duration = (completed_at - started_at).total_seconds()
         await self._store.mark_fired(
             schedule.id, status="complete", when=completed_at
         )
+        # Missing counters land as 0 rather than being omitted, so the row has
+        # a stable shape and a summing grep never trips over an absent key.
+        usage_fields: dict[str, object] = {
+            "model": None,
+            **{key: 0 for key in TURN_USAGE_FIELDS},
+            TURN_COST_FIELD: 0.0,
+        }
+        if usage:
+            usage_fields.update(usage)
         audit_event(
             "audit.schedule.complete",
             audit_dir=self._audit_dir,
@@ -762,6 +836,8 @@ class Scheduler:
             output_length=len(reply),
             suppressed=suppressed,
             recorded_conv_key=recorded_conv_key,
+            duration_s=round(duration, 3),
+            **usage_fields,
         )
         self._log.info(
             "scheduler.complete",
